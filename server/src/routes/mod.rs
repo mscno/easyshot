@@ -74,9 +74,24 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/videos/{id}/parts", post(videos::parts))
         .route("/videos/{id}/progress", post(videos::progress))
-        .route("/videos/{id}/complete", post(videos::complete))
+        // A manifest of up to MAX_PARTS parts outgrows the default limit; the route's own
+        // layer is innermost, so it wins.
+        .route(
+            "/videos/{id}/complete",
+            post(videos::complete).layer(DefaultBodyLimit::max(
+                crate::video::service::COMPLETE_BODY_LIMIT,
+            )),
+        )
         .route("/videos/{id}/thumbnail", post(videos::thumbnail))
+        .route(
+            "/videos/{id}/thumbnail/complete",
+            post(videos::thumbnail_complete),
+        )
         .route("/videos/{id}/transcript", post(videos::transcript))
+        .route(
+            "/videos/{id}/transcript/complete",
+            post(videos::transcript_complete),
+        )
         .route("/internal/expire", post(internal::expire))
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT));
 

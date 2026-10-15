@@ -63,13 +63,16 @@ pub trait ObjectStore: Send + Sync {
 
     // Multipart uploads: the client PUTs parts straight to presigned URLs while recording.
     async fn create_multipart(&self, key: &str, content_type: &str) -> StoreResult<String>;
+    /// The part's exact byte length is signed into the URL (`Content-Length`), so the
+    /// store rejects a body of any other size; send `headers` with the PUT.
     async fn presign_upload_part(
         &self,
         key: &str,
         upload_id: &str,
         part_number: i32,
+        content_length: i64,
         ttl: Duration,
-    ) -> StoreResult<String>;
+    ) -> StoreResult<PresignedPut>;
     /// `parts` are `(part_number, etag)` in ascending order.
     async fn complete_multipart(
         &self,
@@ -295,8 +298,9 @@ impl ObjectStore for S3Store {
         key: &str,
         upload_id: &str,
         part_number: i32,
+        content_length: i64,
         ttl: Duration,
-    ) -> StoreResult<String> {
+    ) -> StoreResult<PresignedPut> {
         let req = self
             .client
             .upload_part()
@@ -304,10 +308,18 @@ impl ObjectStore for S3Store {
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
+            .content_length(content_length)
             .presigned(PresigningConfig::expires_in(ttl).map_err(se)?)
             .await
             .map_err(se)?;
-        Ok(req.uri().to_string())
+        if !req.uri().contains("content-length") {
+            // Unsigned, the URL would accept a body of any size.
+            return Err(StoreError("part URL does not sign Content-Length".into()));
+        }
+        Ok(PresignedPut {
+            url: req.uri().to_string(),
+            headers: vec![("content-length".into(), content_length.to_string())],
+        })
     }
 
     async fn complete_multipart(
@@ -365,6 +377,8 @@ pub struct MemoryStore {
     objects: Mutex<HashMap<String, ObjectMeta>>,
     bytes: Mutex<HashMap<String, Vec<u8>>>,
     uploads: Mutex<HashMap<String, MemUpload>>,
+    /// Content-Length signed into each part URL: (upload id, part number) -> bytes.
+    signed: Mutex<HashMap<(String, i32), i64>>,
     fail_deletes: Mutex<bool>,
 }
 
@@ -408,17 +422,44 @@ impl MemoryStore {
             .unwrap()
             .insert(key.to_string(), bytes.to_vec());
     }
-    /// Simulate a client uploading one part; returns its ETag.
+    /// Simulate a client uploading one part; returns its ETag. Panics where S3 would refuse
+    /// the PUT (see [`try_put_part`](Self::try_put_part)).
     pub fn put_part(&self, upload_id: &str, part_number: i32, size: i64) -> String {
+        self.try_put_part(upload_id, part_number, size)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+    /// Like S3: a body whose size differs from the Content-Length signed into the part's
+    /// URL fails, as does a part for an unknown or finished upload.
+    pub fn try_put_part(
+        &self,
+        upload_id: &str,
+        part_number: i32,
+        size: i64,
+    ) -> StoreResult<String> {
+        if let Some(signed) = self.signed_part_size(upload_id, part_number)
+            && signed != size
+        {
+            return Err(StoreError(format!(
+                "SignatureDoesNotMatch: part {part_number} signed for {signed} bytes, got {size}"
+            )));
+        }
         let tag = format!("\"tag-{upload_id}-{part_number}\"");
         self.uploads
             .lock()
             .unwrap()
             .get_mut(upload_id)
-            .expect("unknown upload")
+            .ok_or_else(|| StoreError("NoSuchUpload".into()))?
             .2
             .insert(part_number, (tag.clone(), size));
-        tag
+        Ok(tag)
+    }
+    /// The Content-Length the latest presigned URL for this part allows.
+    pub fn signed_part_size(&self, upload_id: &str, part_number: i32) -> Option<i64> {
+        self.signed
+            .lock()
+            .unwrap()
+            .get(&(upload_id.to_string(), part_number))
+            .copied()
     }
     pub fn open_uploads(&self) -> usize {
         self.uploads.lock().unwrap().len()
@@ -502,12 +543,20 @@ impl ObjectStore for MemoryStore {
         key: &str,
         upload_id: &str,
         part_number: i32,
+        content_length: i64,
         ttl: Duration,
-    ) -> StoreResult<String> {
-        Ok(format!(
-            "https://store.test/part/{key}?uploadId={upload_id}&partNumber={part_number}&ttl={}",
-            ttl.as_secs()
-        ))
+    ) -> StoreResult<PresignedPut> {
+        self.signed
+            .lock()
+            .unwrap()
+            .insert((upload_id.to_string(), part_number), content_length);
+        Ok(PresignedPut {
+            url: format!(
+                "https://store.test/part/{key}?uploadId={upload_id}&partNumber={part_number}&len={content_length}&ttl={}",
+                ttl.as_secs()
+            ),
+            headers: vec![("content-length".into(), content_length.to_string())],
+        })
     }
     async fn complete_multipart(
         &self,
@@ -596,6 +645,21 @@ mod tests {
         assert!(
             get.starts_with("http://127.0.0.1:9000/my-bucket/k?"),
             "{get}"
+        );
+        // Part URLs sign the exact Content-Length.
+        let part = store
+            .presign_upload_part("k", "up1", 3, 5_242_880, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(
+            part.url
+                .contains("X-Amz-SignedHeaders=content-length%3Bhost"),
+            "{}",
+            part.url
+        );
+        assert_eq!(
+            part.headers,
+            [("content-length".to_string(), "5242880".to_string())]
         );
         // SAFETY: see above.
         unsafe { std::env::remove_var("AWS_ENDPOINT_URL_S3") };

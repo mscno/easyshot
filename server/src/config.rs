@@ -33,6 +33,10 @@ pub struct Config {
     pub video_retention_days: i64,
     /// Largest accepted recording, in bytes.
     pub max_video_bytes: i64,
+    /// Unfinished recording uploads one account may have at once.
+    pub max_pending_uploads: i64,
+    /// Bytes one account may reserve across its unfinished uploads (default `max_video_bytes`).
+    pub max_pending_upload_bytes: i64,
     /// Key for password-unlock cookies and viewer hashes. Random per process when unset, so
     /// unlocks and same-day view dedupe reset on restart.
     pub web_secret: Option<String>,
@@ -127,6 +131,11 @@ impl Config {
             auth_code_ttl_minutes: number("AUTH_CODE_TTL_MINUTES", 10)?,
             video_retention_days: number("VIDEO_RETENTION_DAYS", 90)?,
             max_video_bytes: number("MAX_VIDEO_BYTES", 5 * 1024 * 1024 * 1024)?,
+            max_pending_uploads: number("MAX_PENDING_UPLOADS", 3)?,
+            max_pending_upload_bytes: number(
+                "MAX_PENDING_UPLOAD_BYTES",
+                number("MAX_VIDEO_BYTES", 5 * 1024 * 1024 * 1024)?,
+            )?,
             web_secret: get("WEB_SECRET"),
             trusted_proxy_hops: non_negative("TRUSTED_PROXY_HOPS", 0)? as usize,
             download_url: get("DOWNLOAD_URL").unwrap_or_else(|| DEFAULT_DOWNLOAD_URL.into()),
@@ -170,6 +179,8 @@ impl Config {
             auth_code_ttl_minutes: 10,
             video_retention_days: 90,
             max_video_bytes: 5 * 1024 * 1024 * 1024,
+            max_pending_uploads: 3,
+            max_pending_upload_bytes: 5 * 1024 * 1024 * 1024,
             web_secret: Some("test-web-secret".into()),
             trusted_proxy_hops: 0,
             download_url: DEFAULT_DOWNLOAD_URL.into(),
@@ -206,6 +217,15 @@ mod tests {
         assert!(c.allow_signups && !c.run_migrations && !c.s3_force_path_style);
         assert_eq!(c.db_max_connections, 5);
         assert!(c.cron_secret.is_none());
+        assert_eq!(c.max_pending_uploads, 3);
+        assert_eq!(c.max_pending_upload_bytes, c.max_video_bytes);
+        let c = Config::from_lookup(lookup(&[
+            ("DATABASE_URL", "postgres://x"),
+            ("S3_BUCKET", "b"),
+            ("MAX_VIDEO_BYTES", "1000"),
+        ]))
+        .unwrap();
+        assert_eq!(c.max_pending_upload_bytes, 1000);
     }
 
     #[test]

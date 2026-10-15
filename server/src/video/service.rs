@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::model::{Comment, ItemView, Reaction, Video};
 use super::scope::{Scope, Visibility};
 use crate::auth::{generate_slug, hash_password_blocking, verify_password_blocking};
-use crate::db::Context;
+use crate::db::{Context, Value, execute_in, placeholders, query_in};
 use crate::error::{AppError, AppResult};
 use crate::orm::{begin, is_unique_violation, orm_err};
 use crate::repo::{now_ms, ts};
@@ -26,9 +26,17 @@ use crate::vals;
 
 /// S3 requires every part except the last to be at least 5 MiB.
 pub const MIN_PART_BYTES: i64 = 5 * 1024 * 1024;
+/// S3's largest part.
+pub const MAX_PART_BYTES: i64 = 5 * 1024 * 1024 * 1024;
 pub const MAX_PARTS: i32 = 10_000;
 /// Part URLs requested in one call.
 pub const MAX_PART_BATCH: usize = 100;
+/// Longest part ETag accepted at completion, quotes excluded.
+pub const MAX_ETAG_CHARS: usize = 64;
+/// Body limit of `POST /v1/videos/{id}/complete`: a manifest of [`MAX_PARTS`] parts. One
+/// compact entry with the longest accepted ETag is about 100 bytes; the rest is slack for
+/// whitespace and the other fields.
+pub const COMPLETE_BODY_LIMIT: usize = MAX_PARTS as usize * 160 + 64 * 1024;
 pub const PART_URL_TTL: Duration = Duration::from_secs(3600);
 pub const ASSET_PUT_TTL: Duration = Duration::from_secs(600);
 /// Media URLs on the watch page; long enough for a long video to keep seeking.
@@ -102,6 +110,47 @@ fn valid_slug(slug: &str) -> bool {
     !slug.is_empty() && slug.len() <= 32 && slug.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// Part ETags as S3, MinIO, R2 and Tigris return them (32 hex digits, quoted) and as the
+/// in-memory store makes them: optionally quoted, 1..=[`MAX_ETAG_CHARS`] of `[A-Za-z0-9_-]`.
+pub fn valid_etag(tag: &str) -> bool {
+    let inner = tag
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(tag);
+    (1..=MAX_ETAG_CHARS).contains(&inner.len())
+        && inner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Serializes one account's upload bookkeeping (creating uploads, reserving parts,
+/// completing) inside `tx`, so the pending cap and the byte budgets hold under concurrent
+/// requests. Released when `tx` ends.
+async fn lock_uploads(tx: &mut dyn toasty::Executor, user_id: &str) -> AppResult<()> {
+    execute_in(
+        tx,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        &vals![format!("easyshot:uploads:{user_id}")],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Unfinished uploads that still count against the account (the expire job aborts older
+/// ones, and their parts can no longer be requested).
+async fn pending_uploads(tx: &mut dyn toasty::Executor, user_id: &str, now: i64) -> AppResult<i64> {
+    Ok(query_in(
+        tx,
+        "SELECT COUNT(*) FROM videos WHERE user_id = $1 AND status = 'pending' AND created_at >= $2",
+        &vals![user_id, now - STALE_PENDING_MS],
+    )
+    .await?
+    .first()
+    .map(|r| r.i64(0))
+    .transpose()?
+    .unwrap_or(0))
+}
+
 // ---------- lookup ----------
 
 /// Resolve a share link for `scope` (RLS share path). Expired links resolve to `None`;
@@ -145,89 +194,224 @@ pub async fn create(st: &AppState, scope: &Scope, input: NewVideo) -> AppResult<
     let id = Uuid::new_v4().to_string();
     let user = user_id.to_string();
     let key = format!("{}.{ext}", base_key(&user, &id, now));
+    let cap = st.config.max_pending_uploads;
+    let mut db = st.orm().await?;
+    // Refuse early, before creating a multipart upload; re-checked under the lock below.
+    let mut tx = begin(&mut db, &scope.context()).await?;
+    let pending = pending_uploads(&mut tx, &user, now).await?;
+    tx.commit().await.map_err(orm_err)?;
+    if pending >= cap {
+        return Err(AppError::TooManyPendingUploads);
+    }
     let upload_id = st
         .store
         .create_multipart(&key, &content_type)
         .await
         .map_err(store_err)?;
     let expires_at = now + st.config.video_retention_days * 86_400_000;
-    let mut db = st.orm().await?;
-    for _ in 0..8 {
-        let mut tx = begin(&mut db, &scope.context()).await?;
-        let created = toasty::create!(Video {
-            id: id.clone(),
-            kind: "video",
-            user_id: user.clone(),
-            workspace_id: None::<String>,
-            slug: generate_slug(),
-            title: title.clone(),
-            status: "pending",
-            object_key: key.clone(),
-            upload_id: Some(upload_id.clone()),
-            content_type: content_type.clone(),
-            byte_size: 0,
-            duration_ms: 0,
-            width: None::<i64>,
-            height: None::<i64>,
-            thumbnail_key: None::<String>,
-            transcript_key: None::<String>,
-            visibility: Visibility::Link.as_str(),
-            password_hash: None::<String>,
-            created_at: now,
-            updated_at: now,
-            ready_at: None::<i64>,
-            expires_at,
-            uploaded_bytes: 0,
-            recording_ended_at: None::<i64>,
-        })
-        .exec(&mut tx)
-        .await;
-        match created {
-            Ok(v) => {
-                tx.commit().await.map_err(orm_err)?;
-                return Ok(v);
+    let created: AppResult<Video> = async {
+        for _ in 0..8 {
+            let mut tx = begin(&mut db, &scope.context()).await?;
+            // Count and insert under the account's upload lock: concurrent creates cannot
+            // both see room for one more.
+            lock_uploads(&mut tx, &user).await?;
+            if pending_uploads(&mut tx, &user, now).await? >= cap {
+                return Err(AppError::TooManyPendingUploads);
             }
-            Err(e) if is_unique_violation(&e) => continue,
-            Err(e) => {
-                drop(tx);
-                let _ = st.store.abort_multipart(&key, &upload_id).await;
-                return Err(orm_err(e));
+            let created = toasty::create!(Video {
+                id: id.clone(),
+                kind: "video",
+                user_id: user.clone(),
+                workspace_id: None::<String>,
+                slug: generate_slug(),
+                title: title.clone(),
+                status: "pending",
+                object_key: key.clone(),
+                upload_id: Some(upload_id.clone()),
+                content_type: content_type.clone(),
+                byte_size: 0,
+                duration_ms: 0,
+                width: None::<i64>,
+                height: None::<i64>,
+                thumbnail_key: None::<String>,
+                transcript_key: None::<String>,
+                visibility: Visibility::Link.as_str(),
+                password_hash: None::<String>,
+                created_at: now,
+                updated_at: now,
+                ready_at: None::<i64>,
+                expires_at,
+                uploaded_bytes: 0,
+                recording_ended_at: None::<i64>,
+            })
+            .exec(&mut tx)
+            .await;
+            match created {
+                Ok(v) => {
+                    tx.commit().await.map_err(orm_err)?;
+                    return Ok(v);
+                }
+                Err(e) if is_unique_violation(&e) => continue,
+                Err(e) => return Err(orm_err(e)),
             }
         }
+        Err(AppError::Internal("could not allocate slug".into()))
     }
-    let _ = st.store.abort_multipart(&key, &upload_id).await;
-    Err(AppError::Internal("could not allocate slug".into()))
+    .await;
+    if created.is_err() {
+        let _ = st.store.abort_multipart(&key, &upload_id).await;
+    }
+    created
 }
 
 pub async fn presign_parts(
     st: &AppState,
+    scope: &Scope,
     v: &Video,
-    part_numbers: &[i32],
-) -> AppResult<Vec<(i32, String)>> {
+    parts: &[(i32, i64)],
+) -> AppResult<Vec<(i32, crate::storage::PresignedPut)>> {
     let upload_id = match (&v.upload_id, v.status.as_str()) {
         (Some(u), "pending") => u,
         _ => return Err(AppError::Invalid("upload already completed".into())),
     };
-    if part_numbers.is_empty() || part_numbers.len() > MAX_PART_BATCH {
+    let now = now_ms();
+    if v.created_at < now - STALE_PENDING_MS {
+        return Err(AppError::Invalid(
+            "this upload has expired; share the recording again".into(),
+        ));
+    }
+    if parts.is_empty() || parts.len() > MAX_PART_BATCH {
         return Err(AppError::Invalid(format!(
-            "request between 1 and {MAX_PART_BATCH} part numbers"
+            "request between 1 and {MAX_PART_BATCH} parts"
         )));
     }
-    let mut out = Vec::with_capacity(part_numbers.len());
-    for &n in part_numbers {
-        if !(1..=MAX_PARTS).contains(&n) {
+    let max_part = MAX_PART_BYTES.min(st.config.max_video_bytes);
+    let mut seen = std::collections::HashSet::with_capacity(parts.len());
+    for &(n, size) in parts {
+        if !(1..=MAX_PARTS).contains(&n) || !seen.insert(n) {
             return Err(AppError::Invalid(format!(
-                "part numbers must be between 1 and {MAX_PARTS}"
+                "part numbers must be distinct and between 1 and {MAX_PARTS}"
             )));
         }
-        let url = st
+        if size <= 0 {
+            return Err(AppError::Invalid("part sizes must be positive".into()));
+        }
+        if size > max_part {
+            return Err(AppError::TooLarge);
+        }
+    }
+    reserve_parts(st, scope, v, parts, now).await?;
+    let mut out = Vec::with_capacity(parts.len());
+    for &(n, size) in parts {
+        let put = st
             .store
-            .presign_upload_part(&v.object_key, upload_id, n, PART_URL_TTL)
+            .presign_upload_part(&v.object_key, upload_id, n, size, PART_URL_TTL)
             .await
             .map_err(store_err)?;
-        out.push((n, url));
+        out.push((n, put));
     }
     Ok(out)
+}
+
+/// Record the byte size of each part before any URL is signed for it. A part's size is
+/// fixed once reserved (asking again with the same size is fine), so the bytes in storage
+/// never exceed the reservation; the video's parts stay within `max_video_bytes` and all of
+/// the account's unfinished uploads within `max_pending_upload_bytes`.
+async fn reserve_parts(
+    st: &AppState,
+    scope: &Scope,
+    v: &Video,
+    parts: &[(i32, i64)],
+    now: i64,
+) -> AppResult<()> {
+    let mut db = st.orm().await?;
+    let mut tx = begin(&mut db, &scope.context()).await?;
+    lock_uploads(&mut tx, &v.user_id).await?;
+    // Completion takes the same lock; once it has run there is nothing left to reserve.
+    let still_pending = query_in(
+        &mut tx,
+        "SELECT 1 FROM videos WHERE id = $1 AND status = 'pending'",
+        &vals![v.id.as_str()],
+    )
+    .await?;
+    if still_pending.is_empty() {
+        return Err(AppError::Invalid("upload already completed".into()));
+    }
+    let mut params: Vec<Value> = vec![v.id.as_str().into()];
+    params.extend(parts.iter().map(|(n, _)| Value::from(*n)));
+    let existing = query_in(
+        &mut tx,
+        &format!(
+            "SELECT part_number, byte_size FROM upload_parts WHERE video_id = $1 AND part_number IN ({})",
+            placeholders(2, parts.len())
+        ),
+        &params,
+    )
+    .await?;
+    let mut reserved = HashMap::with_capacity(existing.len());
+    for r in &existing {
+        reserved.insert(r.i64(0)? as i32, r.i64(1)?);
+    }
+    let mut fresh = Vec::with_capacity(parts.len());
+    for &(n, size) in parts {
+        match reserved.get(&n) {
+            Some(&s) if s != size => {
+                return Err(AppError::Invalid(format!(
+                    "part {n} was already requested with {s} bytes"
+                )));
+            }
+            Some(_) => {}
+            None => fresh.push((n, size)),
+        }
+    }
+    if fresh.is_empty() {
+        return Ok(());
+    }
+    let mut params: Vec<Value> = Vec::with_capacity(fresh.len() * 6);
+    let rows: Vec<String> = fresh
+        .iter()
+        .enumerate()
+        .map(|(i, &(n, size))| {
+            params.extend([
+                v.id.as_str().into(),
+                n.into(),
+                v.user_id.as_str().into(),
+                v.workspace_id.as_deref().into(),
+                size.into(),
+                now.into(),
+            ]);
+            format!("({})", placeholders(i * 6 + 1, 6))
+        })
+        .collect();
+    execute_in(
+        &mut tx,
+        &format!(
+            "INSERT INTO upload_parts (video_id, part_number, user_id, workspace_id, byte_size, created_at) \
+             VALUES {}",
+            rows.join(", ")
+        ),
+        &params,
+    )
+    .await?;
+    let sums = query_in(
+        &mut tx,
+        "SELECT COALESCE(SUM(p.byte_size) FILTER (WHERE p.video_id = $2), 0)::BIGINT, \
+                COALESCE(SUM(p.byte_size), 0)::BIGINT \
+         FROM upload_parts p JOIN videos v ON v.id = p.video_id \
+         WHERE p.user_id = $1 AND v.status = 'pending' AND v.created_at >= $3",
+        &vals![v.user_id.as_str(), v.id.as_str(), now - STALE_PENDING_MS],
+    )
+    .await?;
+    let (video, account) = match sums.first() {
+        Some(r) => (r.i64(0)?, r.i64(1)?),
+        None => (0, 0),
+    };
+    if video > st.config.max_video_bytes || account > st.config.max_pending_upload_bytes {
+        // Dropping the transaction rolls the reservation back.
+        return Err(AppError::TooLarge);
+    }
+    tx.commit().await.map_err(orm_err)?;
+    Ok(())
 }
 
 pub struct Completion {
@@ -237,6 +421,10 @@ pub struct Completion {
     pub height: Option<i64>,
 }
 
+/// Finish a recording's upload. Idempotent: a retry after the store already assembled the
+/// object (the process or the database failed before the row became ready) finds the
+/// upload gone, checks the object against the reserved sizes of the named parts and
+/// finishes the transition.
 pub async fn complete(st: &AppState, scope: &Scope, v: Video, c: Completion) -> AppResult<Video> {
     if v.status == "ready" {
         return Ok(v);
@@ -247,47 +435,68 @@ pub async fn complete(st: &AppState, scope: &Scope, v: Video, c: Completion) -> 
         .ok_or_else(|| AppError::Invalid("no upload in progress".into()))?;
     let mut parts = c.parts;
     if parts.is_empty() || parts.len() > MAX_PARTS as usize {
-        return Err(AppError::Invalid("parts must not be empty".into()));
+        return Err(AppError::Invalid(format!(
+            "list between 1 and {MAX_PARTS} parts"
+        )));
     }
     parts.sort_by_key(|p| p.0);
     if parts.windows(2).any(|w| w[0].0 == w[1].0)
         || parts
             .iter()
-            .any(|(n, tag)| !(1..=MAX_PARTS).contains(n) || tag.is_empty() || tag.len() > 200)
+            .any(|(n, tag)| !(1..=MAX_PARTS).contains(n) || !valid_etag(tag))
     {
         return Err(AppError::Invalid("invalid parts list".into()));
     }
     if c.width.is_some_and(|w| w <= 0) || c.height.is_some_and(|h| h <= 0) {
         return Err(AppError::Invalid("width/height must be positive".into()));
     }
-    st.store
+    let reserved = reserved_parts(st, scope, &v.id).await?;
+    let mut expected = 0;
+    for (n, _) in &parts {
+        expected += reserved.get(n).ok_or_else(|| {
+            AppError::Invalid(format!("part {n} was never requested for this upload"))
+        })?;
+    }
+    let recovering = match st
+        .store
         .complete_multipart(&v.object_key, &upload_id, &parts)
         .await
-        .map_err(|e| {
-            if e.0.contains("InvalidPart") || e.0.contains("EntityTooSmall") {
-                AppError::Invalid(format!("upload could not be completed: {}", e.0))
+    {
+        Ok(()) => false,
+        Err(e) if e.0.contains("NoSuchUpload") => true,
+        Err(e) if e.0.contains("InvalidPart") || e.0.contains("EntityTooSmall") => {
+            return Err(AppError::Invalid(format!(
+                "upload could not be completed: {}",
+                e.0
+            )));
+        }
+        Err(e) => return Err(store_err(e)),
+    };
+    let meta = st.store.head(&v.object_key).await.map_err(store_err)?;
+    let size = match meta {
+        Some(m) if m.size == expected => m.size,
+        // Just assembled from parts whose sizes were signed, yet not the reserved size: the
+        // store let unreserved bytes in. Keep none of it.
+        Some(m) if !recovering => {
+            purge(st, &scope.context(), &v).await?;
+            return Err(if m.size > st.config.max_video_bytes {
+                AppError::TooLarge
             } else {
-                store_err(e)
-            }
-        })?;
-    let meta = st
-        .store
-        .head(&v.object_key)
-        .await
-        .map_err(store_err)?
-        .ok_or(AppError::NotUploaded)?;
-    if meta.size > st.config.max_video_bytes {
-        purge(st, &scope.context(), &v).await?;
-        return Err(AppError::TooLarge);
-    }
+                AppError::NotUploaded
+            });
+        }
+        // Aborted, never assembled, or assembled from other parts than these.
+        _ => return Err(AppError::NotUploaded),
+    };
     let now = now_ms();
     let duration = c.duration_ms.unwrap_or(0).clamp(0, 24 * 3_600_000);
     let mut db = st.orm().await?;
     let mut tx = begin(&mut db, &scope.context()).await?;
+    lock_uploads(&mut tx, &v.user_id).await?;
     Video::update_by_id(&v.id)
         .status("ready")
         .upload_id(None::<String>)
-        .byte_size(meta.size)
+        .byte_size(size)
         .duration_ms(duration)
         .width(c.width.or(v.width))
         .height(c.height.or(v.height))
@@ -296,8 +505,32 @@ pub async fn complete(st: &AppState, scope: &Scope, v: Video, c: Completion) -> 
         .exec(&mut tx)
         .await
         .map_err(orm_err)?;
+    // No longer pending: release the reservation.
+    execute_in(
+        &mut tx,
+        "DELETE FROM upload_parts WHERE video_id = $1",
+        &vals![v.id.as_str()],
+    )
+    .await?;
     tx.commit().await.map_err(orm_err)?;
     scope.managed(st, &v.id).await
+}
+
+/// Reserved size per part number of a pending upload.
+async fn reserved_parts(st: &AppState, scope: &Scope, id: &str) -> AppResult<HashMap<i32, i64>> {
+    let rows = st
+        .db
+        .scoped(scope.context())
+        .query(
+            "SELECT part_number, byte_size FROM upload_parts WHERE video_id = $1",
+            &vals![id],
+        )
+        .await?;
+    let mut out = HashMap::with_capacity(rows.len());
+    for r in &rows {
+        out.insert(r.i64(0)? as i32, r.i64(1)?);
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,12 +558,26 @@ impl Asset {
             Asset::Transcript => "vtt",
         }
     }
+    /// The asset's deterministic object key.
+    fn key(self, v: &Video) -> String {
+        format!(
+            "{}.{}",
+            base_key(&v.user_id, &v.id, v.created_at),
+            self.ext()
+        )
+    }
+    fn published(self, v: &Video) -> Option<&str> {
+        match self {
+            Asset::Thumbnail => v.thumbnail_key.as_deref(),
+            Asset::Transcript => v.transcript_key.as_deref(),
+        }
+    }
 }
 
-/// Presigned PUT for a poster frame or WebVTT transcript; records its key on the video.
+/// Presigned PUT for a poster frame or WebVTT transcript. Nothing is published until
+/// [`complete_asset`] finds the object.
 pub async fn presign_asset(
     st: &AppState,
-    scope: &Scope,
     v: &Video,
     asset: Asset,
     byte_size: i64,
@@ -341,26 +588,73 @@ pub async fn presign_asset(
     if byte_size > asset.max() {
         return Err(AppError::TooLarge);
     }
-    let key = format!(
-        "{}.{}",
-        base_key(&v.user_id, &v.id, v.created_at),
-        asset.ext()
-    );
-    let put = st
-        .store
-        .presign_put(&key, asset.content_type(), byte_size, ASSET_PUT_TTL)
+    st.store
+        .presign_put(
+            &asset.key(v),
+            asset.content_type(),
+            byte_size,
+            ASSET_PUT_TTL,
+        )
         .await
-        .map_err(store_err)?;
+        .map_err(store_err)
+}
+
+/// Publish an uploaded poster frame or transcript: the object must exist, fit the asset's
+/// limit and have its content type. Setting the key notifies every open watch page.
+pub async fn complete_asset(
+    st: &AppState,
+    scope: &Scope,
+    v: &Video,
+    asset: Asset,
+) -> AppResult<Video> {
+    let key = asset.key(v);
+    let meta = st
+        .store
+        .head(&key)
+        .await
+        .map_err(store_err)?
+        .ok_or(AppError::NotUploaded)?;
+    let typed = meta
+        .content_type
+        .as_deref()
+        .and_then(|t| t.split(';').next())
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case(asset.content_type()));
+    let fits = (1..=asset.max()).contains(&meta.size);
+    if !(typed && fits) {
+        // Only a store that ignored the signed length and type lets this in. The object
+        // replaced any earlier upload under the same key: delete it and unpublish.
+        st.store
+            .delete_many(std::slice::from_ref(&key))
+            .await
+            .map_err(store_err)?;
+        if asset.published(v).is_some() {
+            set_asset_key(st, scope, v, asset, None).await?;
+        }
+        return Err(AppError::NotUploaded);
+    }
+    set_asset_key(st, scope, v, asset, Some(key)).await?;
+    scope.managed(st, &v.id).await
+}
+
+async fn set_asset_key(
+    st: &AppState,
+    scope: &Scope,
+    v: &Video,
+    asset: Asset,
+    key: Option<String>,
+) -> AppResult<()> {
     let mut db = st.orm().await?;
     let mut tx = begin(&mut db, &scope.context()).await?;
     let q = Video::update_by_id(&v.id).updated_at(now_ms());
-    let q = match asset {
-        Asset::Thumbnail => q.thumbnail_key(Some(key)),
-        Asset::Transcript => q.transcript_key(Some(key)),
-    };
-    q.exec(&mut tx).await.map_err(orm_err)?;
+    match asset {
+        Asset::Thumbnail => q.thumbnail_key(key),
+        Asset::Transcript => q.transcript_key(key),
+    }
+    .exec(&mut tx)
+    .await
+    .map_err(orm_err)?;
     tx.commit().await.map_err(orm_err)?;
-    Ok(put)
+    Ok(())
 }
 
 // ---------- owner edits ----------
@@ -449,6 +743,12 @@ pub async fn purge(st: &AppState, ctx: &Context, v: &Video) -> AppResult<()> {
         .exec(&mut tx)
         .await
         .map_err(orm_err)?;
+    execute_in(
+        &mut tx,
+        "DELETE FROM upload_parts WHERE video_id = $1",
+        &vals![v.id.as_str()],
+    )
+    .await?;
     Video::filter_by_id(&v.id)
         .delete()
         .exec(&mut tx)
@@ -615,17 +915,22 @@ async fn counts(
 
 // ---------- conversation ----------
 
+/// The latest [`MAX_LISTED`] comments, oldest first; the bound is in the query.
 pub async fn comments(st: &AppState, scope: &Scope, v: &Video) -> AppResult<Vec<Comment>> {
     let mut db = st.orm().await?;
     let mut tx = begin(&mut db, &scope.share(v)).await?;
     let mut c = Comment::filter_by_item_id(&v.id)
+        .order_by((
+            Comment::fields().created_at().desc(),
+            Comment::fields().id().desc(),
+        ))
+        .limit(MAX_LISTED)
         .exec(&mut tx)
         .await
         .map_err(orm_err)?;
     tx.commit().await.map_err(orm_err)?;
-    c.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-    let skip = c.len().saturating_sub(MAX_LISTED);
-    Ok(c.split_off(skip))
+    c.reverse();
+    Ok(c)
 }
 
 pub enum Author {
@@ -715,6 +1020,18 @@ pub async fn reactions(
     scope: &Scope,
     v: &Video,
 ) -> AppResult<(Vec<(&'static str, i64)>, Vec<Reaction>)> {
+    tokio::try_join!(
+        reaction_totals(st, scope, v),
+        reaction_markers(st, scope, v)
+    )
+}
+
+/// Reactions per emoji, in allowlist order (one grouped count).
+pub async fn reaction_totals(
+    st: &AppState,
+    scope: &Scope,
+    v: &Video,
+) -> AppResult<Vec<(&'static str, i64)>> {
     let rows = st
         .db
         .scoped(scope.share(v))
@@ -730,17 +1047,26 @@ pub async fn reactions(
             t.1 = n;
         }
     }
+    Ok(totals)
+}
+
+/// The latest [`MAX_LISTED`] timestamped reactions, oldest first, for timeline markers.
+pub async fn reaction_markers(st: &AppState, scope: &Scope, v: &Video) -> AppResult<Vec<Reaction>> {
     let mut db = st.orm().await?;
     let mut tx = begin(&mut db, &scope.share(v)).await?;
     let mut recent = Reaction::filter_by_item_id(&v.id)
+        .filter(Reaction::fields().timestamp_ms().is_some())
+        .order_by((
+            Reaction::fields().created_at().desc(),
+            Reaction::fields().id().desc(),
+        ))
+        .limit(MAX_LISTED)
         .exec(&mut tx)
         .await
         .map_err(orm_err)?;
     tx.commit().await.map_err(orm_err)?;
-    recent.retain(|r| r.timestamp_ms.is_some());
-    recent.sort_by_key(|r| r.created_at);
-    let skip = recent.len().saturating_sub(MAX_LISTED);
-    Ok((totals, recent.split_off(skip)))
+    recent.reverse();
+    Ok(recent)
 }
 
 /// WebVTT text for the watch page (fetched from storage, small).

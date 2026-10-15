@@ -146,22 +146,26 @@ impl Scope {
             .ok_or(AppError::NotFound)
     }
 
-    /// Items listed in this principal's library, newest first.
+    /// Items listed in this principal's library, newest first. Expiry, order and the
+    /// limit are part of the query.
     pub async fn items(&self, st: &AppState, limit: usize) -> AppResult<Vec<Video>> {
         let Some(user) = self.user_id else {
             return Ok(Vec::new());
         };
         let mut db = st.orm().await?;
         let mut tx = begin(&mut db, &self.context()).await?;
-        let now = now_ms();
         let mut v = Video::filter_by_user_id(user.to_string())
+            .filter(Video::fields().expires_at().gt(now_ms()))
+            .order_by((
+                Video::fields().created_at().desc(),
+                Video::fields().id().desc(),
+            ))
+            .limit(limit)
             .exec(&mut tx)
             .await
             .map_err(orm_err)?;
         tx.commit().await.map_err(orm_err)?;
-        v.retain(|v| v.expires_at > now && self.can_manage(v));
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
-        v.truncate(limit);
+        v.retain(|v| self.can_manage(v));
         Ok(v)
     }
 }

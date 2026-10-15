@@ -17,8 +17,8 @@ use crate::storage::PresignedPut;
 use crate::video::model::Video;
 use crate::video::scope::{Scope, Visibility};
 use crate::video::service::{
-    self, Asset, Completion, Edit, MAX_PART_BATCH, MIN_PART_BYTES, NewVideo, PART_URL_TTL,
-    share_url,
+    self, Asset, Completion, Edit, MAX_PART_BATCH, MAX_PARTS, MIN_PART_BYTES, NewVideo,
+    PART_URL_TTL, share_url,
 };
 
 fn scope(st: &AppState, user: &AuthUser) -> AppResult<Scope> {
@@ -83,6 +83,7 @@ pub async fn create(
     body["upload"] = json!({
         "min_part_bytes": MIN_PART_BYTES,
         "max_bytes": st.config.max_video_bytes,
+        "max_parts": MAX_PARTS,
         "max_part_batch": MAX_PART_BATCH,
         "part_url_ttl_seconds": PART_URL_TTL.as_secs(),
     });
@@ -106,20 +107,37 @@ pub async fn get(
 }
 
 #[derive(Deserialize)]
-pub struct PartsBody {
-    part_numbers: Vec<i32>,
+pub struct PartRequest {
+    part_number: i32,
+    size: i64,
 }
 
+#[derive(Deserialize)]
+pub struct PartsBody {
+    parts: Vec<PartRequest>,
+}
+
+/// Presigned UploadPart URLs. Each part's size is reserved first and signed into its URL,
+/// so the PUT must carry exactly that `Content-Length` (returned in `headers`).
 pub async fn parts(
     State(st): State<AppState>,
     user: AuthUser,
     Path(id): Path<String>,
     ApiJson(b): ApiJson<PartsBody>,
 ) -> AppResult<Json<Value>> {
-    let v = scope(&st, &user)?.managed(&st, &id).await?;
-    let urls = service::presign_parts(&st, &v, &b.part_numbers).await?;
+    let scope = scope(&st, &user)?;
+    let v = scope.managed(&st, &id).await?;
+    let wanted: Vec<(i32, i64)> = b.parts.iter().map(|p| (p.part_number, p.size)).collect();
+    let urls = service::presign_parts(&st, &scope, &v, &wanted).await?;
     Ok(Json(json!({
-        "parts": urls.into_iter().map(|(n, url)| json!({"part_number": n, "method": "PUT", "url": url})).collect::<Vec<_>>(),
+        "parts": urls
+            .into_iter()
+            .map(|(n, put)| {
+                let mut part = put_json(put);
+                part["part_number"] = n.into();
+                part
+            })
+            .collect::<Vec<_>>(),
         "expires_in": PART_URL_TTL.as_secs(),
     })))
 }
@@ -177,10 +195,39 @@ async fn asset(
     b: AssetBody,
     kind: Asset,
 ) -> AppResult<Json<Value>> {
+    let v = scope(&st, &user)?.managed(&st, &id).await?;
+    let put = service::presign_asset(&st, &v, kind, b.byte_size).await?;
+    Ok(Json(json!({"upload": put_json(put)})))
+}
+
+/// Publish an uploaded poster frame or transcript (empty body): 200 with the video, or
+/// 409 `NOT_UPLOADED` when the object is missing or does not match.
+async fn asset_done(
+    st: AppState,
+    user: AuthUser,
+    id: String,
+    kind: Asset,
+) -> AppResult<Json<Value>> {
     let scope = scope(&st, &user)?;
     let v = scope.managed(&st, &id).await?;
-    let put = service::presign_asset(&st, &scope, &v, kind, b.byte_size).await?;
-    Ok(Json(json!({"upload": put_json(put)})))
+    let v = service::complete_asset(&st, &scope, &v, kind).await?;
+    Ok(Json(video_json(&st, &v)))
+}
+
+pub async fn thumbnail_complete(
+    State(st): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    asset_done(st, user, id, Asset::Thumbnail).await
+}
+
+pub async fn transcript_complete(
+    State(st): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    asset_done(st, user, id, Asset::Transcript).await
 }
 
 pub async fn thumbnail(
