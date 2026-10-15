@@ -475,6 +475,48 @@ async fn provider_login_gets_app_privileges_through_membership() {
         .await
         .unwrap();
     assert!(checks.iter().all(|(_, ok)| *ok), "{checks:?}");
+    // A recursive SET ROLE path is dangerous even when inheritance is disabled.
+    let bridge = format!("{login}_bridge");
+    for sql in [
+        format!("CREATE ROLE {bridge} NOLOGIN"),
+        format!("GRANT {bypass} TO {bridge} WITH INHERIT FALSE, SET TRUE"),
+        format!("GRANT {bridge} TO {login} WITH INHERIT FALSE, SET TRUE"),
+        "CREATE TABLE role_owned_probe (id INT)".into(),
+        format!("ALTER TABLE role_owned_probe OWNER TO {bridge}"),
+        "CREATE FUNCTION privileged_probe() RETURNS integer LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'".into(),
+    ] {
+        t.owner.execute(&sql, &[]).await.unwrap();
+    }
+    let checks = easyshot_server::prod::verify(&t.owner_url, &login_url)
+        .await
+        .unwrap();
+    for what in [
+        "app login cannot inherit or SET ROLE to an elevated role",
+        "app role owns no tables",
+        "app login cannot execute schema SECURITY DEFINER functions",
+    ] {
+        assert!(checks.iter().any(|(w, ok)| w == what && !ok), "{checks:?}");
+    }
+    t.owner
+        .execute(&format!("REVOKE {bridge} FROM {login}"), &[])
+        .await
+        .unwrap();
+    t.owner
+        .execute(&format!("REVOKE {bypass} FROM {bridge}"), &[])
+        .await
+        .unwrap();
+    t.owner
+        .execute("DROP TABLE role_owned_probe", &[])
+        .await
+        .unwrap();
+    t.owner
+        .execute("DROP FUNCTION privileged_probe()", &[])
+        .await
+        .unwrap();
+    t.owner
+        .execute(&format!("DROP ROLE {bridge}"), &[])
+        .await
+        .unwrap();
     drop(db);
     let _ = t
         .owner

@@ -147,14 +147,66 @@ pub async fn verify(owner_url: &str, app_url: &str) -> DbResult<Vec<Check>> {
     ));
     checks.push(("app role is not a superuser".into(), !superuser));
     checks.push(("app role cannot bypass row-level security".into(), !bypass));
+    // USAGE follows inherited privileges; SET also finds roles reachable only through
+    // SET ROLE (including recursive memberships with INHERIT FALSE).
+    let reachable =
+        "(pg_has_role(current_user, r.oid, 'USAGE') OR pg_has_role(current_user, r.oid, 'SET'))";
+    let elevated: i64 = app
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM pg_roles r WHERE {reachable} AND \
+         (r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication \
+          OR r.rolname IN ('pg_read_all_data', 'pg_write_all_data', 'pg_read_server_files', \
+                          'pg_write_server_files', 'pg_execute_server_program'))"
+            ),
+            &[],
+        )
+        .await?
+        .get(0);
+    checks.push((
+        "app login cannot inherit or SET ROLE to an elevated role".into(),
+        elevated == 0,
+    ));
     let owned: i64 = app
         .query_one(
-            "SELECT count(*) FROM pg_tables WHERE schemaname = $1 AND tableowner = current_user",
+            &format!(
+                "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_roles r ON r.oid = c.relowner WHERE n.nspname = $1 AND {reachable}"
+            ),
             &[&schema],
         )
         .await?
         .get(0);
     checks.push(("app role owns no tables".into(), owned == 0));
+    let schema_owner: bool = app
+        .query_one(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner \
+         WHERE n.nspname = $1 AND {reachable})"
+            ),
+            &[&schema],
+        )
+        .await?
+        .get(0);
+    checks.push((
+        "app login cannot assume the schema owner".into(),
+        !schema_owner,
+    ));
+    let definers: i64 = app.query_one(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = $1 AND p.prosecdef AND has_function_privilege(current_user, p.oid, 'EXECUTE')",
+        &[&schema]).await?.get(0);
+    checks.push((
+        "app login cannot execute schema SECURITY DEFINER functions".into(),
+        definers == 0,
+    ));
+    let grant_callable: bool = app.query_one(
+        "SELECT COALESCE(has_function_privilege(current_user, to_regprocedure('easyshot_grant_app_login(text,boolean)'), 'EXECUTE'), false)",
+        &[]).await?.get(0);
+    checks.push((
+        "app login cannot execute the role grant helper".into(),
+        !grant_callable,
+    ));
     let dev_password = app_url
         .trim()
         .parse::<tokio_postgres::Config>()
