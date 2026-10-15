@@ -8,7 +8,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
-use crate::db::{placeholders, Context, Db, DbResult, Row};
+use crate::db::{Context, Db, DbResult, Row, placeholders};
 use crate::vals;
 
 /// Rows per `IN (...)` / `DELETE` statement.
@@ -497,13 +497,13 @@ pub async fn insert_screenshot(db: &Db, s: &NewScreenshot<'_>) -> DbResult<bool>
 pub async fn get_screenshot(db: &Db, id: Uuid, user_id: Uuid) -> DbResult<Option<Screenshot>> {
     db.scoped(Context::user(user_id))
         .query_opt(
-        &format!("SELECT {COLS} FROM screenshots WHERE id = $1 AND user_id = $2"),
-        &vals![id, user_id],
-    )
-    .await?
-    .as_ref()
-    .map(screenshot)
-    .transpose()
+            &format!("SELECT {COLS} FROM screenshots WHERE id = $1 AND user_id = $2"),
+            &vals![id, user_id],
+        )
+        .await?
+        .as_ref()
+        .map(screenshot)
+        .transpose()
 }
 
 pub async fn mark_ready(db: &Db, id: Uuid, user_id: Uuid, now: i64) -> DbResult<()> {
@@ -519,10 +519,10 @@ pub async fn mark_ready(db: &Db, id: Uuid, user_id: Uuid, now: i64) -> DbResult<
 pub async fn delete_screenshot(db: &Db, id: Uuid, user_id: Uuid) -> DbResult<()> {
     db.scoped(Context::user(user_id))
         .execute(
-        "DELETE FROM screenshots WHERE id = $1 AND user_id = $2",
-        &vals![id, user_id],
-    )
-    .await?;
+            "DELETE FROM screenshots WHERE id = $1 AND user_id = $2",
+            &vals![id, user_id],
+        )
+        .await?;
     Ok(())
 }
 
@@ -642,11 +642,12 @@ pub async fn inactive_users(db: &Db, last_seen_before: i64, limit: i64) -> DbRes
 
 pub async fn user_screenshots(db: &Db, user_id: Uuid, limit: i64) -> DbResult<KeyedIds> {
     keyed(
-        db.scoped(Context::user(user_id)).query(
-            "SELECT id, object_key FROM screenshots WHERE user_id = $1 LIMIT $2",
-            &vals![user_id, limit],
-        )
-        .await?,
+        db.scoped(Context::user(user_id))
+            .query(
+                "SELECT id, object_key FROM screenshots WHERE user_id = $1 LIMIT $2",
+                &vals![user_id, limit],
+            )
+            .await?,
     )
 }
 

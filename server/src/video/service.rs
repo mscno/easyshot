@@ -682,7 +682,7 @@ pub async fn reactions(
         .map_err(orm_err)?;
     tx.commit().await.map_err(orm_err)?;
     recent.retain(|r| r.timestamp_ms.is_some());
-    recent.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    recent.sort_by_key(|r| r.created_at);
     let skip = recent.len().saturating_sub(MAX_LISTED);
     Ok((totals, recent.split_off(skip)))
 }

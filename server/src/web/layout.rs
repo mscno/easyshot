@@ -3,8 +3,8 @@
 use std::future::Future;
 
 use topcoat::{
-    view::{component, view, Child, View},
     Result,
+    view::{Child, View, component, view},
 };
 
 use super::assets;
@@ -75,7 +75,12 @@ pub async fn shell(
                 if !bare {
                     <header class="topbar">
                         <a class="brand" href="/">
-                            <img src=(assets::url("icon.svg")) alt="" width="28" height="28">
+                            <img
+                                src=(assets::url("icon.svg"))
+                                alt=""
+                                width="28"
+                                height="28"
+                            >
                             <span>"Shotglass"</span>
                         </a>
                         <nav>

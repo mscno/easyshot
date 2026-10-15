@@ -238,7 +238,10 @@ mod tests {
         .unwrap();
         assert_eq!(c.s3_bucket, "tigris-bucket");
         assert_eq!(c.s3_region, "auto");
-        assert_eq!(c.migration_database_url.as_deref(), Some("postgres://owner@db/x"));
+        assert_eq!(
+            c.migration_database_url.as_deref(),
+            Some("postgres://owner@db/x")
+        );
         assert_eq!(c.inactive_user_days, 0);
         let c = Config::from_lookup(lookup(&[
             ("DATABASE_URL", "x"),
@@ -252,12 +255,14 @@ mod tests {
             (c.s3_bucket.as_str(), c.s3_region.as_str()),
             ("a", "eu-west-1")
         );
-        assert!(Config::from_lookup(lookup(&[
-            ("DATABASE_URL", "x"),
-            ("S3_BUCKET", "b"),
-            ("INACTIVE_USER_DAYS", "-1")
-        ]))
-        .is_err());
+        assert!(
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "x"),
+                ("S3_BUCKET", "b"),
+                ("INACTIVE_USER_DAYS", "-1")
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -290,17 +295,21 @@ mod tests {
     #[test]
     fn errors() {
         assert!(Config::from_lookup(lookup(&[])).is_err());
-        assert!(Config::from_lookup(lookup(&[
-            ("DATABASE_URL", "x"),
-            ("S3_BUCKET", "b"),
-            ("RETENTION_DAYS", "abc")
-        ]))
-        .is_err());
-        assert!(Config::from_lookup(lookup(&[
-            ("DATABASE_URL", "x"),
-            ("S3_BUCKET", "b"),
-            ("ALLOW_SIGNUPS", "maybe")
-        ]))
-        .is_err());
+        assert!(
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "x"),
+                ("S3_BUCKET", "b"),
+                ("RETENTION_DAYS", "abc")
+            ]))
+            .is_err()
+        );
+        assert!(
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "x"),
+                ("S3_BUCKET", "b"),
+                ("ALLOW_SIGNUPS", "maybe")
+            ]))
+            .is_err()
+        );
     }
 }

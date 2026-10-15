@@ -5,12 +5,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
-use aws_sdk_s3::Client;
 
 use crate::config::Config;
 

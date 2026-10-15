@@ -2,11 +2,11 @@
 //! video is created; the client streams parts to presigned URLs while still recording and
 //! completes the upload when it stops. Video bytes never pass through this server.
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::ApiJson;
 use crate::auth::AuthUser;
@@ -17,8 +17,8 @@ use crate::storage::PresignedPut;
 use crate::video::model::Video;
 use crate::video::scope::{Scope, Visibility};
 use crate::video::service::{
-    self, share_url, Asset, Completion, Edit, NewVideo, MAX_PART_BATCH, MIN_PART_BYTES,
-    PART_URL_TTL,
+    self, Asset, Completion, Edit, MAX_PART_BATCH, MIN_PART_BYTES, NewVideo, PART_URL_TTL,
+    share_url,
 };
 
 fn scope(st: &AppState, user: &AuthUser) -> AppResult<Scope> {
@@ -151,7 +151,11 @@ pub async fn complete(
         &scope,
         v,
         Completion {
-            parts: b.parts.into_iter().map(|p| (p.part_number, p.etag)).collect(),
+            parts: b
+                .parts
+                .into_iter()
+                .map(|p| (p.part_number, p.etag))
+                .collect(),
             duration_ms: b.duration_ms,
             width: b.width,
             height: b.height,
@@ -166,7 +170,13 @@ pub struct AssetBody {
     byte_size: i64,
 }
 
-async fn asset(st: AppState, user: AuthUser, id: String, b: AssetBody, kind: Asset) -> AppResult<Json<Value>> {
+async fn asset(
+    st: AppState,
+    user: AuthUser,
+    id: String,
+    b: AssetBody,
+    kind: Asset,
+) -> AppResult<Json<Value>> {
     let scope = scope(&st, &user)?;
     let v = scope.managed(&st, &id).await?;
     let put = service::presign_asset(&st, &scope, &v, kind, b.byte_size).await?;
@@ -208,10 +218,9 @@ pub async fn update(
     let v = scope.managed(&st, &id).await?;
     let visibility = match b.visibility.as_deref() {
         None => None,
-        Some(s) => Some(
-            Visibility::parse(s)
-                .ok_or_else(|| AppError::Invalid("visibility must be link, password or private".into()))?,
-        ),
+        Some(s) => Some(Visibility::parse(s).ok_or_else(|| {
+            AppError::Invalid("visibility must be link, password or private".into())
+        })?),
     };
     let v = service::edit(
         &st,

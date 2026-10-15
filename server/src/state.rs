@@ -9,8 +9,8 @@ use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::mailer::{DisabledMailer, LettermintMailer, Mailer};
 use crate::storage::{ObjectStore, S3Store};
-use crate::video::live::Hub;
 use crate::video::limit::RateLimiter;
+use crate::video::live::Hub;
 
 #[derive(Clone)]
 pub struct AppState {

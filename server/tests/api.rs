@@ -3,17 +3,17 @@
 
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
+use axum::body::Body;
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use shotglass_server::config::Config;
 use shotglass_server::db::{Db, DbError};
 use shotglass_server::mailer::{Email, LettermintMailer, Mailer, MemoryMailer};
 use shotglass_server::repo::{self, now_ms};
 use shotglass_server::storage::MemoryStore;
-use shotglass_server::{router, vals, AppState};
+use shotglass_server::{AppState, router, vals};
 use tower::ServiceExt;
 
 const HOUR: i64 = 3_600_000;
@@ -38,7 +38,8 @@ impl Ctx {
         let store = Arc::new(MemoryStore::new());
         let mail = MemoryMailer::new();
         let app = router(
-            AppState::new(test_db.app.clone(), store.clone(), cfg.clone()).with_mailer(mail.clone()),
+            AppState::new(test_db.app.clone(), store.clone(), cfg.clone())
+                .with_mailer(mail.clone()),
         );
         Ctx {
             app,
@@ -54,8 +55,12 @@ impl Ctx {
     fn reconfigure(mut self, f: impl FnOnce(&mut Config)) -> Ctx {
         f(&mut self.cfg);
         self.app = router(
-            AppState::new(self.test_db.app.clone(), self.store.clone(), self.cfg.clone())
-                .with_mailer(self.mail.clone()),
+            AppState::new(
+                self.test_db.app.clone(),
+                self.store.clone(),
+                self.cfg.clone(),
+            )
+            .with_mailer(self.mail.clone()),
         );
         self
     }
@@ -804,19 +809,20 @@ async fn expiry_and_cron(c: Ctx) {
     );
     assert!(!c.store.contains(&old_key));
     assert!(!c.store.contains(&stale_key));
-    assert!(c
-        .store
-        .contains(&c.key_of(keep["id"].as_str().unwrap()).await));
+    assert!(
+        c.store
+            .contains(&c.key_of(keep["id"].as_str().unwrap()).await)
+    );
     assert_eq!(c.count("screenshots").await, 2); // keep + fresh pending
-    assert!(c
-        .db
-        .query_opt(
+    assert!(
+        c.db.query_opt(
             "SELECT 1 FROM screenshots WHERE id = $1",
             &vals![fresh["id"].as_str().unwrap()]
         )
         .await
         .unwrap()
-        .is_some());
+        .is_some()
+    );
     let (s, ..) = c
         .call(Method::GET, &format!("/s/{old_slug}"), None, None)
         .await;

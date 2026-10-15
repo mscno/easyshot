@@ -20,5 +20,9 @@ fn main() {
         ));
     }
     out.push_str("];\n");
-    fs::write(Path::new(&env::var("OUT_DIR").unwrap()).join("migrations.rs"), out).unwrap();
+    fs::write(
+        Path::new(&env::var("OUT_DIR").unwrap()).join("migrations.rs"),
+        out,
+    )
+    .unwrap();
 }

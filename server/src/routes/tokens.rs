@@ -1,12 +1,12 @@
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::ApiJson;
-use crate::auth::{generate_token, AuthUser, API_PREFIX};
+use crate::auth::{API_PREFIX, AuthUser, generate_token};
 use crate::error::{AppError, AppResult};
 use crate::repo::{self, now_ms, ts};
 use crate::state::AppState;

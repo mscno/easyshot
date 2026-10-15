@@ -359,13 +359,17 @@ async fn applied(conn: &mut PgConnection) -> DbResult<Vec<String>> {
         .fetch_one(&mut *conn)
         .await?;
     if exists.is_none() {
-        sqlx::raw_sql("CREATE TABLE _migrations (name TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)")
-            .execute(&mut *conn)
-            .await?;
+        sqlx::raw_sql(
+            "CREATE TABLE _migrations (name TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)",
+        )
+        .execute(&mut *conn)
+        .await?;
     }
-    Ok(sqlx::query_scalar("SELECT name FROM _migrations ORDER BY name")
-        .fetch_all(&mut *conn)
-        .await?)
+    Ok(
+        sqlx::query_scalar("SELECT name FROM _migrations ORDER BY name")
+            .fetch_all(&mut *conn)
+            .await?,
+    )
 }
 
 /// Apply pending migrations as the table owner. Each file runs in its own transaction.

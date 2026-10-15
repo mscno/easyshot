@@ -1,19 +1,19 @@
 use std::time::Duration;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::ApiJson;
-use crate::auth::{generate_slug, AuthUser};
+use crate::auth::{AuthUser, generate_slug};
 use crate::error::{AppError, AppResult};
-use crate::repo::{self, now_ms, ts, NewScreenshot, Screenshot};
+use crate::repo::{self, NewScreenshot, Screenshot, now_ms, ts};
 use crate::state::AppState;
 
 pub const UPLOAD_TTL: Duration = Duration::from_secs(600);

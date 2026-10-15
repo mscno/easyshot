@@ -6,33 +6,34 @@ use std::time::Duration;
 use futures_util::stream;
 use serde::Deserialize;
 use topcoat::{
+    Result,
     context::Cx,
-    datastar::{datastar_request, PatchElements},
+    datastar::{PatchElements, datastar_request},
     router::{
+        StatusCode,
         content::{
-            sse::{Event, Sse},
             Form,
+            sse::{Event, Sse},
         },
         error::{redirect, see_other},
         page, path_param, query_params,
         response::{IntoResponse, Response},
-        route, StatusCode,
+        route,
     },
     session,
-    view::{component, view, View, ViewExt},
-    Result,
+    view::{View, ViewExt, component, view},
 };
 use uuid::Uuid;
 
-use super::layout::{ago, clock, plural, shell, Meta};
-use super::{hex, member, state, Member, WebResult};
+use super::layout::{Meta, ago, clock, plural, shell};
+use super::{Member, WebResult, hex, member, state};
 use crate::mailer::{CodePurpose, Email};
 use crate::repo::{self, now_ms};
 use crate::routes::auth::normalize_email;
 use crate::routes::codes::{check_code, send_code};
 use crate::video::model::Video;
 use crate::video::scope::{Scope, Visibility};
-use crate::video::service::{self, share_url, Edit};
+use crate::video::service::{self, Edit, share_url};
 
 // ---------- landing ----------
 
@@ -59,8 +60,13 @@ pub async fn landing(cx: &Cx) -> Result<impl View> {
                     "Teammates watch in the browser, react, and leave comments pinned to the exact second."
                 </p>
                 <div class="cta">
-                    <a class="button primary" href=(download.as_str())>"Download for Mac"</a>
-                    <a class="button" href=(if signed_in { "/library" } else { "/login" })>
+                    <a class="button primary" href=(download.as_str())>
+                        "Download for Mac"
+                    </a>
+                    <a
+                        class="button"
+                        href=(if signed_in { "/library" } else { "/login" })
+                    >
                         (if signed_in { "Your library" } else { "Sign in" })
                     </a>
                 </div>
@@ -69,19 +75,27 @@ pub async fn landing(cx: &Cx) -> Result<impl View> {
             <section class="features">
                 <article>
                     <h2>"Instant links"</h2>
-                    <p>"Parts stream to storage during the recording. Stop, and the link already works."</p>
+                    <p>
+                        "Parts stream to storage during the recording. Stop, and the link already works."
+                    </p>
                 </article>
                 <article>
                     <h2>"Comments on the timeline"</h2>
-                    <p>"Viewers comment and react at a moment in the video. Everyone watching sees it live."</p>
+                    <p>
+                        "Viewers comment and react at a moment in the video. Everyone watching sees it live."
+                    </p>
                 </article>
                 <article>
                     <h2>"Transcripts from your Mac"</h2>
-                    <p>"Speech is transcribed on-device and shown next to the video. Click a line to jump there."</p>
+                    <p>
+                        "Speech is transcribed on-device and shown next to the video. Click a line to jump there."
+                    </p>
                 </article>
                 <article>
                     <h2>"You choose who watches"</h2>
-                    <p>"Anyone with the link, a password, or only you. Links expire automatically."</p>
+                    <p>
+                        "Anyone with the link, a password, or only you. Links expire automatically."
+                    </p>
                 </article>
             </section>
             <section class="privacy">
@@ -116,8 +130,13 @@ fn safe_next(next: Option<&str>) -> String {
 }
 
 enum LoginStep {
-    Email { error: Option<String> },
-    Code { email: String, error: Option<String> },
+    Email {
+        error: Option<String>,
+    },
+    Code {
+        email: String,
+        error: Option<String>,
+    },
 }
 
 #[component]
@@ -129,11 +148,15 @@ async fn login_card(next: String, step: LoginStep, mail_ok: bool) -> Result<impl
             <section class="card narrow">
                 <h1>"Sign in"</h1>
                 if !mail_ok {
-                    <p class="notice error" role="alert">"Email sign-in is not configured on this server."</p>
+                    <p class="notice error" role="alert">
+                        "Email sign-in is not configured on this server."
+                    </p>
                 }
                 match step {
                     LoginStep::Email { error } => {
-                        <p class="muted">"We'll email you a 6-digit code. Accounts are created in the Shotglass app."</p>
+                        <p class="muted">
+                            "We'll email you a 6-digit code. Accounts are created in the Shotglass app."
+                        </p>
                         match error {
                             Some(e) => <p class="notice error" role="alert">(e)</p>,
                             None => "",
@@ -141,12 +164,25 @@ async fn login_card(next: String, step: LoginStep, mail_ok: bool) -> Result<impl
                         <form method="post" action="/login" class="stack">
                             <input type="hidden" name="next" value=(next.as_str())>
                             <label for="email">"Email"</label>
-                            <input id="email" name="email" type="email" required="" autocomplete="email" autofocus="">
-                            <button type="submit" class="button primary">"Email me a code"</button>
+                            <input
+                                id="email"
+                                name="email"
+                                type="email"
+                                required=""
+                                autocomplete="email"
+                                autofocus=""
+                            >
+                            <button type="submit" class="button primary">
+                                "Email me a code"
+                            </button>
                         </form>
-                    },
+                    }
                     LoginStep::Code { email, error } => {
-                        <p class="muted">"If " <strong>(email.as_str())</strong> " has a Shotglass account, a code is on its way."</p>
+                        <p class="muted">
+                            "If "
+                            <strong>(email.as_str())</strong>
+                            " has a Shotglass account, a code is on its way."
+                        </p>
                         match error {
                             Some(e) => <p class="notice error" role="alert">(e)</p>,
                             None => "",
@@ -155,15 +191,28 @@ async fn login_card(next: String, step: LoginStep, mail_ok: bool) -> Result<impl
                             <input type="hidden" name="next" value=(next.as_str())>
                             <input type="hidden" name="email" value=(email.as_str())>
                             <label for="code">"Code"</label>
-                            <input id="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required="" autocomplete="one-time-code" autofocus="">
-                            <button type="submit" class="button primary">"Sign in"</button>
+                            <input
+                                id="code"
+                                name="code"
+                                inputmode="numeric"
+                                pattern="[0-9]{6}"
+                                maxlength="6"
+                                required=""
+                                autocomplete="one-time-code"
+                                autofocus=""
+                            >
+                            <button type="submit" class="button primary">
+                                "Sign in"
+                            </button>
                         </form>
                         <form method="post" action="/login" class="inline">
                             <input type="hidden" name="next" value=(next.as_str())>
                             <input type="hidden" name="email" value=(email.as_str())>
-                            <button type="submit" class="link">"Send a new code"</button>
+                            <button type="submit" class="link">
+                                "Send a new code"
+                            </button>
                         </form>
-                    },
+                    }
                 }
             </section>
         )
@@ -181,11 +230,18 @@ pub async fn login_page(cx: &Cx) -> Result<impl View> {
         return Err(redirect(next).into());
     }
     let mail_ok = state(cx).mailer.enabled();
-    Ok(view! { login_card(next: next, step: LoginStep::Email { error: None }, mail_ok: mail_ok) })
+    Ok(view! {
+        login_card(next: next, step: LoginStep::Email { error: None }, mail_ok: mail_ok)
+    })
 }
 
 /// Render the sign-in card as a full response from a route handler.
-async fn login_response(cx: &Cx, next: String, step: LoginStep, status: StatusCode) -> Result<Response> {
+async fn login_response(
+    cx: &Cx,
+    next: String,
+    step: LoginStep,
+    status: StatusCode,
+) -> Result<Response> {
     let mail_ok = state(cx).mailer.enabled();
     let html = view! { cx => login_card(next: next, step: step, mail_ok: mail_ok) }
         .single()
@@ -217,16 +273,14 @@ pub async fn login_submit(cx: &Cx, Form(f): Form<LoginForm>) -> Result<Response>
         return login_response(cx, next, step, StatusCode::UNPROCESSABLE_ENTITY).await;
     };
     super::limit(cx, "login", 10, Duration::from_secs(600))?;
-    if st.mailer.enabled() {
-        if let Some(u) = repo::find_user_for_login(&st.db, &email)
+    if st.mailer.enabled()
+        && let Some(u) = repo::find_user_for_login(&st.db, &email)
             .await
             .map_err(Into::into)
             .web()?
-        {
-            if !u.disabled {
-                send_code(st, u.id, &email, CodePurpose::LoginOtp);
-            }
-        }
+        && !u.disabled
+    {
+        send_code(st, u.id, &email, CodePurpose::LoginOtp);
     }
     let step = LoginStep::Code { email, error: None };
     login_response(cx, next, step, StatusCode::OK).await
@@ -251,7 +305,9 @@ pub async fn login_verify(cx: &Cx, Form(f): Form<VerifyForm>) -> Result<Response
         .web()?
         .filter(|u| !u.disabled);
     let checked = match &user {
-        Some(u) => check_code(st, u.id, CodePurpose::LoginOtp, &f.code).await.is_ok(),
+        Some(u) => check_code(st, u.id, CodePurpose::LoginOtp, &f.code)
+            .await
+            .is_ok(),
         None => false,
     };
     let (Some(u), true) = (user, checked) else {
@@ -268,11 +324,21 @@ pub async fn login_verify(cx: &Cx, Form(f): Form<VerifyForm>) -> Result<Response
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(now);
-    repo::insert_session(&st.db, u.id, &hex(&s.token_hash[..]), Some("Web"), now, expires)
+    repo::insert_session(
+        &st.db,
+        u.id,
+        &hex(&s.token_hash[..]),
+        Some("Web"),
+        now,
+        expires,
+    )
+    .await
+    .map_err(Into::into)
+    .web()?;
+    repo::touch_user(&st.db, u.id, now)
         .await
         .map_err(Into::into)
         .web()?;
-    repo::touch_user(&st.db, u.id, now).await.map_err(Into::into).web()?;
     repo::set_email_verified(&st.db, u.id, now)
         .await
         .map_err(Into::into)
@@ -307,7 +373,9 @@ pub async fn library(cx: &Cx) -> Result<impl View> {
     let scope = Scope::user(m.user_id);
     let items = scope.items(st, 200).await.web()?;
     let ids: Vec<&str> = items.iter().map(|v| v.id.as_str()).collect();
-    let views = service::view_counts(st, scope.context(), &ids).await.web()?;
+    let views = service::view_counts(st, scope.context(), &ids)
+        .await
+        .web()?;
     let mail = st.mailer.enabled();
     let base = st.config.public_base_url.clone();
     let now = now_ms();
@@ -318,19 +386,31 @@ pub async fn library(cx: &Cx) -> Result<impl View> {
             <section class="library">
                 <div class="library-head">
                     <h1>"Library"</h1>
-                    <p class="muted">"Signed in as " (m.email.as_str())</p>
+                    <p class="muted">
+                        "Signed in as "
+                        (m.email.as_str())
+                    </p>
                 </div>
                 if items.is_empty() {
                     <div class="empty card">
                         <h2>"No recordings yet"</h2>
-                        <p>"Record in the Shotglass app with Shotglass Cloud enabled. The link appears here and on your clipboard."</p>
+                        <p>
+                            "Record in the Shotglass app with Shotglass Cloud enabled. The link appears here and on your clipboard."
+                        </p>
                     </div>
                 }
                 <div id="items" class="items">
                     #[key(v.id.clone())]
                     for v in items {
                         let n = views.get(&v.id).copied().unwrap_or(0);
-                        item_card(video: v, views: n, base: base.clone(), mail: mail, now: now, notice: None)
+                        item_card(
+                            video: v,
+                            views: n,
+                            base: base.clone(),
+                            mail: mail,
+                            now: now,
+                            notice: None
+                        )
                     }
                 </div>
             </section>
@@ -353,7 +433,9 @@ pub async fn item_card(
     let card_id = format!("item-{id}");
     let action = |what: &str| format!("/library/{id}/{what}");
     let enhance = |what: &str| {
-        format!("@post('/library/{id}/{what}', {{contentType: 'form', retry: 'never', retryMaxCount: 0}})")
+        format!(
+            "@post('/library/{id}/{what}', {{contentType: 'form', retry: 'never', retryMaxCount: 0}})"
+        )
     };
     let (rename_url, rename_js) = (action("rename"), enhance("rename"));
     let (vis_url, vis_js) = (action("visibility"), enhance("visibility"));
@@ -363,7 +445,11 @@ pub async fn item_card(
         "if (confirm('Delete this recording for everyone?')) {{ {} }}",
         enhance("delete")
     );
-    let (title_id, vis_id, to_id) = (format!("title-{id}"), format!("vis-{id}"), format!("to-{id}"));
+    let (title_id, vis_id, to_id) = (
+        format!("title-{id}"),
+        format!("vis-{id}"),
+        format!("to-{id}"),
+    );
     let visibility = Visibility::parse(&v.visibility).unwrap_or(Visibility::Private);
     let pending = v.status != "ready";
     let thumb = format!("/v/{}/thumbnail.jpg", v.slug);
@@ -382,43 +468,102 @@ pub async fn item_card(
             <div class="item-body">
                 <a class="item-title" href=(link.as_str())>(v.title.as_str())</a>
                 <p class="muted small">
-                    (ago(v.created_at, now)) " · " (plural(views, "view", "views")) " · " (visibility.label())
-                    if pending { " · " <span class="pill">"Uploading"</span> }
+                    (ago(v.created_at, now))
+                    " · "
+                    (plural(views, "view", "views"))
+                    " · "
+                    (visibility.label())
+                    if pending {
+                        " · "
+                        <span class="pill">"Uploading"</span>
+                    }
                 </p>
                 match notice {
                     Some(n) => <p class="notice" role="status">(n)</p>,
                     None => "",
                 }
                 <div class="row">
-                    <button type="button" class="button small" data-copy=(link.as_str())>"Copy link"</button>
+                    <button
+                        type="button"
+                        class="button small"
+                        data-copy=(link.as_str())
+                    >
+                        "Copy link"
+                    </button>
                     <a class="button small" href=(link.as_str())>"Open"</a>
                 </div>
                 <details class="manage">
                     <summary>"Manage"</summary>
-                    <form method="post" action=(rename_url.as_str()) class="row" data-on:submit=(rename_js.as_str())>
+                    <form
+                        method="post"
+                        action=(rename_url.as_str())
+                        class="row"
+                        data-on:submit=(rename_js.as_str())
+                    >
                         <label class="sr-only" for=(title_id.as_str())>"Title"</label>
-                        <input id=(title_id.as_str()) name="title" value=(v.title.as_str()) maxlength="200" required="">
+                        <input
+                            id=(title_id.as_str())
+                            name="title"
+                            value=(v.title.as_str())
+                            maxlength="200"
+                            required=""
+                        >
                         <button type="submit" class="button small">"Rename"</button>
                     </form>
-                    <form method="post" action=(vis_url.as_str()) class="row" data-on:submit=(vis_js.as_str())>
-                        <label class="sr-only" for=(vis_id.as_str())>"Who can watch"</label>
+                    <form
+                        method="post"
+                        action=(vis_url.as_str())
+                        class="row"
+                        data-on:submit=(vis_js.as_str())
+                    >
+                        <label class="sr-only" for=(vis_id.as_str())>
+                            "Who can watch"
+                        </label>
                         <select id=(vis_id.as_str()) name="visibility">
                             for opt in Visibility::ALL {
-                                <option value=(opt.as_str()) selected=(opt == visibility)>(opt.label())</option>
+                                <option value=(opt.as_str()) selected=(opt == visibility)>
+                                    (opt.label())
+                                </option>
                             }
                         </select>
-                        <input name="password" type="password" placeholder="Password" maxlength="128" autocomplete="new-password">
+                        <input
+                            name="password"
+                            type="password"
+                            placeholder="Password"
+                            maxlength="128"
+                            autocomplete="new-password"
+                        >
                         <button type="submit" class="button small">"Save"</button>
                     </form>
                     if mail {
-                        <form method="post" action=(send_url.as_str()) class="row" data-on:submit=(send_js.as_str())>
-                            <label class="sr-only" for=(to_id.as_str())>"Send to"</label>
-                            <input id=(to_id.as_str()) name="to" type="email" placeholder="teammate@company.com" required="">
+                        <form
+                            method="post"
+                            action=(send_url.as_str())
+                            class="row"
+                            data-on:submit=(send_js.as_str())
+                        >
+                            <label class="sr-only" for=(to_id.as_str())>
+                                "Send to"
+                            </label>
+                            <input
+                                id=(to_id.as_str())
+                                name="to"
+                                type="email"
+                                placeholder="teammate@company.com"
+                                required=""
+                            >
                             <button type="submit" class="button small">"Send"</button>
                         </form>
                     }
-                    <form method="post" action=(delete_url.as_str()) class="row" data-on:submit=(delete_js.as_str())>
-                        <button type="submit" class="button small danger">"Delete"</button>
+                    <form
+                        method="post"
+                        action=(delete_url.as_str())
+                        class="row"
+                        data-on:submit=(delete_js.as_str())
+                    >
+                        <button type="submit" class="button small danger">
+                            "Delete"
+                        </button>
                     </form>
                 </details>
             </div>
@@ -453,7 +598,12 @@ async fn managed(cx: &Cx) -> Result<(Member, Scope, Video)> {
 }
 
 /// Datastar gets the refreshed card; a plain form post returns to the library.
-async fn card_response(cx: &Cx, scope: &Scope, v: Video, notice: Option<String>) -> Result<Response> {
+async fn card_response(
+    cx: &Cx,
+    scope: &Scope,
+    v: Video,
+    notice: Option<String>,
+) -> Result<Response> {
     if !datastar_request(cx) {
         return see_other("/library").into_response(cx);
     }
@@ -464,8 +614,16 @@ async fn card_response(cx: &Cx, scope: &Scope, v: Video, notice: Option<String>)
         .get(&v.id)
         .copied()
         .unwrap_or(0);
-    let html = view! { cx =>
-        item_card(video: v, views: views, base: st.config.public_base_url.clone(), mail: st.mailer.enabled(), now: now_ms(), notice: notice)
+    let html = view! {
+        cx =>
+        item_card(
+            video: v,
+            views: views,
+            base: st.config.public_base_url.clone(),
+            mail: st.mailer.enabled(),
+            now: now_ms(),
+            notice: notice
+        )
     }
     .single()
     .await?
@@ -518,7 +676,9 @@ pub async fn item_visibility(cx: &Cx, Form(f): Form<VisibilityForm>) -> Result<R
 #[route(POST "/library/{id}/delete")]
 pub async fn item_delete(cx: &Cx) -> Result<Response> {
     let (_, scope, v) = managed(cx).await?;
-    service::purge(state(cx), &scope.context(), &v).await.web()?;
+    service::purge(state(cx), &scope.context(), &v)
+        .await
+        .web()?;
     if datastar_request(cx) {
         let events = vec![Ok::<Event, topcoat::Error>(
             PatchElements::remove(format!("#item-{}", v.id)).into(),
@@ -533,16 +693,29 @@ pub async fn item_send(cx: &Cx, Form(f): Form<SendForm>) -> Result<Response> {
     let (m, scope, v) = managed(cx).await?;
     let st = state(cx);
     if !st.mailer.enabled() {
-        return card_response(cx, &scope, v, Some("Email is not configured on this server.".into())).await;
+        return card_response(
+            cx,
+            &scope,
+            v,
+            Some("Email is not configured on this server.".into()),
+        )
+        .await;
     }
     let Ok(to) = normalize_email(&f.to) else {
         return card_response(cx, &scope, v, Some("Enter a valid email address.".into())).await;
     };
-    if !st
-        .limiter
-        .allow(&format!("send:{}", m.user_id), 20, Duration::from_secs(3600))
-    {
-        return card_response(cx, &scope, v, Some("Too many emails sent. Try again later.".into())).await;
+    if !st.limiter.allow(
+        &format!("send:{}", m.user_id),
+        20,
+        Duration::from_secs(3600),
+    ) {
+        return card_response(
+            cx,
+            &scope,
+            v,
+            Some("Too many emails sent. Try again later.".into()),
+        )
+        .await;
     }
     let link = share_url(st, &v.slug);
     let email = share_email(&to, m.name(), &v.title, &link);

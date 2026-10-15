@@ -3,7 +3,7 @@
 //! `MIGRATION_DATABASE_URL`).
 
 use shotglass_server::config::Config;
-use shotglass_server::{db, AppState};
+use shotglass_server::{AppState, db};
 use tracing_subscriber::EnvFilter;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;

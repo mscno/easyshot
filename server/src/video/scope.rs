@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use super::model::Video;
 use crate::db::Context;
-use crate::orm::{begin, orm_err};
 use crate::error::{AppError, AppResult};
+use crate::orm::{begin, orm_err};
 use crate::repo::now_ms;
 use crate::state::AppState;
 
@@ -204,10 +204,19 @@ mod tests {
         let anon = Scope::anonymous();
         let me = Scope::user(owner);
         assert_eq!(anon.access(&video(owner, "link"), false), Access::Allowed);
-        assert_eq!(anon.access(&video(owner, "password"), false), Access::NeedsPassword);
-        assert_eq!(other.access(&video(owner, "password"), true), Access::Allowed);
+        assert_eq!(
+            anon.access(&video(owner, "password"), false),
+            Access::NeedsPassword
+        );
+        assert_eq!(
+            other.access(&video(owner, "password"), true),
+            Access::Allowed
+        );
         assert_eq!(other.access(&video(owner, "private"), true), Access::Denied);
-        assert_eq!(anon.access(&video(owner, "workspace"), true), Access::Denied);
+        assert_eq!(
+            anon.access(&video(owner, "workspace"), true),
+            Access::Denied
+        );
         assert_eq!(me.access(&video(owner, "private"), false), Access::Allowed);
         assert!(me.can_manage(&video(owner, "link")) && !other.can_manage(&video(owner, "link")));
         let mut expired = video(owner, "link");

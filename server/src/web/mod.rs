@@ -11,18 +11,18 @@ pub mod watch;
 use std::time::Duration;
 
 use topcoat::{
-    context::{app_context, Cx},
+    Result,
+    context::{Cx, app_context},
     cookie::RouterBuilderCookieExt,
     router::{
+        Body, HeaderValue, Method, Next, Router, TrustedProxies,
         error::{bad_request, not_found, too_many_requests, unauthorized},
         header, layer,
         request::{client_ip, headers},
         response::Response,
         tower::TowerRoute,
-        Body, HeaderValue, Method, Next, Router, TrustedProxies,
     },
-    session::{self, cookie::CookieTokenStore, RouterBuilderSessionExt, SessionConfig},
-    Result,
+    session::{self, RouterBuilderSessionExt, SessionConfig, cookie::CookieTokenStore},
 };
 use uuid::Uuid;
 
@@ -61,6 +61,17 @@ pub fn router(state: AppState) -> Router {
         .route(account::item_visibility)
         .route(account::item_delete)
         .route(account::item_send)
+        .page(watch::watch)
+        .page(watch::embed)
+        .route(watch::unlock)
+        .route(watch::media)
+        .route(watch::download)
+        .route(watch::thumbnail)
+        .route(watch::transcript)
+        .route(watch::live)
+        .route(watch::post_comment)
+        .route(watch::post_reaction)
+        .route(watch::oembed)
         .build()
 }
 
@@ -127,7 +138,10 @@ pub fn fingerprint(cx: &Cx) -> (String, String) {
 /// Rate limit a web write by client address; 429 when exceeded.
 pub fn limit(cx: &Cx, what: &str, max: u32, window: Duration) -> Result<()> {
     let (ip, _) = fingerprint(cx);
-    if state(cx).limiter.allow(&format!("{what}:{ip}"), max, window) {
+    if state(cx)
+        .limiter
+        .allow(&format!("{what}:{ip}"), max, window)
+    {
         Ok(())
     } else {
         Err(too_many_requests(window.as_secs()).into())

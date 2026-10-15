@@ -7,12 +7,12 @@ use std::sync::LazyLock;
 
 use sha2::{Digest, Sha256};
 use topcoat::{
+    Result,
     context::Cx,
     router::{
-        error::not_found, header, path_param, request::headers, response::Response, route, Body,
-        HeaderValue, StatusCode,
+        Body, HeaderValue, StatusCode, error::not_found, header, path_param, request::headers,
+        response::Response, route,
     },
-    Result,
 };
 
 /// Datastar v1.0.4 + Rocket beta.2, MIT (static/DATASTAR-LICENSE.md),
@@ -117,8 +117,14 @@ pub async fn serve_static(cx: &Cx) -> Result<Response> {
         Response::new(Body::from(asset.bytes))
     };
     let h = res.headers_mut();
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(asset.content_type));
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(asset.content_type),
+    );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
-    h.insert(header::ETAG, HeaderValue::from_str(&asset.etag).expect("etag"));
+    h.insert(
+        header::ETAG,
+        HeaderValue::from_str(&asset.etag).expect("etag"),
+    );
     Ok(res)
 }
