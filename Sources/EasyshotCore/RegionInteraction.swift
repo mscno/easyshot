@@ -38,19 +38,15 @@ public struct RegionInteraction {
         else if rect.contains(point),rect.width > 2,rect.height > 2 { operation = .move }
         else { operation = .draw }
     }
-    public func update(to point: CGPoint,bounds: CGRect,square: Bool = false) -> CGRect {
+    /// `square` (Shift) forces 1:1 and overrides `ratio`, an optional width/height aspect lock.
+    public func update(to point: CGPoint,bounds: CGRect,square: Bool = false,ratio: CGFloat? = nil) -> CGRect {
+        let lock = square ? 1 : ratio
         switch operation {
         case .move:
             return CaptureGeometry.clamped(original.offsetBy(dx: point.x-anchor.x,dy: point.y-anchor.y),to: bounds)
         case .draw:
             var end = CGPoint(x: max(bounds.minX,min(point.x,bounds.maxX)),y: max(bounds.minY,min(point.y,bounds.maxY)))
-            if square {
-                let sx: CGFloat = end.x >= anchor.x ? 1 : -1,sy: CGFloat = end.y >= anchor.y ? 1 : -1
-                let availableX = sx > 0 ? bounds.maxX-anchor.x : anchor.x-bounds.minX
-                let availableY = sy > 0 ? bounds.maxY-anchor.y : anchor.y-bounds.minY
-                let side = min(max(abs(end.x-anchor.x),abs(end.y-anchor.y)),availableX,availableY)
-                end = CGPoint(x: anchor.x+sx*side,y: anchor.y+sy*side)
-            }
+            if let lock { end = AspectLock.end(from: anchor,to: end,ratio: lock,bounds: bounds) }
             return CaptureGeometry.rectangle(from: anchor,to: end)
         case .resize(let h):
             let p = CGPoint(x: max(bounds.minX,min(point.x,bounds.maxX)),y: max(bounds.minY,min(point.y,bounds.maxY)))
@@ -59,7 +55,9 @@ public struct RegionInteraction {
             if [.bottomRight,.topRight,.right].contains(h) { x1 = max(p.x,x0+3) }
             if [.bottomLeft,.bottomRight,.bottom].contains(h) { y0 = min(p.y,y1-3) }
             if [.topLeft,.topRight,.top].contains(h) { y1 = max(p.y,y0+3) }
-            return CGRect(x: x0,y: y0,width: x1-x0,height: y1-y0)
+            let raw = CGRect(x: x0,y: y0,width: x1-x0,height: y1-y0)
+            guard let lock else { return raw }
+            return AspectLock.resized(raw,handle: h,original: original,ratio: lock,bounds: bounds)
         }
     }
 }
@@ -68,6 +66,8 @@ public enum LaunchAction: String, CaseIterable {
     case capture, draw, repeatArea = "repeat", library, settings, fullscreen, window, activeWindow = "active-window"
     /// Capture, upload, and copy a shareable link. `pasteUpload` converts the clipboard image into a link instead.
     case upload, pasteUpload = "paste-upload", cloud
+    /// OCR an area straight to the clipboard; reopen the most recently closed Quick Access card.
+    case captureText = "capture-text", restoreOverlay = "restore-overlay"
     public init?(url: URL) {
         guard ["easyshot","easyshot-dev"].contains(url.scheme?.lowercased() ?? ""),url.user == nil,url.password == nil,url.port == nil,
               url.path.isEmpty || url.path == "/",url.query == nil,url.fragment == nil,

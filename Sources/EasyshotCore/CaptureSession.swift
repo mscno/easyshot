@@ -2,8 +2,10 @@ import Foundation
 
 public enum CaptureKeyAction: Equatable {
     case mode(CaptureMode), drawNew, resetArea, upload, library, settings
+    /// T toggles Capture Text, M the crosshair magnifier, C copies the colour under the magnifier.
+    case captureText, magnifier, copyColor
     /// Keys with a fixed meaning. The configurable upload key may not shadow them.
-    public static let reservedKeys: Set<String> = ["1","2","3","4","5","a","f","s","w","v","r","d","n","x"]
+    public static let reservedKeys: Set<String> = ["1","2","3","4","5","a","f","s","w","v","r","d","n","x","t","m","c"]
     public static let defaultUploadKey = "u"
     /// Returns a usable single-character upload key, or the default when `key` is empty or reserved.
     public static func sanitizedUploadKey(_ key: String) -> String {
@@ -25,6 +27,9 @@ public enum CaptureKeyAction: Equatable {
         case "r": return .mode(.lastRegion)
         case "d", "n": return .drawNew
         case "x": return .resetArea
+        case "t": return .captureText
+        case "m": return .magnifier
+        case "c": return .copyColor
         case sanitizedUploadKey(uploadKey): return .upload
         default: return nil
         }

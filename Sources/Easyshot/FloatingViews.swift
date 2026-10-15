@@ -65,6 +65,11 @@ struct ScrollingControls: View {
             HStack(spacing: 12) {
                 Image(systemName: "scroll").foregroundStyle(accent)
                 Text("\(controller.scrollFrames) frames").font(.system(size: 12,weight: .medium))
+                Picker("Direction",selection: $controller.scrollAxis) {
+                    Image(systemName: "arrow.up.and.down").tag(ScrollStitcher.Axis.vertical).help("Vertical")
+                    Image(systemName: "arrow.left.and.right").tag(ScrollStitcher.Axis.horizontal).help("Horizontal")
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 76).disabled(controller.scrollFrames > 1)
+                    .help("Scroll direction · fixed after the second frame")
                 Spacer()
                 #if !APP_STORE
                 Button(controller.autoScrolling ? "Stop auto" : "Auto scroll") { controller.toggleAutoScroll() }.disabled(controller.busy && !controller.autoScrolling)

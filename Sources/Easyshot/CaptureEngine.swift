@@ -107,8 +107,22 @@ enum CaptureTarget {
         }
         return SCContentFilter(display: display,excludingApplications: excluded,exceptingWindows: exceptions)
     }
-    func image(_ target: CaptureTarget) async throws -> CGImage {
+    /// One native capture per display, for a frozen selection backdrop. Easyshot's own windows are excluded.
+    func displayImages() async throws -> [CGDirectDisplayID: CGImage] {
+        try await refresh()
+        guard let content else { return [:] }
+        var images: [CGDirectDisplayID: CGImage] = [:]
+        for display in content.displays { images[display.displayID] = try await nativeImage(displayFilter(display,content: content)) }
+        return images
+    }
+    /// `frozen` display images, when present, replace live display captures so a frozen selection captures
+    /// exactly what was on screen when it opened. Windows are always captured live.
+    func image(_ target: CaptureTarget,frozen: [CGDirectDisplayID: CGImage]? = nil) async throws -> CGImage {
         guard let content else { throw ShotError.message("Screen capture is not ready. Try again.") }
+        func still(of display: SCDisplay) async throws -> CGImage {
+            if let image = frozen?[display.displayID] { return image }
+            return try await nativeImage(displayFilter(display,content: content))
+        }
         switch target {
         case .window(let window):
             // Let the still-image API size the complete window, including its shadow.
@@ -116,7 +130,7 @@ enum CaptureTarget {
             return try await nativeImage(SCContentFilter(desktopIndependentWindow: window), shadow: Preferences.shared.windowShadow)
         case .display(let id):
             guard let display = content.displays.first(where: { $0.displayID == id }) else { throw ShotError.message("This display is no longer connected.") }
-            return try await nativeImage(displayFilter(display, content: content))
+            return try await still(of: display)
         case .region(let rect):
             let quartz = CaptureGeometry.quartz(rect,primaryHeight: NSScreen.primaryHeight)
             let displays = content.displays.filter { area($0.frame.intersection(quartz)) > 0 }
@@ -125,7 +139,7 @@ enum CaptureTarget {
             for display in displays {
                 // Capture the native display first; crop by integer pixel edges afterward.
                 // Never ask ScreenCaptureKit to rescale a sourceRect into a stream surface.
-                let full = try await nativeImage(displayFilter(display, content: content))
+                let full = try await still(of: display)
                 guard let pixels = ScreenshotPixels.cropRect(quartz, display: display.frame, width: full.width, height: full.height),
                       let cropped = full.cropping(to: pixels) else { throw ShotError.message("Cannot crop screenshot.") }
                 let scale = CGFloat(full.width) / display.frame.width
@@ -161,9 +175,8 @@ enum CaptureTarget {
             text.automaticallyDetectsLanguage = true
             let codes = VNDetectBarcodesRequest()
             try VNImageRequestHandler(cgImage: image,options: [:]).perform([text,codes])
-            let lines = text.results?.compactMap { $0.topCandidates(1).first?.string } ?? []
-            let qr = codes.results?.compactMap(\.payloadStringValue) ?? []
-            return (lines+qr).joined(separator: "\n")
+            let lines = text.results?.compactMap { o in o.topCandidates(1).first.map { RecognizedText.Line(text: $0.string,box: o.boundingBox) } } ?? []
+            return RecognizedText.assemble(lines: lines,codes: codes.results?.compactMap(\.payloadStringValue) ?? [])
         }.value
     }
 }

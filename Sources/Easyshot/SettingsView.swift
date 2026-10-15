@@ -32,7 +32,21 @@ struct SettingsView: View {
                 Toggle("Hide desktop icons in display captures",isOn: $preferences.hideDesktopIcons)
                 Toggle("Snap on draw",isOn: $preferences.snapOnDraw)
                     .help("Capture and close when you finish drawing a new rectangle. Moving and resizing wait for Capture.")
-                Toggle("Quick Preview · 3 seconds",isOn: $preferences.showPreview)
+                Picker("After capture",selection: $preferences.postCapture) { ForEach(PostCapture.allCases) { Text($0.title).tag($0) } }.frame(maxWidth: 310,alignment: .leading)
+                if preferences.postCapture == .overlay {
+                    Picker("Close cards after",selection: $preferences.quickAccessAutoClose) { Text("Never").tag(0); Text("3 seconds").tag(3); Text("5 seconds").tag(5); Text("10 seconds").tag(10) }.frame(maxWidth: 310,alignment: .leading)
+                }
+                Toggle("Magnifier and crosshair while selecting · M",isOn: $preferences.magnifier)
+                Toggle("Freeze screen while selecting",isOn: $preferences.freezeScreen)
+                Picker("Area aspect",selection: $preferences.aspectLock) { ForEach(AspectLock.allCases) { Text($0.title).tag($0) } }.frame(maxWidth: 310,alignment: .leading)
+                Toggle("Keep a screenshot when capturing text",isOn: $preferences.saveCapturedText)
+                Picker("Window background",selection: $preferences.windowBackground) { ForEach(WindowBackground.allCases) { Text($0.title).tag($0) } }.frame(maxWidth: 310,alignment: .leading)
+                if preferences.windowBackground != .none {
+                    VStack(alignment: .leading) { Text("Padding · \(Int(preferences.windowPadding)) pt"); Slider(value: $preferences.windowPadding,in: 8...240) }.frame(maxWidth: 310)
+                    if [.solid,.gradient].contains(preferences.windowBackground) {
+                        ColorPicker("Background color",selection: Binding(get: { Color(nsColor: preferences.windowBackgroundColor) },set: { preferences.windowBackgroundColor = NSColor($0) }),supportsOpacity: false)
+                    }
+                }
                 Picker("Capture delay",selection: $preferences.delay) { Text("None").tag(0.0); Text("3 seconds").tag(3.0); Text("5 seconds").tag(5.0); Text("10 seconds").tag(10.0) }.frame(maxWidth: 310,alignment: .leading)
             }
             if CloudSession.isAvailable {

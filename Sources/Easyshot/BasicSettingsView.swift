@@ -32,9 +32,15 @@ struct BasicSettingsView: View {
                     }
                     Toggle("Snap on draw",isOn: $preferences.snapOnDraw)
                     .help("Capture and close when you finish drawing a new rectangle. Moving and resizing wait for Capture.")
-                    Toggle("Quick Preview · 3 seconds",isOn: $preferences.showPreview)
-                    Text("A thumbnail slides into the bottom right. New captures replace it; Easyshot quits when it disappears.")
+                    Picker("After capture",selection: $preferences.postCapture) { ForEach(PostCapture.allCases) { Text($0.title).tag($0) } }
+                    if preferences.postCapture == .overlay {
+                        Picker("Close cards after",selection: $preferences.quickAccessAutoClose) { Text("Never").tag(0); Text("3 seconds").tag(3); Text("5 seconds").tag(5); Text("10 seconds").tag(10) }
+                    }
+                    Text("Quick Access cards stack in the corner of the captured display; hover to keep them, swipe to dismiss. Easyshot quits when the last one closes.")
                         .font(.caption).foregroundStyle(.secondary)
+                    Toggle("Magnifier while selecting · M",isOn: $preferences.magnifier)
+                    Toggle("Freeze screen while selecting",isOn: $preferences.freezeScreen)
+                    Picker("Window background",selection: $preferences.windowBackground) { ForEach(WindowBackground.allCases) { Text($0.title).tag($0) } }
                 }
                 #if !APP_STORE
                 Section("Updates") { UpdateSettingsView() }

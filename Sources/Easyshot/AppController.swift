@@ -39,6 +39,8 @@ struct CaptureRequest {
     @Published var scrollFrames = 0
     @Published var scrollNotice = "Scroll the content, then add another frame."
     @Published var autoScrolling = false
+    /// Chosen before the second frame; fixed afterwards.
+    @Published var scrollAxis: ScrollStitcher.Axis = .vertical
     @Published var status = "Ready when you are"
     var mainWindow: NSWindow?
     var preview: NSPanel?
@@ -68,13 +70,17 @@ struct CaptureRequest {
     var toastPanel: NSPanel?
     var toastTask: Task<Void,Never>?
     var pendingExports = 0
+    /// Created on the first card so plain capture sessions pay nothing for it.
+    var quickAccess: QuickAccess?
+    /// Global Cocoa frame of the latest capture target; Quick Access cards appear on its display.
+    var lastCaptureFrame: CGRect?
     var sessionActivity: SessionActivity {
         var activity: SessionActivity = []
         if overlay.onComplete != nil || !overlay.windows.isEmpty { activity.insert(.selection) }
         if busy || pendingExports > 0 || pendingCapture != nil || launcherPending { activity.insert(.processing) }
         if recording || recorder != nil { activity.insert(.recording) }
         if scrolling != nil { activity.insert(.scrolling) }
-        if previewLifetime.isActive || toastPanel != nil { activity.insert(.preview) }
+        if previewLifetime.isActive || toastPanel != nil || quickAccess?.isActive == true { activity.insert(.preview) }
         if mainWindow?.isVisible == true || settingsWindow?.isVisible == true || auxiliaryWindows.contains(where: { $0.isVisible }) { activity.insert(.toolWindow) }
         #if !APP_STORE
         if updates.holdsSession { activity.insert(.toolWindow) }
@@ -145,6 +151,10 @@ struct CaptureRequest {
             capture(.area,unified: true,purpose: "Upload",drawNewArea: Preferences.shared.selection.drawNew)
         case .pasteUpload: pasteUpload()
         case .cloud: openMain(); DispatchQueue.main.async { NotificationCenter.default.post(name: .showCloud,object: nil) }
+        case .captureText: capture(.area,unified: true,purpose: "Text / QR",drawNewArea: Preferences.shared.selection.drawNew)
+        case .restoreOverlay:
+            let cards = quickAccess ?? QuickAccess(controller: self); quickAccess = cards
+            if !cards.restore() { showToast("Nothing to restore",symbol: "rectangle.stack",hideAfter: 2) }
         }
     }
     func application(_ application: NSApplication,open urls: [URL]) {
@@ -372,6 +382,9 @@ struct CaptureRequest {
         guard !StartupTrace.enabled else { return }
         busy = true
         engine.previousApp?.activate(options: [])
+        lastCaptureFrame = cocoaFrame(target)
+        // A frozen selection captures the stills it showed; a timer means the user wants a later moment.
+        let frozen = Preferences.shared.delay > 0 ? nil : overlay.takeFrozenHandoff()
         Task {
             do {
                 let delay = Preferences.shared.delay
@@ -381,24 +394,53 @@ struct CaptureRequest {
                 try await engine.refresh()
                 if purpose == "Recording" { try await startRecording(target) }
                 else if purpose == "Scrolling capture" { try await beginScroll(target) }
+                else if purpose == "Text / QR" { try await captureText(target,frozen: frozen) }
                 else {
-                    let image = try await engine.image(target)
+                    var image = try await engine.image(target,frozen: frozen)
+                    if case .window(let window) = target,let plan = WindowBackdropRenderer.plan(windowFrame: CaptureGeometry.quartz(window.frame,primaryHeight: NSScreen.primaryHeight)) {
+                        let plain = image
+                        image = await Task.detached(priority: .userInitiated) { WindowBackdropRenderer.render(plain,plan: plan) }.value
+                    }
                     let uploading = purpose == "Upload"
                     // PNG encoding and the file write happen off the main thread; the link replaces the image on the clipboard.
-                    var clip = try await store.writeDetached(image: image,kind: purpose == "Text / QR" ? "Text" : targetName(target),copyOverride: uploading ? false : nil)
+                    let clip = try await store.writeDetached(image: image,kind: targetName(target),copyOverride: uploading ? false : nil)
                     status = "\(Preferences.shared.saveToDisk ? "Saved" : "In history")\(Preferences.shared.copyToClipboard && !uploading ? " and copied" : "") · \(image.width) × \(image.height)"
                     if uploading { await uploadClip(clip) }
-                    if purpose == "Text / QR" {
-                        let text = try await CaptureEngine.recognize(image)
-                        clip.text = text; store.update(clip)
-                        if !text.isEmpty { NSPasteboard.general.setString(text,forType: .string); status = "Recognized text copied" }
-                        else { status = "No text or QR code found. Screenshot saved." }
-                    }
                     showPreview(clip)
                 }
             } catch { fail(error) }
             busy = false; drainPendingCapture(); finishIfIdle()
         }
+    }
+    /// Capture Text: on-device OCR straight to the clipboard. The screenshot is kept only when the user opts in.
+    func captureText(_ target: CaptureTarget,frozen: [CGDirectDisplayID: CGImage]?) async throws {
+        let image = try await engine.image(target,frozen: frozen)
+        let text = try await CaptureEngine.recognize(image)
+        if text.isEmpty {
+            status = "No text or QR code found."
+            showToast("No text found",symbol: "text.viewfinder",hideAfter: 2.5)
+        } else {
+            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text,forType: .string)
+            status = "Recognized text copied"
+            showToast("Text copied",symbol: "text.viewfinder",detail: CaptureTextSummary.detail(text),hideAfter: 2.5)
+        }
+        if Preferences.shared.saveCapturedText {
+            var clip = try await store.writeDetached(image: image,kind: "Text",copyOverride: false)
+            clip.text = text; store.update(clip)
+        }
+    }
+    func cocoaFrame(_ target: CaptureTarget) -> CGRect? {
+        switch target {
+        case .region(let rect): return rect
+        case .display(let id): return NSScreen.screens.first { $0.displayID == id }?.frame
+        case .window(let window): return CaptureGeometry.quartz(window.frame,primaryHeight: NSScreen.primaryHeight)
+        }
+    }
+    /// The display holding most of the latest capture, else the one under the pointer.
+    var captureScreen: NSScreen {
+        guard let frame = lastCaptureFrame else { return .pointerScreen }
+        func area(_ s: NSScreen) -> CGFloat { let r = s.frame.intersection(frame); return r.isNull ? 0 : r.width*r.height }
+        return NSScreen.screens.max { area($0) < area($1) }.flatMap { area($0) > 0 ? $0 : nil } ?? .pointerScreen
     }
     // MARK: Easyshot Cloud
     func requireSignIn() {
@@ -478,10 +520,17 @@ struct CaptureRequest {
     }
     func showPreview(_ clip: Clip) {
         hidePreviewImmediately()
-        guard Preferences.shared.showPreview else { finishIfIdle(); return }
+        switch Preferences.shared.postCapture {
+        case .none: finishIfIdle(); return
+        case .overlay:
+            idleExitTask?.cancel()
+            let cards = quickAccess ?? QuickAccess(controller: self); quickAccess = cards
+            cards.show(clip,on: captureScreen); return
+        case .thumbnail: break
+        }
         idleExitTask?.cancel()
         let generation = previewLifetime.replace()
-        let screen = NSScreen.pointerScreen
+        let screen = captureScreen
         let size = CGSize(width: 228,height: 164)
         let finalFrame = CGRect(x: screen.visibleFrame.maxX-size.width-24,y: screen.visibleFrame.minY+24,width: size.width,height: size.height)
         let panel = NSPanel(contentRect: finalFrame.offsetBy(dx: size.width+32,dy: 0),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
@@ -623,7 +672,7 @@ struct CaptureRequest {
         scrolling = (target,[image]); scrollFrames = 1; scrollNotice = "Scroll the content, then add another frame."
         engine.previousApp?.activate(options: [])
         let screen = NSScreen.pointerScreen
-        let panel = NSPanel(contentRect: CGRect(x: screen.visibleFrame.midX-295,y: screen.visibleFrame.minY+24,width: 590,height: 94),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
+        let panel = NSPanel(contentRect: CGRect(x: screen.visibleFrame.midX-340,y: screen.visibleFrame.minY+24,width: 680,height: 94),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
         panel.level = .floating; panel.isOpaque = false; panel.backgroundColor = .clear
         panel.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary]
         panel.contentView = NSHostingView(rootView: ScrollingControls(controller: self)); panel.orderFrontRegardless(); scrollPanel = panel
@@ -634,17 +683,18 @@ struct CaptureRequest {
             do {
                 let image = try await engine.image(session.target)
                 guard let last = session.frames.last else { return }
-                if let overlap = ScrollStitcher.overlap(last,image) {
-                    if overlap == image.height { scrollNotice = "Same view. Scroll down before adding a frame." }
+                let vertical = scrollAxis == .vertical
+                if let overlap = ScrollStitcher.overlap(last,image,axis: scrollAxis) {
+                    if overlap == (vertical ? image.height : image.width) { scrollNotice = "Same view. Scroll \(vertical ? "down" : "right") before adding a frame." }
                     else { scrolling?.frames.append(image); scrollFrames += 1; scrollNotice = "Frame added · \(overlap) px overlap" }
-                } else { scrollNotice = "No overlap found. Scroll back up a little and try again." }
+                } else { scrollNotice = "No overlap found. Scroll back \(vertical ? "up" : "left") a little and try again." }
             } catch { scrollNotice = error.localizedDescription }
             busy = false; drainPendingCapture(); finishIfIdle()
         }
     }
     func finishScroll() {
         guard let session = scrolling,!busy else { return }
-        do { let result = try ScrollStitcher.stitch(session.frames); let clip = try store.write(image: result,kind: "Scrolling"); cancelScroll(); showPreview(clip); status = "Scrolling capture saved" }
+        do { let result = try ScrollStitcher.stitch(session.frames,axis: scrollAxis); let clip = try store.write(image: result,kind: "Scrolling"); cancelScroll(); showPreview(clip); status = "Scrolling capture saved" }
         catch { scrollNotice = error.localizedDescription }
     }
     func toggleAutoScroll() {
@@ -663,25 +713,27 @@ struct CaptureRequest {
             guard let self else { return }
             defer { self.autoScrolling = false; self.busy = false; self.finishIfIdle() }
             let quartz = CaptureGeometry.quartz(rect,primaryHeight: NSScreen.primaryHeight)
+            let axis = self.scrollAxis,vertical = axis == .vertical
             var duplicates = 0
             while !Task.isCancelled,let current = self.scrolling,current.frames.count < 50 {
                 self.busy = true
                 do {
-                    let event = CGEvent(scrollWheelEvent2Source: nil,units: .pixel,wheelCount: 1,wheel1: -Int32(rect.height*0.55),wheel2: 0,wheel3: 0)
+                    let event = vertical ? CGEvent(scrollWheelEvent2Source: nil,units: .pixel,wheelCount: 1,wheel1: -Int32(rect.height*0.55),wheel2: 0,wheel3: 0)
+                        : CGEvent(scrollWheelEvent2Source: nil,units: .pixel,wheelCount: 2,wheel1: 0,wheel2: -Int32(rect.width*0.55),wheel3: 0)
                     event?.location = CGPoint(x: quartz.midX,y: quartz.midY)
                     event?.post(tap: .cghidEventTap)
                     try await Task.sleep(for: .milliseconds(650))
                     let image = try await self.engine.image(current.target)
                     guard !Task.isCancelled,self.scrolling != nil,let last = current.frames.last else { break }
-                    guard let overlap = ScrollStitcher.overlap(last,image) else { self.scrollNotice = "No overlap. Exclude fixed headers and try a smaller area."; break }
-                    if overlap == image.height {
+                    guard let overlap = ScrollStitcher.overlap(last,image,axis: axis) else { self.scrollNotice = "No overlap. Exclude fixed headers and try a smaller area."; break }
+                    if overlap == (vertical ? image.height : image.width) {
                         duplicates += 1
                         if duplicates >= 3 { self.scrollNotice = "End reached. Finish to save your scrolling capture."; break }
                     } else {
                         duplicates = 0; self.scrolling?.frames.append(image); self.scrollFrames += 1
                         self.scrollNotice = "Auto scrolling · \(self.scrollFrames) frames"
-                        let height = self.scrolling?.frames.reduce(0) { $0+$1.height } ?? 0
-                        if height > 40000 { self.scrollNotice = "Capture limit reached. Finish to save."; break }
+                        let extent = self.scrolling?.frames.reduce(0) { $0+(vertical ? $1.height : $1.width) } ?? 0
+                        if extent > (vertical ? 40000 : 19000) { self.scrollNotice = "Capture limit reached. Finish to save."; break }
                     }
                 } catch is CancellationError { self.scrollNotice = "Auto scroll stopped. Finish to save."; break }
                 catch { self.scrollNotice = error.localizedDescription; break }

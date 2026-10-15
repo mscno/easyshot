@@ -1,6 +1,29 @@
 import CoreGraphics
 
 enum ScrollStitcher {
+    enum Axis: String,CaseIterable { case vertical, horizontal }
+    /// Horizontal scrolling reuses the vertical matcher on frames turned a quarter clockwise, so the right
+    /// edge becomes the bottom; the stitched result is turned back.
+    static func overlap(_ first: CGImage,_ second: CGImage,axis: Axis) -> Int? {
+        guard axis == .horizontal else { return overlap(first,second) }
+        guard let a = rotated(first,clockwise: true),let b = rotated(second,clockwise: true) else { return nil }
+        return overlap(a,b)
+    }
+    static func stitch(_ frames: [CGImage],axis: Axis) throws -> CGImage {
+        guard axis == .horizontal else { return try stitch(frames) }
+        let turned = frames.compactMap { rotated($0,clockwise: true) }
+        guard turned.count == frames.count else { throw ShotError.message("Could not prepare scrolling frames.") }
+        guard let result = rotated(try stitch(turned),clockwise: false) else { throw ShotError.message("Could not combine frames.") }
+        return result
+    }
+    static func rotated(_ image: CGImage,clockwise: Bool) -> CGImage? {
+        guard let ctx = EditorModel.context(width: image.height,height: image.width) else { return nil }
+        ctx.interpolationQuality = .none
+        if clockwise { ctx.translateBy(x: 0,y: CGFloat(image.width)); ctx.rotate(by: -.pi/2) }
+        else { ctx.translateBy(x: CGFloat(image.height),y: 0); ctx.rotate(by: .pi/2) }
+        ctx.draw(image,in: CGRect(x: 0,y: 0,width: image.width,height: image.height))
+        return ctx.makeImage()
+    }
     /// Match moving content at the bottom of the previous viewport to the top of the next.
     static func overlap(_ first: CGImage,_ second: CGImage) -> Int? {
         guard first.width == second.width,let a = pixels(first),let b = pixels(second) else { return nil }

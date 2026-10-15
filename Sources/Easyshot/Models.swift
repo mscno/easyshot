@@ -43,7 +43,7 @@ final class Preferences: ObservableObject {
     @Published var uploadKey: String { didSet { save() } }
     @Published var cloudBaseURL: String { didSet { save() } }
 
-    private let defaults: UserDefaults
+    let defaults: UserDefaults
     private let folderAccess: CaptureFolderAccess
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults

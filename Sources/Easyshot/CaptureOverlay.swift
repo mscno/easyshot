@@ -24,6 +24,10 @@ import QuartzCore
     var capture: (() -> Void)?
     var cancel: (() -> Void)?
     var applySize: (() -> Void)?
+    var applyAspect: (() -> Void)?
+    var toggleText: (() -> Void)?
+    var toggleMagnifier: (() -> Void)?
+    var isText: Bool { purpose == "Text / QR" }
 }
 
 final class CaptureToolbarPanel: NSPanel {
@@ -60,6 +64,18 @@ final class CaptureOverlayWindow: NSPanel {
     var windowRefreshTask: Task<Void,Never>?
 
     var pointer = CGPoint.zero
+    /// Per-display stills taken when a frozen selection opens; handed to the capture on completion.
+    var frozen: [CGDirectDisplayID: CGImage] = [:]
+    private var frozenHandoff: [CGDirectDisplayID: CGImage]?
+    var freezeTask: Task<Void,Never>?
+    lazy var sampler: PixelSampler = {
+        let sampler = PixelSampler()
+        sampler.frozen = { [weak self] in self?.frozen ?? [:] }
+        sampler.onUpdate = { [weak self] in guard let self else { return }; self.views.forEach { $0.invalidatePointer(self.pointer,self.pointer) } }
+        return sampler
+    }()
+    var magnifierActive: Bool { preferences.magnifier && onComplete != nil && !state.needsPermission && (state.mode == .area || state.mode == .lastRegion) }
+    func takeFrozenHandoff() -> [CGDirectDisplayID: CGImage]? { defer { frozenHandoff = nil }; return frozenHandoff }
     var captureOnDraw: Bool { state.fastDraw || preferences.snapOnDraw }
     var selectionBounds: CGRect { NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) } }
     var targetDisplayID: CGDirectDisplayID = 0
@@ -106,6 +122,12 @@ final class CaptureOverlayWindow: NSPanel {
             self.state.rect = CaptureGeometry.clamped(CGRect(x: screen.midX-w/2,y: screen.midY-h/2,width: w,height: h),to: screen)
             self.rememberMode(); self.redraw()
         }
+        state.applyAspect = { [weak self] in
+            guard let self,self.state.mode == .area || self.state.mode == .lastRegion,self.state.rect.width > 2 else { return }
+            self.state.rect = self.preferences.aspectLock.applied(to: self.state.rect,in: self.selectionBounds); self.redraw()
+        }
+        state.toggleText = { [weak self] in self?.toggleText() }
+        state.toggleMagnifier = { [weak self] in self?.toggleMagnifier() }
         updateWindowSelection(at: NSEvent.mouseLocation)
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if self?.interceptEscape(event) == true { return nil }
@@ -113,7 +135,7 @@ final class CaptureOverlayWindow: NSPanel {
         }
         presentSelectionWindows()
         let screen = NSScreen.pointerScreen
-        let panel = CaptureToolbarPanel(contentRect: CGRect(x: screen.visibleFrame.midX-(CloudSession.isAvailable ? 328 : 310),y: screen.visibleFrame.minY+24,width: CloudSession.isAvailable ? 656 : 620,height: 62),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
+        let panel = CaptureToolbarPanel(contentRect: CGRect(x: screen.visibleFrame.midX-(CloudSession.isAvailable ? 348 : 330),y: screen.visibleFrame.minY+24,width: CloudSession.isAvailable ? 696 : 660,height: 62),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
         panel.overlay = self; panel.acceptsMouseMovedEvents = true; panel.hidesOnDeactivate = false
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue+1)
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true; panel.isReleasedWhenClosed = false
@@ -126,6 +148,31 @@ final class CaptureOverlayWindow: NSPanel {
         redraw()
         StartupTrace.mark("selectorVisible")
         if !state.needsPermission { startWindowMetadataRefresh() }
+        if preferences.freezeScreen,!state.needsPermission { freeze() }
+        if magnifierActive { sampler.request(NSEvent.mouseLocation) }
+    }
+    /// The selector is already up and transparent; the stills replace the live desktop as soon as they arrive.
+    func freeze() {
+        let generation = selectionGeneration
+        freezeTask = Task { [weak self] in
+            guard let self,let images = try? await self.engine.displayImages(),self.selectionGeneration == generation,self.onComplete != nil else { return }
+            self.frozen = images
+            self.views.forEach { $0.invalidateSelection(full: true) }
+        }
+    }
+    func toggleText() {
+        guard ["Screenshot","Text / QR"].contains(state.purpose) else { NSSound.beep(); return }
+        state.purpose = state.isText ? "Screenshot" : "Text / QR"
+    }
+    func toggleMagnifier() {
+        preferences.magnifier.toggle()
+        if magnifierActive { sampler.request(pointer) } else { sampler.reset() }
+        views.forEach { $0.invalidateSelection(full: true) }
+    }
+    func copyColor() {
+        guard magnifierActive,let hex = sampler.hex else { NSSound.beep(); return }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(hex,forType: .string)
+        AppController.shared.showToast("Copied \(hex)",symbol: "eyedropper",hideAfter: 1.4)
     }
     func presentSelectionWindows() {
         guard windows.isEmpty else { return }
@@ -167,6 +214,8 @@ final class CaptureOverlayWindow: NSPanel {
         if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor); self.escapeMonitor = nil }
         selectionGeneration += 1
         windowRefreshTask?.cancel(); windowRefreshTask = nil
+        freezeTask?.cancel(); freezeTask = nil; frozen = [:]
+        sampler.reset()
         let hadSelection = onComplete != nil || !windows.isEmpty
         toolbar?.close(); toolbar = nil; toolbarOccluded = false
         windows.forEach { $0.close() }; windows.removeAll(); views.removeAll()
@@ -190,7 +239,9 @@ final class CaptureOverlayWindow: NSPanel {
         }
     }
     func updatePointer(at point: CGPoint) {
+        let previous = pointer
         pointer = point
+        if magnifierActive { views.forEach { $0.invalidatePointer(previous,point) }; sampler.request(point) }
         guard state.mode == .fullscreen,let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }),screen.displayID != targetDisplayID else { return }
         targetDisplayID = screen.displayID; redraw()
     }
@@ -258,6 +309,9 @@ final class CaptureOverlayWindow: NSPanel {
             case .upload: uploadCapture()
             case .library: state.openLibrary?()
             case .settings: state.openSettings?()
+            case .captureText: toggleText()
+            case .magnifier: toggleMagnifier()
+            case .copyColor: copyColor()
             }
             return true
         }
@@ -297,6 +351,7 @@ final class CaptureOverlayWindow: NSPanel {
         case .fullscreen: target = .display(targetDisplayID)
         }
         let callback = onComplete
+        frozenHandoff = frozen.isEmpty ? nil : frozen
         close(); callback?(target)
     }
 }
@@ -364,6 +419,16 @@ final class CaptureOverlayWindow: NSPanel {
         if (overlay.state.mode == .fullscreen && current.width > 0) || full || local.width*local.height > bounds.width*bounds.height*0.6 { needsDisplay = true; return }
         setNeedsDisplay(local.offsetBy(dx: -window.frame.minX,dy: -window.frame.minY))
     }
+    /// The crosshair spans the whole display, but only thin strips and the loupe around the old and new pointer repaint.
+    func invalidatePointer(_ old: CGPoint,_ new: CGPoint) {
+        guard let window else { return }
+        for p in [old,new] where window.frame.insetBy(dx: -1,dy: -1).contains(p) {
+            let local = CGPoint(x: p.x-window.frame.minX,y: p.y-window.frame.minY)
+            setNeedsDisplay(CGRect(x: local.x.rounded()-2,y: 0,width: 5,height: bounds.height))
+            setNeedsDisplay(CGRect(x: 0,y: local.y.rounded()-2,width: bounds.width,height: 5))
+            setNeedsDisplay(PixelLoupe.placement(pointer: local,size: MagnifierChrome.loupeSize,in: bounds).insetBy(dx: -3,dy: -3))
+        }
+    }
     required init?(coder: NSCoder) { fatalError() }
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -395,7 +460,7 @@ final class CaptureOverlayWindow: NSPanel {
     override func mouseMoved(with event: NSEvent) {
         overlay.updatePointer(at: screenPoint(event))
         if let anchor = overlay.clickAnchor,(overlay.state.mode == .area || overlay.state.mode == .lastRegion) {
-            overlay.state.rect = CaptureGeometry.rectangle(from: anchor,to: screenPoint(event))
+            overlay.state.rect = cornerRectangle(from: anchor,to: screenPoint(event),square: event.modifierFlags.contains(.shift))
             overlay.redraw(cursors: false)
         }
         if overlay.state.mode == .window {
@@ -412,7 +477,7 @@ final class CaptureOverlayWindow: NSPanel {
         if s.mode == .fullscreen { overlay.updatePointer(at: point); overlay.complete(); return }
         if s.mode == .activeWindow { overlay.complete(); return }
         if let first = overlay.clickAnchor {
-            s.rect = CaptureGeometry.rectangle(from: first,to: point)
+            s.rect = cornerRectangle(from: first,to: point,square: event.modifierFlags.contains(.shift))
             guard s.rect.width > 2,s.rect.height > 2 else { overlay.redraw(); return }
             overlay.clickAnchor = nil; s.drawingNew = false; overlay.rememberMode(); overlay.redraw()
             if overlay.captureOnDraw { overlay.complete() }
@@ -426,13 +491,14 @@ final class CaptureOverlayWindow: NSPanel {
     override func mouseDragged(with event: NSEvent) {
         guard !interactionCancelled,overlay.onComplete != nil,overlay.state.mode == .area || overlay.state.mode == .lastRegion else { return }
         dragging = true
-        overlay.state.rect = interaction.update(to: screenPoint(event),bounds: overlay.selectionBounds,square: event.modifierFlags.contains(.shift))
+        overlay.updatePointer(at: screenPoint(event))
+        overlay.state.rect = interaction.update(to: screenPoint(event),bounds: overlay.selectionBounds,square: event.modifierFlags.contains(.shift),ratio: overlay.preferences.aspectLock.ratio)
         if interaction.operation == .move { NSCursor.closedHand.set() }
         overlay.redraw(cursors: false)
     }
     override func mouseUp(with event: NSEvent) {
         guard !interactionCancelled,overlay.onComplete != nil,overlay.state.mode == .area || overlay.state.mode == .lastRegion else { return }
-        if dragging { overlay.state.rect = interaction.update(to: screenPoint(event),bounds: overlay.selectionBounds,square: event.modifierFlags.contains(.shift)) }
+        if dragging { overlay.state.rect = interaction.update(to: screenPoint(event),bounds: overlay.selectionBounds,square: event.modifierFlags.contains(.shift),ratio: overlay.preferences.aspectLock.ratio) }
         // A click starts two-corner selection. Moving/resizing never captures on release.
         if interaction.operation == .draw {
             if !dragging { if overlay.clickAnchor == nil,overlay.state.rect.width < 3 { overlay.clickAnchor = anchor }; return }
@@ -445,11 +511,33 @@ final class CaptureOverlayWindow: NSPanel {
     override func keyDown(with event: NSEvent) {
         if !overlay.handleKeyboard(event) { super.keyDown(with: event) }
     }
+    /// Coordinates are display-local with a top-left origin, as in other macOS measuring tools.
+    private func drawMagnifier(in ctx: CGContext,window: NSWindow) {
+        guard overlay.magnifierActive,window.frame.contains(overlay.pointer) else { return }
+        let p = CGPoint(x: overlay.pointer.x-window.frame.minX,y: overlay.pointer.y-window.frame.minY)
+        MagnifierChrome.crosshair(at: p,in: ctx,bounds: bounds)
+        let scale = window.backingScaleFactor
+        let x = Int(p.x),y = Int(bounds.height-p.y)
+        var caption = ["\(x), \(y) pt","\(Int(CGFloat(x)*scale)), \(Int(CGFloat(y)*scale)) px"]
+        let r = overlay.state.rect
+        if r.width > 2,r.height > 2 { caption.append("\(Int(r.width)) × \(Int(r.height)) pt") }
+        MagnifierChrome.loupe(pointer: p,in: ctx,bounds: bounds,image: overlay.sampler.image,hex: overlay.sampler.hex,caption: caption)
+    }
+    /// Two-corner selection honours Shift and the aspect lock like dragging does.
+    func cornerRectangle(from anchor: CGPoint,to point: CGPoint,square: Bool) -> CGRect {
+        guard let ratio = square ? 1 : overlay.preferences.aspectLock.ratio else { return CaptureGeometry.rectangle(from: anchor,to: point) }
+        return CaptureGeometry.rectangle(from: anchor,to: AspectLock.end(from: anchor,to: point,ratio: ratio,bounds: overlay.selectionBounds))
+    }
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext,let window else { return }
         ctx.saveGState()
         ctx.setBlendMode(.copy); ctx.clear(dirtyRect)
         ctx.restoreGState()
+        defer { drawMagnifier(in: ctx,window: window) }
+        if let still = overlay.frozen[displayID] {
+            // Native pixels onto a backing of the same density; AppKit clips the draw to the dirty rect.
+            ctx.saveGState(); ctx.interpolationQuality = .none; ctx.draw(still,in: bounds); ctx.restoreGState()
+        }
         let s = overlay.state
         var selection = s.rect
         let selectingWindow = s.mode == .window || s.mode == .activeWindow
@@ -524,6 +612,7 @@ struct CaptureToolbar: View {
     @State private var options = false
     var hint: String {
         if state.needsPermission { return "Screen Recording access is needed · Click Allow access to continue" }
+        if state.isText { return "Select text or a QR code · Return: copy text · T: back to screenshot · Esc: cancel" }
         if state.mode == .window { return "Click a window to capture · Space: area · Esc: cancel" }
         if state.mode == .activeWindow { return "Capture the previously active application window · Return: capture" }
         if state.mode == .fullscreen { return "Move pointer to choose display · Click display or Return: capture" }
@@ -550,6 +639,10 @@ struct CaptureToolbar: View {
                     Button { tooltips.dismiss(); state.resetArea?() } label: {
                         Image(systemName: "eraser").font(.system(size: 18,weight: .regular)).frame(width: 34,height: 40)
                     }.buttonStyle(.plain).captureHelp("Reset Area · X or Delete\nClear the rectangle, any half-drawn corner and start drawing from scratch. Your saved last area is kept.",using: tooltips).accessibilityLabel("Reset area")
+                    Button { tooltips.dismiss(); state.toggleText?() } label: {
+                        Image(systemName: "text.viewfinder").font(.system(size: 18,weight: .regular)).frame(width: 34,height: 40)
+                            .background(state.isText ? Color.primary.opacity(0.12) : Color.clear,in: RoundedRectangle(cornerRadius: 7))
+                    }.buttonStyle(.plain).captureHelp("Capture Text · T\nRecognize text and QR codes in the selection and copy them. Nothing is saved unless you turn that on in Settings.",using: tooltips).accessibilityLabel("Capture text")
                 }
                 divider
                 Button { tooltips.dismiss(); options.toggle() } label: {
@@ -562,7 +655,7 @@ struct CaptureToolbar: View {
                         Image(systemName: "link.badge.plus").font(.system(size: 18,weight: .regular)).frame(width: 34,height: 40)
                     }.buttonStyle(.plain).captureHelp("Capture & Copy Link · \(preferences.uploadKey.uppercased()) or ⇧Return\nUpload the capture to Easyshot Cloud and copy a shareable link, for pasting over SSH or into chat.",using: tooltips).accessibilityLabel("Capture and copy link")
                 }
-                Button(state.needsPermission ? "Allow Access" : state.purpose == "Recording" ? "Record" : state.purpose == "Upload" ? "Upload" : "Capture") { state.capture?() }
+                Button(state.needsPermission ? "Allow Access" : state.purpose == "Recording" ? "Record" : state.purpose == "Upload" ? "Upload" : state.isText ? "Copy Text" : "Capture") { state.capture?() }
                     .buttonStyle(.glassProminent).tint(.accentColor).controlSize(.large).keyboardShortcut(.defaultAction)
                     .font(.system(size: 12,weight: .medium)).captureHelp("\(state.needsPermission ? "Allow Screen Recording Access" : state.purpose == "Recording" ? "Record · Return" : "Capture · Return")\n\(hint)",using: tooltips)
                     .accessibilityHint(hint)
@@ -590,8 +683,16 @@ struct CaptureToolbar: View {
                 .captureHelp("Copy to Clipboard\nCopy the screenshot image and its saved file URL.",using: tooltips)
             Toggle("Snap on draw",isOn: Binding(get: { preferences.snapOnDraw || state.fastDraw },set: { preferences.snapOnDraw = $0; state.fastDraw = false }))
                 .captureHelp("Snap on Draw\nCapture and close as soon as you finish a new rectangle, by dragging or clicking two corners. Moving and resizing still wait for Capture.",using: tooltips)
-            Toggle("Quick Preview · 3 seconds",isOn: $preferences.showPreview)
-                .captureHelp("Quick Preview\nShow a three-second thumbnail. Rapid captures replace it; click it to edit.",using: tooltips)
+            Picker("After capture",selection: $preferences.postCapture) { ForEach(PostCapture.allCases) { Text($0.title).tag($0) } }
+                .captureHelp("After Capture\nQuick Access cards stack in the corner with copy, save, annotate, pin and text actions. Drag a card into any app.",using: tooltips)
+            Toggle("Magnifier · M",isOn: Binding(get: { preferences.magnifier },set: { if $0 != preferences.magnifier { state.toggleMagnifier?() } }))
+                .captureHelp("Magnifier · M\nCrosshair and pixel loupe with coordinates and the color under the pointer. C copies the color.",using: tooltips)
+            Toggle("Freeze screen",isOn: $preferences.freezeScreen)
+                .captureHelp("Freeze Screen\nTake one still of each display when selection opens, so menus and tooltips stay put. Applies next time.",using: tooltips)
+            Divider()
+            Text("Aspect").font(.system(size: 11,weight: .semibold)).foregroundStyle(.secondary)
+            Picker("Aspect",selection: Binding(get: { preferences.aspectLock },set: { preferences.aspectLock = $0; state.applyAspect?() })) { ForEach(AspectLock.allCases) { Text($0.title).tag($0) } }.pickerStyle(.segmented).labelsHidden()
+                .captureHelp("Aspect Lock\nKeep new and resized areas at this ratio. Shift still draws a square.",using: tooltips)
             Divider()
             Text("Timer").font(.system(size: 11,weight: .semibold)).foregroundStyle(.secondary)
             Picker("Timer",selection: $preferences.delay) { Text("None").tag(0.0); Text("3s").tag(3.0); Text("5s").tag(5.0); Text("10s").tag(10.0) }.pickerStyle(.segmented).labelsHidden()
@@ -624,7 +725,7 @@ struct CaptureToolbar: View {
                 .captureHelp("Settings · ⌘,\nConfigure folder, format, clipboard, previews and capture preferences.",using: tooltips)
             Button("Open Library…") { tooltips.dismiss(); options = false; state.openLibrary?() }
                 .captureHelp("Library · ⌘L\nBrowse saved captures, edit, pin, copy text and share.",using: tooltips)
-            Text("1: screen · 2: window · 3: area\n4: active window · 5: last area\nD/N: draw new · X/Delete: reset area\n\(CloudSession.isAvailable ? "\(preferences.uploadKey.uppercased()) / ⇧Return: capture & copy link · " : "")Return: capture · Esc: close").font(.caption).foregroundStyle(.secondary)
+            Text("1: screen · 2: window · 3: area\n4: active window · 5: last area\nD/N: draw new · X/Delete: reset area\nT: capture text · M: magnifier · C: copy color\n\(CloudSession.isAvailable ? "\(preferences.uploadKey.uppercased()) / ⇧Return: capture & copy link · " : "")Return: capture · Esc: close").font(.caption).foregroundStyle(.secondary)
         }.padding(20).frame(width: 310)
             .background(CapturePopoverLevel())
     }
