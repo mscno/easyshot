@@ -64,16 +64,16 @@ The binary's own commands: `easyshot-server [serve]`, `migrate up|status|reset -
 | `/` | Landing page; download link from `DOWNLOAD_URL` |
 | `/v/{slug}` | Watch page: player, transcript (from the WebVTT track; click a line to seek), timestamped comments (guests name themselves and are labelled guests; members come from the session), emoji reactions, view count, copy link, download. While the app records it shows "Recording live… N MB uploaded", then "Finishing…", then swaps in the player live. Password videos show a gate; private and expired ones are 404. Open viewers follow changes: a switch to password shows the gate, deletion or "only me" shows "Recording unavailable". Open Graph, Twitter player and oEmbed discovery tags for link-visible videos. |
 | `/v/{slug}/embed` | Player only, frameable (oEmbed `html`) |
-| `/v/{slug}/media`, `/download`, `/thumbnail.jpg` | 302 to presigned GETs (6 h, 10 min, 10 min) after the access check |
+| `/v/{slug}/media`, `/download`, `/thumbnail.jpg` | 302 to presigned GETs (5 min, 10 min, 10 min) after the access check |
 | `/v/{slug}/transcript.vtt` | The transcript, same origin so `<track>` needs no bucket CORS |
 | `/v/{slug}/live` | Datastar SSE stream |
 | `POST /v/{slug}/comments`, `/reactions`, `/unlock` | Native forms; Datastar gets SSE patches, plain posts a 303 |
 | `/oembed?url=` | oEmbed JSON for link-visible, ready videos |
 | `/signup`, `POST /signup` | Email + password (10–256 characters, argon2id, like the API); honours `ALLOW_SIGNUPS`. With mail configured it emails a verification code and shows `/verify`; an email that already has an account gets the same page and a sign-in code instead (no account enumeration). Without mail (local dev) it signs straight in. 5 per hour per address. |
-| `/verify`, `POST /verify`, `POST /verify/resend` | Enter an emailed code (verification or sign-in); marks the email verified and signs in |
+| `/verify`, `POST /verify`, `POST /verify/resend` | Enter an emailed code; password-carrying codes also require the hidden signup-attempt nonce. The first mailbox proof installs that attempt’s password and revokes earlier sessions, API tokens and codes |
 | `/login`, `POST /login` | Password sign-in; same `login_attempts` lockout as the API (10 failures per email per 15 min) plus 20 posts per 10 min per address |
 | `/login/code`, `POST /login/code` | "Email me a sign-in code" (`login_otp`) |
-| `/forgot`, `POST /forgot`, `POST /reset` | Password reset with an emailed code; ends every session of the account and signs this browser in |
+| `/forgot`, `POST /forgot`, `POST /reset` | Password reset with an emailed code; ends every session, revokes every API token and outstanding code, and signs this browser in |
 | `POST /logout` | Ends this browser's session |
 | `/account` | Email and verification, change password (ends every other session), signed-in devices (Mac app and browsers; sign out one or all others), API tokens (shown once on creation, revocable), delete account (type the email to confirm; purges recordings, screenshots, sessions and tokens) |
 | `/account/live`, `/library/live` | Datastar SSE streams for those pages |
@@ -83,13 +83,25 @@ Sessions: every sign-in replaces the browser's `__Host-sg_session` cookie with a
 
 Security: Topcoat's origin policy rejects cross-site state-changing browser requests; the CSP allows scripts and styles only from `'self'`, plus `'unsafe-eval'` (accepted deliberately: Datastar compiles each `data-*` expression with `Function`, and has no build-time compilation mode; every expression is server-authored, user data only ever appears as escaped text or attribute values, and inline `<script>` stays blocked), media and images from `https:` (and a plain-HTTP dev store); comment, reaction, unlock and sign-in posts are rate limited per client address or user; password unlocks are an HMAC cookie bound to the current password hash; views are counted once per viewer per UTC day using a keyed hash of day, address and user agent.
 
+## Authentication API
+
+With mail configured, `POST /v1/auth/register {email, password, device_name?}` returns `202 {verification_required: true, attempt}` for every valid address (new, unverified, verified or disabled), without a session. The random attempt is 43 URL-safe characters; only its hash is stored, alongside the signup password hash on the mailed code. `POST /v1/auth/login` returns that same shape for a correct password on an unverified account; a verified account gets `200 {token, expires_at, user}`. Wrong credentials remain 401. Without mail, development registration returns 201 with a session and duplicate addresses return 409.
+
+`POST /v1/auth/otp/verify {email, code, attempt?, device_name?}` completes signup or sign-in. A password-carrying verification code requires its matching attempt; independent signup attempts cannot redeem or cancel each other's codes. The first proof of an unverified mailbox atomically installs that attempt's password, verifies the account and revokes all earlier sessions, API tokens and outstanding codes. A passwordless sign-in code claims without retaining a preregistered password; the owner can set one through password recovery. Authenticated email confirmation preserves that session's credentials. Unverified accounts cannot create API tokens while mail is configured.
+
+`POST /v1/auth/otp/request {email, attempt?}` resends a signup code with the same attempt and password, or requests a passwordless sign-in code without an attempt. Resending never moves a code to another attempt. Code issuance is serialized per account/purpose: 30 seconds between sends, at most five per hour, five guesses per code, single use. Password reset revokes sessions, API tokens and outstanding codes in one transaction.
+
+Web and API requests share per-address budgets before password hashing: login 20/10 min, signup 5/hour, code requests 10/10 min and verification/reset 20/10 min. Addresses follow `TRUSTED_PROXY_HOPS`; client-supplied leftmost forwarding entries are ignored. Concurrent Argon2 work is bounded and per-email failures are recorded before checking passwords (10 failures/15 min).
+
+Media signatures are bearer capabilities: a URL already issued remains usable until expiry, even after a privacy or password change. Media GET signatures last five minutes, and their redirect responses are not cached. The player re-enters the authorized media route after an expiry error and preserves playback position. Live pages remove inaccessible players immediately; bytes already downloaded cannot be recalled. Downloads and thumbnails retain their ten-minute signatures.
+
 ## Video upload API
 
 Auth as for screenshots (`Authorization: Bearer ...`; uploads need a confirmed email when `REQUIRE_EMAIL_VERIFICATION=true`). The share link exists before any bytes are uploaded.
 
 | Endpoint | Body | Result |
 |---|---|---|
-| `POST /v1/videos` | `{title?, content_type?}` (`video/mp4` default, `video/quicktime`, `video/webm`) | 201 video JSON with `share_url` and `upload: {min_part_bytes, max_bytes, max_parts, max_part_batch, part_url_ttl_seconds}`. 429 `TOO_MANY_PENDING_UPLOADS` when the account already has `MAX_PENDING_UPLOADS` unfinished uploads (younger than 24 h) |
+| `POST /v1/videos` | `{title?, content_type?}` (`video/mp4` default, `video/quicktime`, `video/webm`) | 201 video JSON with `share_url` and `upload: {min_part_bytes, max_bytes, max_parts, max_part_batch, part_url_ttl_seconds}`. 429 `TOO_MANY_PENDING_UPLOADS` when the account already has `MAX_PENDING_UPLOADS` unfinished uploads |
 | `POST /v1/videos/{id}/parts` | `{parts: [{part_number, size}, ...]}` (≤ 100 per call, part numbers 1..=10000, sizes 1..=5 GiB) | `{parts: [{part_number, method: "PUT", url, headers: {"content-length"}}], expires_in}`; PUT exactly `size` bytes (the length is signed into the URL) and keep each `ETag`. Sizes are reserved before signing and fixed per part (asking again with the same size is fine, another size is 400). 413 `TOO_LARGE` when the video's parts would exceed `MAX_VIDEO_BYTES` or the account's unfinished uploads `MAX_PENDING_UPLOAD_BYTES`; a refused batch reserves nothing |
 | `POST /v1/videos/{id}/progress` | `{uploaded_bytes, recording}` | 204. About once per second while recording; at most 4 per second per video (429 beyond). Counts must not decrease (400); `recording: false` records when recording stopped; ignored once the video is ready. Drives "Recording live… N MB uploaded" / "Finishing…" on every open page. |
 | `POST /v1/videos/{id}/complete` | `{parts: [{part_number, etag}], duration_ms?, width?, height?}` (up to 10,000 parts; ETags optionally quoted, ≤ 64 of `[A-Za-z0-9_-]`) | video JSON (`status: ready`). Every part must have been requested (400 otherwise); the object must measure the reserved sizes of the listed parts. Idempotent: a retry after storage already assembled the object finishes the transition (200); an aborted or mismatching upload is 409 `NOT_UPLOADED` |
@@ -101,7 +113,7 @@ Auth as for screenshots (`Authorization: Bearer ...`; uploads need a confirmed e
 | `PATCH /v1/videos/{id}` | `{title?, visibility?, password?}` | video JSON |
 | `DELETE /v1/videos/{id}` | | 204; aborts the upload, deletes objects and conversation |
 
-Every part except the last must be at least 5 MiB (S3 rule). Upload parts while recording and complete on stop; the watch page flips to the player within a moment. Reservations live in `upload_parts` (migration `0009`, owner-only RLS); creating uploads, reserving parts and completing serialize per account with a transaction-scoped advisory lock, so the caps hold under concurrent requests. Completion and deletion release the reservation. The completion route accepts bodies up to about 1.6 MB (a 10,000-part manifest); the rest of `/v1` keeps the 64 KiB limit.
+Every part except the last must be at least 5 MiB (S3 rule). Upload parts while recording and complete on stop; the watch page flips to the player within a moment. Reservations live in `upload_parts` (migration `0009`, owner-only RLS); creating uploads, reserving parts and completing serialize per account with a transaction-scoped advisory lock, so the caps hold under concurrent requests. Stale uploads continue counting until actually purged; their parts cannot be presigned after 24 h. Completion and deletion release the reservation. The completion route accepts bodies up to about 1.6 MB (a 10,000-part manifest); the rest of `/v1` keeps the 64 KiB limit.
 
 ## Deploy (Fly.io + PostgreSQL)
 
@@ -115,7 +127,9 @@ APP_DATABASE_PASSWORD="$(openssl rand -base64 32)" mise run db:bootstrap
 # creates or rotates easyshot_app (LOGIN NOSUPERUSER NOBYPASSRLS), grants CONNECT, migrates
 MIGRATION_DATABASE_URL=... DATABASE_URL=postgres://easyshot_app:...@host/db?sslmode=require mise run db:verify
 # ok/FAIL per check: app role is not a superuser, cannot bypass RLS, owns no tables, does not
-# use the development password; all migrations applied; every owner-scoped table FORCEs RLS
+# use the development password; recursive inherited/SET ROLE privileges and object ownership
+# are checked, schema SECURITY DEFINER functions and the role-grant helper cannot be called;
+# all migrations applied; every owner-scoped table FORCEs RLS
 ```
 
 Without the variables, both tasks load the encrypted `.env.production` at the repository root with `esec` (`server/scripts/run-production-db.sh`). Neon: the `*_owner` role can create the app role; Fly MPG: the provided owner user. Set `DATABASE_URL` to the app role with the new password. `fly.toml` runs `easyshot-server migrate up` as the release command, so migrations apply as the owner before new machines start; the app itself never needs the owner URL. Use the pooled endpoint for `DATABASE_URL` only if it is a session pooler: transaction-mode pooling breaks prepared statements and transaction-local settings stay safe only within a transaction.
