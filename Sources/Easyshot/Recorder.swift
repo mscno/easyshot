@@ -27,6 +27,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     private var outputURL: URL?
     private var started = false
     private var ending = false
+    /// The first write failure; owned by `queue`. Any failure ends the recording, whatever the writer's status.
     private var sampleError: Error?
     /// Cuts paused time out of every track; owned by `queue`.
     private var clock = PauseClock(frameDuration: 1/30)
@@ -131,14 +132,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
             if !started {
                 if spool != nil {
                     writer.initialSegmentStartTime = time
-                    guard writer.startWriting() else { sampleError = writer.error; return }
+                    guard writer.startWriting() else { failed(writer.error); return }
                 }
                 writer.startSession(atSourceTime: time); telemetry?.setOrigin(time); mixer?.origin = time; started = true
             }
             if video?.isReadyForMoreMediaData == true {
                 if let effects,let adaptor,let pool = adaptor.pixelBufferPool,let input = CMSampleBufferGetImageBuffer(sample) {
-                    if let output = effects.composite(input,pool: pool),!adaptor.append(output,withPresentationTime: time) { sampleError = writer.error }
-                } else if let retimed = Self.retimed(sample,by: delta),video?.append(retimed) == false { sampleError = writer.error }
+                    if let output = effects.composite(input,pool: pool),!adaptor.append(output,withPresentationTime: time) { failed(writer.error) }
+                } else if let retimed = Self.retimed(sample,by: delta),video?.append(retimed) == false { failed(writer.error) }
             }
         } else if started {
             let input: AVAssetWriterInput?,track: Int
@@ -146,13 +147,21 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
             guard let (time,delta) = map(sample.presentationTimeStamp,track: track) else { return }
             if let mixer,let audio {
                 mixer.add(sample,source: track == 2 ? AudioMixer.voice : AudioMixer.system,at: time)
-                if !mixer.drain(into: audio,final: false) { sampleError = writer.error }
+                if !mixer.drain(into: audio,final: false) { failed(writer.error) }
                 return
             }
-            if input?.isReadyForMoreMediaData == true,let retimed = Self.retimed(sample,by: delta),input?.append(retimed) == false { sampleError = writer.error }
+            if input?.isReadyForMoreMediaData == true,let retimed = Self.retimed(sample,by: delta),input?.append(retimed) == false { failed(writer.error) }
         }
     }
     func stream(_ stream: SCStream,didStopWithError error: Error) { DispatchQueue.main.async { self.didFail?(error) } }
+    /// On `queue`: keeps the first error and stops the recording at once rather than at the user's Stop,
+    /// so a disk-full spool never turns into a truncated upload reported as a success.
+    private func failed(_ error: Error?) {
+        guard sampleError == nil,!ending else { return }
+        let error = error ?? ShotError.message("The recording could not be written.")
+        sampleError = error
+        DispatchQueue.main.async { self.didFail?(error) }
+    }
     func stop() async throws {
         guard let stream,let writer else { return }
         do { try await stream.stopCapture() }
@@ -161,7 +170,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
             queue.async {
                 self.ending = true
                 if let mixer = self.mixer,let audio = self.audio {
-                    if self.started,!mixer.drain(into: audio,final: true) { self.sampleError = self.writer?.error }
+                    if self.started,!mixer.drain(into: audio,final: true) { self.sampleError = self.sampleError ?? self.writer?.error ?? ShotError.message("The recording could not be written.") }
                     self.mixStats = (mixer.busySeconds,mixer.mixedSeconds)
                 }
                 self.video?.markAsFinished(); self.audio?.markAsFinished(); self.mic?.markAsFinished()
@@ -173,7 +182,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         // Every segment, including the last, has been delivered once finishWriting returns.
         spool?.close()
         self.stream = nil
-        if writer.status != .completed { telemetry?.cancel(); throw writer.error ?? sampleError ?? ShotError.message("Recording could not be finalized.") }
+        // Read on the queue, after every callback has drained; a completed writer says nothing about the spool.
+        let failure: Error? = await withCheckedContinuation { c in queue.async { c.resume(returning: self.sampleError ?? self.spool?.failure) } }
+        if writer.status != .completed || failure != nil { telemetry?.cancel(); throw writer.error ?? failure ?? ShotError.message("Recording could not be finalized.") }
         // A missing sidecar only disables Studio editing; the recording itself is intact.
         let output = outputURL ?? writer.outputURL
         try? await withCheckedThrowingContinuation { (c: CheckedContinuation<Void,Error>) in
@@ -184,7 +195,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
 
 extension Recorder: AVAssetWriterDelegate {
     func assetWriter(_ writer: AVAssetWriter,didOutputSegmentData segmentData: Data,segmentType: AVAssetSegmentType,segmentReport: AVAssetSegmentReport?) {
-        do { try spool?.append(segmentData) } catch { queue.async { self.sampleError = error } }
+        do { try spool?.append(segmentData) } catch { queue.async { self.failed(error) } }
     }
 }
 
