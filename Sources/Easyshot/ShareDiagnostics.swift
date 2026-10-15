@@ -53,7 +53,10 @@ enum ShareDiagnostics {
         try? FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
         let url = folder.appendingPathComponent("share.mp4")
-        MockCloud.reset(failFirstPutOf: 2)
+        // Part 2 fails once with 503; part 3's first PUT hangs until the (shortened) idle timeout.
+        MockCloud.reset(failFirstPutOf: 2,hangFirstPutOf: 3)
+        let previousTimeout = CloudClient.partIdleTimeout; CloudClient.partIdleTimeout = 1.5
+        defer { CloudClient.partIdleTimeout = previousTimeout }
         let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [MockCloud.self]
         let client = CloudClient(baseURL: URL(string: "https://cloud.mock")!,token: "test-token",session: URLSession(configuration: config))
         var linkTime: Double?
@@ -69,8 +72,11 @@ enum ShareDiagnostics {
             let writer = try Recorder.makeWriter(url: url,spool: share.spool)
             let delegate = SpoolDelegate(spool: share.spool); writer.delegate = delegate
             let video = Recorder.videoInput(width: width,height: height,fragmented: true); video.expectsMediaDataInRealTime = false
-            let voice = Recorder.audioInput(channels: 1); voice.expectsMediaDataInRealTime = false
+            // System audio (440 Hz, stereo 48 kHz) and a microphone (1 kHz, mono 44.1 kHz, jittered
+            // timestamps) through the recorder's live mixer into one stereo track.
+            let voice = Recorder.audioInput(channels: 2); voice.expectsMediaDataInRealTime = false
             writer.add(voice); writer.add(video)
+            let mixer = AudioMixer(); mixer.origin = .zero
             let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: video,sourcePixelBufferAttributes: [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,kCVPixelBufferWidthKey as String: width,kCVPixelBufferHeightKey as String: height])
             writer.initialSegmentStartTime = .zero
@@ -78,14 +84,17 @@ enum ShareDiagnostics {
             writer.startSession(atSourceTime: .zero)
             var state: UInt64 = 0x9E3779B97F4A7C15
             let noise = (0..<(width*64)).map { _ in state = state &* 6364136223846793005 &+ 1442695040888963407; return 0xFF00_0000 | UInt32(truncatingIfNeeded: state>>40)&0x00FF_FFFF }
-            let audioPerFrame = 48000/fps
             for frame in 0..<(fps*seconds) {
                 let time = CMTime(value: CMTimeValue(frame),timescale: CMTimeScale(fps))
                 while !video.isReadyForMoreMediaData || !voice.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(2)) }
                 guard let pool = adaptor.pixelBufferPool,let buffer = synthesizedFrame(pool: pool,frame: frame,noise: noise) else { throw ShotError.message("no pixel buffer") }
                 guard adaptor.append(buffer,withPresentationTime: time) else { throw writer.error ?? ShotError.message("append failed") }
-                if let audio = tone(frame: frame,count: audioPerFrame) { _ = voice.append(audio) }
+                if let system = tone(frame: frame,fps: fps,rate: 48000,channels: 2,frequency: 440,amplitude: 0.5) { mixer.add(system.sample,source: AudioMixer.system,at: system.time) }
+                if let mic = tone(frame: frame,fps: fps,rate: 44100,channels: 1,frequency: 1000,amplitude: 0.5,jitter: true) { mixer.add(mic.sample,source: AudioMixer.voice,at: mic.time) }
+                guard mixer.drain(into: voice,final: false) else { throw writer.error ?? ShotError.message("audio append failed") }
             }
+            guard mixer.drain(into: voice,final: true) else { throw writer.error ?? ShotError.message("audio flush failed") }
+            note(String(format: "live mixing: %.2f ms CPU per second of audio (%.1f s mixed)",mixer.busySeconds/max(mixer.mixedSeconds,1e-9)*1000,mixer.mixedSeconds))
             video.markAsFinished(); voice.markAsFinished()
             await writer.finishWriting()
             share.spool.close()
@@ -102,7 +111,13 @@ enum ShareDiagnostics {
         let audioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
         let natural = try? await videoTracks.first?.load(.naturalSize)
         check(abs(duration-Double(seconds)) < 0.25,"local fragmented MP4 is playable: duration \(String(format: "%.2f",duration)) s")
-        check(videoTracks.count == 1 && audioTracks.count == 1 && natural == CGSize(width: width,height: height),"one 2560×1440 video track and one voice track")
+        check(videoTracks.count == 1 && audioTracks.count == 1 && natural == CGSize(width: width,height: height),"one 2560×1440 video track and one audio track")
+        if let track = audioTracks.first,let levels = try? await toneLevels(asset: asset,track: track,frequencies: [440,1000,3000],from: 4,seconds: 4) {
+            note(String(format: "mixed track levels: 440 Hz %.3f, 1 kHz %.3f, 3 kHz %.4f, peak %.2f",levels.tones[0],levels.tones[1],levels.tones[2],levels.peak))
+            check(levels.tones[0] > 0.1 && levels.tones[1] > 0.1,"the single track carries both system audio (440 Hz) and the microphone (1 kHz)")
+            check(levels.tones[1] > levels.tones[0],"voice is louder than system audio (1.0 vs 0.7 gain)")
+            check(levels.tones[2] < 0.02 && levels.peak < 1,"no clipping or distortion (3 kHz \(String(format: "%.4f",levels.tones[2])), peak \(String(format: "%.2f",levels.peak)))")
+        } else { check(false,"mixed audio decodes") }
         let generator = AVAssetImageGenerator(asset: asset)
         check((try? await generator.image(at: CMTime(seconds: Double(seconds)-0.5,preferredTimescale: 600))) != nil,"last second decodes")
         do {
@@ -115,6 +130,17 @@ enum ShareDiagnostics {
             check(uploaded == (try? Data(contentsOf: url)),"uploaded parts reassemble to the local file byte for byte")
             check(MockCloud.completedParts == PartPlanner.whole(size: size).count && MockCloud.partsSortedWithQuotedETags,"complete lists every part in order with quoted ETags")
             check(MockCloud.retriedPuts >= 1,"a failed part PUT is retried")
+            check(MockCloud.hungPuts == 1,"a hung part PUT times out after the idle timeout and is retried")
+            let reports = MockCloud.progress
+            note("progress reports: \(reports.map { "\($0.bytes/1024/1024)MiB\($0.recording ? "" : " stopped")" }.joined(separator: ", "))")
+            let stopped = reports.firstIndex { !$0.recording }
+            check(stopped.map { $0 > 0 && reports[$0...].allSatisfy { !$0.recording } } == true,"progress is reported while recording, then recording: false from stop")
+            check(reports.count <= seconds+4 && reports.map(\.bytes) == reports.map(\.bytes).sorted(),"progress is throttled (\(reports.count) reports) and never goes backwards")
+            await resumeTest(client: client,url: url,check)
+            let unsupported = ProgressReporter(client: client)
+            await unsupported.attach("missing"); await unsupported.report(bytes: 1)
+            try? await Task.sleep(for: .milliseconds(300))
+            check(await unsupported.unsupported,"a server without the progress endpoint (404) turns reporting off")
             check(MockCloud.minNonFinalPart >= PartPlanner.minimumPartSize,"every part but the last is ≥ 5 MiB")
             // Extras: poster JPEG within limits and a WebVTT document.
             let poster = try await ShareExtras.poster(url)
@@ -151,22 +177,71 @@ enum ShareDiagnostics {
         }
         return buffer
     }
-    /// A 220 Hz tone, mono 48 kHz float, standing in for the microphone.
-    static func tone(frame: Int,count: Int) -> CMSampleBuffer? {
-        var asbd = AudioStreamBasicDescription(mSampleRate: 48000,mFormatID: kAudioFormatLinearPCM,mFormatFlags: kAudioFormatFlagIsFloat|kAudioFormatFlagIsPacked,
-                                               mBytesPerPacket: 4,mFramesPerPacket: 1,mBytesPerFrame: 4,mChannelsPerFrame: 1,mBitsPerChannel: 32,mReserved: 0)
+    /// One video frame's worth of a sine tone as interleaved float PCM, like a capture callback delivers.
+    /// `jitter` offsets the timestamp by up to ±0.4 ms, as device clocks do; the samples stay continuous.
+    static func tone(frame: Int,fps: Int,rate: Int,channels: Int,frequency: Double,amplitude: Double,jitter: Bool = false) -> (sample: CMSampleBuffer,time: CMTime)? {
+        let start = frame*rate/fps,count = (frame+1)*rate/fps-start
+        var asbd = AudioStreamBasicDescription(mSampleRate: Double(rate),mFormatID: kAudioFormatLinearPCM,mFormatFlags: kAudioFormatFlagIsFloat|kAudioFormatFlagIsPacked,
+                                               mBytesPerPacket: UInt32(4*channels),mFramesPerPacket: 1,mBytesPerFrame: UInt32(4*channels),mChannelsPerFrame: UInt32(channels),mBitsPerChannel: 32,mReserved: 0)
         var format: CMAudioFormatDescription?
         guard CMAudioFormatDescriptionCreate(allocator: nil,asbd: &asbd,layoutSize: 0,layout: nil,magicCookieSize: 0,magicCookie: nil,extensions: nil,formatDescriptionOut: &format) == noErr,let format else { return nil }
-        let start = frame*count
-        var samples = (0..<count).map { Float32(0.2*sin(2*Double.pi*220*Double(start+$0)/48000)) }
+        var samples = [Float32](repeating: 0,count: count*channels)
+        for i in 0..<count { let v = Float32(amplitude*sin(2*Double.pi*frequency*Double(start+i)/Double(rate))); for c in 0..<channels { samples[i*channels+c] = v } }
         var block: CMBlockBuffer?
-        let bytes = count*4
+        let bytes = samples.count*4
         guard CMBlockBufferCreateWithMemoryBlock(allocator: nil,memoryBlock: nil,blockLength: bytes,blockAllocator: nil,customBlockSource: nil,offsetToData: 0,dataLength: bytes,flags: 0,blockBufferOut: &block) == noErr,let block,
               CMBlockBufferReplaceDataBytes(with: &samples,blockBuffer: block,offsetIntoDestination: 0,dataLength: bytes) == noErr else { return nil }
+        var time = CMTime(value: CMTimeValue(start),timescale: CMTimeScale(rate))
+        if jitter { time = CMTimeAdd(time,CMTime(seconds: 0.0004*sin(Double(frame)*1.7),preferredTimescale: 1_000_000)) }
         var sample: CMSampleBuffer?
         CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: nil,dataBuffer: block,formatDescription: format,sampleCount: count,
-                                                             presentationTimeStamp: CMTime(value: CMTimeValue(start),timescale: 48000),packetDescriptions: nil,sampleBufferOut: &sample)
-        return sample
+                                                             presentationTimeStamp: time,packetDescriptions: nil,sampleBufferOut: &sample)
+        return sample.map { ($0,time) }
+    }
+    /// Goertzel amplitudes of `frequencies` and the peak sample over a window of the decoded track's left
+    /// channel (a mono downmix would scale the levels by √2).
+    static func toneLevels(asset: AVAsset,track: AVAssetTrack,frequencies: [Double],from start: Double,seconds: Double) async throws -> (tones: [Double],peak: Float) {
+        let reader = try AVAssetReader(asset: asset)
+        reader.timeRange = CMTimeRange(start: CMTime(seconds: start,preferredTimescale: 48000),duration: CMTime(seconds: seconds,preferredTimescale: 48000))
+        let output = AVAssetReaderTrackOutput(track: track,outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM,AVSampleRateKey: 48000,AVNumberOfChannelsKey: 2,
+                                                                           AVLinearPCMBitDepthKey: 32,AVLinearPCMIsFloatKey: true,AVLinearPCMIsNonInterleaved: false,AVLinearPCMIsBigEndianKey: false])
+        reader.add(output)
+        guard reader.startReading() else { throw reader.error ?? ShotError.message("Cannot read audio.") }
+        var samples: [Float] = []
+        while let buffer = output.copyNextSampleBuffer(),let block = CMSampleBufferGetDataBuffer(buffer) {
+            var chunk = [Float](repeating: 0,count: CMBlockBufferGetDataLength(block)/4)
+            _ = chunk.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block,atOffset: 0,dataLength: $0.count,destination: $0.baseAddress!) }
+            samples += stride(from: 0,to: chunk.count,by: 2).map { chunk[$0] }
+        }
+        guard samples.count > 4800 else { throw ShotError.message("Too little audio.") }
+        let tones = frequencies.map { f -> Double in
+            let k = 2*cos(2*Double.pi*f/48000); var s1 = 0.0,s2 = 0.0
+            for x in samples { let s0 = Double(x)+k*s1-s2; s2 = s1; s1 = s0 }
+            return 2*sqrt(max(0,s1*s1+s2*s2-k*s1*s2))/Double(samples.count)
+        }
+        return (tones,samples.map(abs).max() ?? 0)
+    }
+    /// A retry after a failed upload resumes from the journal: only parts it lacks are sent again.
+    @MainActor static func resumeTest(client: CloudClient,url: URL,_ check: (Bool,String) -> Void) async {
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        let plan = PartPlanner.whole(size: size)
+        guard plan.count >= 3 else { check(false,"resume test needs at least three parts"); return }
+        // As if every part but the last two were stored before the upload failed.
+        var journal = UploadJournal(videoID: "vid1",partSize: PartPlanner.minimumPartSize)
+        for part in plan.dropLast(2) { journal.record(part,etag: MockCloud.etag(part.number)) }
+        try? JSONEncoder().encode(journal).write(to: UploadJournal.url(for: url))
+        MockCloud.prepareRetry(keeping: Set(plan.dropLast(2).map(\.number)))
+        do {
+            var pending = try JSONSerialization.jsonObject(with: JSONSerialization.data(withJSONObject: MockCloud.video)) as! [String: Any]
+            pending["status"] = "pending"
+            let video = try CloudClient.decoder.decode(CloudVideo.self,from: JSONSerialization.data(withJSONObject: pending))
+            let retry = try ShareRecording(client: client,file: url,video: video,title: nil)
+            let ready = try await retry.finish(durationMs: 1000,width: 2560,height: 1440)
+            let reused = await retry.uploader.reusedParts
+            check(ready.status == "ready" && MockCloud.puts == 2 && reused == plan.count-2,"retry resumes: \(MockCloud.puts) of \(plan.count) parts re-sent, \(reused) reused from the journal")
+            check(MockCloud.assembled() == (try? Data(contentsOf: url)),"the resumed upload reassembles to the local file")
+            check(!FileManager.default.fileExists(atPath: UploadJournal.url(for: url).path),"the journal is removed once the upload completes")
+        } catch { check(false,"resume: \(error.localizedDescription)") }
     }
 
     // MARK: Live
@@ -256,10 +331,19 @@ final class MockCloud: URLProtocol,@unchecked Sendable {
     nonisolated(unsafe) private static var lock = NSLock()
     nonisolated(unsafe) private static var parts: [Int: Data] = [:]
     nonisolated(unsafe) private static var failNext: Set<Int> = []
-    nonisolated(unsafe) static var retriedPuts = 0,completedParts = 0,deleted = 0,partsSortedWithQuotedETags = false,minNonFinalPart = Int.max
-    static func reset(failFirstPutOf part: Int) {
-        lock.lock(); parts = [:]; failNext = [part]; retriedPuts = 0; completedParts = 0; deleted = 0; partsSortedWithQuotedETags = false; minNonFinalPart = Int.max; lock.unlock()
+    nonisolated(unsafe) private static var hangNext: Set<Int> = []
+    nonisolated(unsafe) private static var progressReports: [(bytes: Int,recording: Bool)] = []
+    nonisolated(unsafe) static var retriedPuts = 0,hungPuts = 0,puts = 0,completedParts = 0,deleted = 0,partsSortedWithQuotedETags = false,minNonFinalPart = Int.max
+    static func reset(failFirstPutOf part: Int,hangFirstPutOf hang: Int) {
+        lock.lock(); parts = [:]; failNext = [part]; hangNext = [hang]; progressReports = []
+        retriedPuts = 0; hungPuts = 0; puts = 0; completedParts = 0; deleted = 0; partsSortedWithQuotedETags = false; minNonFinalPart = Int.max; lock.unlock()
     }
+    /// Keeps only the `keeping` parts in storage, as after an interrupted upload, and resets counters.
+    static func prepareRetry(keeping: Set<Int>) {
+        lock.lock(); parts = parts.filter { keeping.contains($0.key) }; failNext = []; hangNext = []; puts = 0; lock.unlock()
+    }
+    static func etag(_ n: Int) -> String { lock.lock(); defer { lock.unlock() }; return "\"etag-\(n)-\(parts[n]?.count ?? 0)\"" }
+    static var progress: [(bytes: Int,recording: Bool)] { lock.lock(); defer { lock.unlock() }; return progressReports }
     static var storedParts: Int { lock.lock(); defer { lock.unlock() }; return parts.count }
     static func assembled() -> Data { lock.lock(); defer { lock.unlock() }; return parts.keys.sorted().reduce(into: Data()) { $0.append(parts[$1]!) } }
     override class func canInit(with request: URLRequest) -> Bool { request.url?.host?.hasSuffix(".mock") == true }
@@ -286,9 +370,12 @@ final class MockCloud: URLProtocol,@unchecked Sendable {
         if url.host == "storage.mock",method == "PUT",let n = Int(url.lastPathComponent) {
             let data = body()
             Self.lock.lock()
-            let fail = Self.failNext.remove(n) != nil
-            if fail { Self.retriedPuts += 1 } else { Self.parts[n] = data }
+            let hang = Self.hangNext.remove(n) != nil
+            let fail = !hang && Self.failNext.remove(n) != nil
+            if hang { Self.hungPuts += 1 } else if fail { Self.retriedPuts += 1 } else { Self.parts[n] = data; Self.puts += 1 }
             Self.lock.unlock()
+            // A hung request never answers; the session's idle timeout cancels it.
+            if hang { return }
             if fail { reply(503); return }
             reply(200,headers: ["ETag": "\"etag-\(n)-\(data.count)\""]); return
         }
@@ -308,6 +395,10 @@ final class MockCloud: URLProtocol,@unchecked Sendable {
             if numbers.count == 1 { Self.minNonFinalPart = Int.max }
             Self.lock.unlock()
             var ready = Self.video; ready["status"] = "ready"; reply(200,ready)
+        case ("POST","/v1/videos/vid1/progress"):
+            let json = (try? JSONSerialization.jsonObject(with: body()) as? [String: Any]) ?? [:]
+            Self.lock.lock(); Self.progressReports.append((json["uploaded_bytes"] as? Int ?? -1,json["recording"] as? Bool ?? true)); Self.lock.unlock()
+            reply(204)
         case ("DELETE","/v1/videos/vid1"): Self.lock.lock(); Self.deleted += 1; Self.lock.unlock(); reply(204)
         default: reply(404,["error": ["message": "not found"]])
         }

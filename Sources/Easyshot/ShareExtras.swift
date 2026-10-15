@@ -73,7 +73,7 @@ enum Transcriber {
         let cues = WebVTT.cues(phrases)
         return cues.isEmpty ? nil : WebVTT.document(cues)
     }
-    /// The mono microphone track (the voice is written first in shared recordings), as 16 kHz mono float PCM.
+    /// The recording's audio (the microphone alone, or its live mix with system audio), as 16 kHz mono float PCM.
     static func extractVoice(from movie: URL,to output: URL) async throws -> Bool {
         let asset = AVURLAsset(url: movie)
         let tracks = try await asset.loadTracks(withMediaType: .audio)

@@ -14,6 +14,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     private var audio: AVAssetWriterInput?
     private var mic: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    /// With both system audio and the microphone on, one mixed track replaces the two separate ones.
+    private var mixer: AudioMixer?
+    /// Mixing cost from the last recording: CPU seconds spent and seconds of audio produced.
+    private(set) var mixStats: (busy: Double,audio: Double)?
     private var effects: RecordingEffects?
     private var telemetry: CursorTelemetry?
     /// Record & Share: the writer emits fragmented-MP4 segments into this spool, which is both the local
@@ -79,14 +83,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         configuration.capturesAudio = Preferences.shared.systemAudio
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48000; configuration.channelCount = 2
-        // Browsers play only the first audio track, so a shared recording puts the voice first.
-        let voiceFirst = spool != nil && Preferences.shared.microphone
-        if voiceFirst,#available(macOS 15.0, *) { configuration.captureMicrophone = true; mic = Self.audioInput(channels: 1); writer.add(mic!) }
-        if configuration.capturesAudio { audio = Self.audioInput(channels: 2); writer.add(audio!) }
-        if !voiceFirst,#available(macOS 15.0, *),Preferences.shared.microphone {
+        // One audio track either way: a single source passes through, two are mixed while recording.
+        if #available(macOS 15.0, *),Preferences.shared.microphone {
             configuration.captureMicrophone = true
-            mic = Self.audioInput(channels: 1); writer.add(mic!)
+            if configuration.capturesAudio { mixer = AudioMixer() } else { mic = Self.audioInput(channels: 1); writer.add(mic!) }
         }
+        if configuration.capturesAudio { audio = Self.audioInput(channels: 2); writer.add(audio!) }
         let stream = SCStream(filter: filter,configuration: configuration,delegate: self)
         self.stream = stream
         try stream.addStreamOutput(self,type: .screen,sampleHandlerQueue: queue)
@@ -131,7 +133,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
                     writer.initialSegmentStartTime = time
                     guard writer.startWriting() else { sampleError = writer.error; return }
                 }
-                writer.startSession(atSourceTime: time); telemetry?.setOrigin(time); started = true
+                writer.startSession(atSourceTime: time); telemetry?.setOrigin(time); mixer?.origin = time; started = true
             }
             if video?.isReadyForMoreMediaData == true {
                 if let effects,let adaptor,let pool = adaptor.pixelBufferPool,let input = CMSampleBufferGetImageBuffer(sample) {
@@ -141,7 +143,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         } else if started {
             let input: AVAssetWriterInput?,track: Int
             if #available(macOS 15.0, *),type == .microphone { input = mic; track = 2 } else { input = audio; track = 1 }
-            guard let (_,delta) = map(sample.presentationTimeStamp,track: track) else { return }
+            guard let (time,delta) = map(sample.presentationTimeStamp,track: track) else { return }
+            if let mixer,let audio {
+                mixer.add(sample,source: track == 2 ? AudioMixer.voice : AudioMixer.system,at: time)
+                if !mixer.drain(into: audio,final: false) { sampleError = writer.error }
+                return
+            }
             if input?.isReadyForMoreMediaData == true,let retimed = Self.retimed(sample,by: delta),input?.append(retimed) == false { sampleError = writer.error }
         }
     }
@@ -153,6 +160,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         let hasFrames: Bool = await withCheckedContinuation { continuation in
             queue.async {
                 self.ending = true
+                if let mixer = self.mixer,let audio = self.audio {
+                    if self.started,!mixer.drain(into: audio,final: true) { self.sampleError = writer.error }
+                    self.mixStats = (mixer.busySeconds,mixer.mixedSeconds)
+                }
                 self.video?.markAsFinished(); self.audio?.markAsFinished(); self.mic?.markAsFinished()
                 continuation.resume(returning: self.started)
             }
@@ -178,22 +189,6 @@ extension Recorder: AVAssetWriterDelegate {
 }
 
 enum VideoTools {
-    static func mixAudio(_ url: URL) async throws {
-        let asset = AVURLAsset(url: url)
-        let tracks = try await asset.loadTracks(withMediaType: .audio)
-        guard tracks.count > 1 else { return }
-        let mix = AVMutableAudioMix()
-        mix.inputParameters = tracks.enumerated().map { i,track in
-            let input = AVMutableAudioMixInputParameters(track: track)
-            input.setVolume(i == 0 ? 0.7 : 1,at: .zero)
-            return input
-        }
-        guard let export = AVAssetExportSession(asset: asset,presetName: AVAssetExportPresetHighestQuality) else { throw ShotError.message("Cannot mix recording audio.") }
-        let temp = url.deletingLastPathComponent().appendingPathComponent(".Easyshot-mix-\(UUID().uuidString).mp4")
-        export.audioMix = mix
-        try await export.export(to: temp,as: .mp4)
-        _ = try FileManager.default.replaceItemAt(url,withItemAt: temp)
-    }
     static func thumbnail(_ url: URL) async -> NSImage? {
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
         generator.appliesPreferredTrackTransform = true
