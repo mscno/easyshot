@@ -26,6 +26,8 @@ final class CameraFeed: NSObject,AVCaptureVideoDataOutputSampleBufferDelegate,@u
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         lock.lock(); frame = buffer; lock.unlock()
     }
+    /// Diagnostics feed synthetic frames without a camera.
+    func inject(_ buffer: CVPixelBuffer) { lock.lock(); frame = buffer; lock.unlock() }
     func latestFrame() -> CVPixelBuffer? { lock.lock(); defer { lock.unlock() }; return frame }
     func stop() { queue.async { self.session.stopRunning(); self.lock.lock(); self.frame = nil; self.lock.unlock() } }
 }

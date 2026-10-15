@@ -209,6 +209,7 @@ struct CaptureRequest {
             Task { let result = await CloudDiagnostics.run(base: base); fflush(stdout); exit(result) }
             return
         }
+        if EditorDiagnostics.launch(CommandLine.arguments) { return }
         if CommandLine.arguments.contains("--studio-test") {
             Task { let result = await Diagnostics.studioTest(); fflush(stdout); exit(result) }
             return
@@ -435,6 +436,7 @@ struct CaptureRequest {
         }
     }
     private func finishUpload(_ image: UploadableImage) async throws {
+        guard let image = try await Redaction.reviewBeforeUpload(image) else { hideToast(); status = "Upload cancelled"; return }
         let shot = try await CloudSession.shared.upload(image)
         guard copyLink(shot.shareURL) else { throw CloudError.invalidResponse }
         status = "Link copied · \(shot.shareURL)"
@@ -725,13 +727,11 @@ struct CaptureRequest {
         store.add(clip); editor(clip)
     }
     func importProject(_ url: URL) {
-        struct Project: Codable { var png: Data; var marks: [Mark]; var padding: Double; var background: [Double]; var shadow: Bool }
         do {
-            let project = try JSONDecoder().decode(Project.self,from: Data(contentsOf: url))
+            let project = try JSONDecoder().decode(EditorProject.self,from: Data(contentsOf: url))
             guard project.background.count == 4,project.marks.allSatisfy({ $0.color.count == 4 }),let image = NSImage(data: project.png)?.cgImage(forProposedRect: nil,context: nil,hints: nil) else { throw ShotError.message("Invalid Easyshot project.") }
             let clip = Clip(path: url.path,kind: "Project",width: image.width,height: image.height)
-            let model = EditorModel(image: image,clip: clip,store: store); model.marks = project.marks; model.padding = project.padding; model.shadow = project.shadow
-            model.background = Color(.sRGB,red: project.background[0],green: project.background[1],blue: project.background[2],opacity: project.background[3])
+            let model = EditorModel(image: image,clip: clip,store: store); model.apply(project)
             openWindow(title: "Editable project · Easyshot",size: CGSize(width: 1160,height: 800),view: EditorView(model: model))
         } catch { fail(error) }
     }
