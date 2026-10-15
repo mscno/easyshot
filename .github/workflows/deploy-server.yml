@@ -29,7 +29,7 @@ jobs:
           MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
           WEB_SECRET: ${{ secrets.WEB_SECRET }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          PUBLIC_BASE_URL: ${{ secrets.SHOTGLASS_API_URL }}
+          PUBLIC_BASE_URL: ${{ secrets.EASYSHOT_API_URL }}
           # Optional email config; unset values are simply not synced.
           LETTERMINT_API_TOKEN: ${{ secrets.LETTERMINT_API_TOKEN }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}

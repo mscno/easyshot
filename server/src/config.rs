@@ -42,7 +42,7 @@ pub struct Config {
     pub download_url: String,
 }
 
-pub const DEFAULT_DOWNLOAD_URL: &str = "https://github.com/mscno/shotglass/releases/latest";
+pub const DEFAULT_DOWNLOAD_URL: &str = "https://github.com/mscno/easyshot/releases/latest";
 
 fn parse_bool(s: &str) -> Option<bool> {
     match s.trim().to_ascii_lowercase().as_str() {

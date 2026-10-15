@@ -10,11 +10,11 @@ jobs:
     steps:
       - name: Call the expiry endpoint
         env:
-          API_URL: ${{ secrets.SHOTGLASS_API_URL }}
+          API_URL: ${{ secrets.EASYSHOT_API_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
           set -euo pipefail
-          : "${API_URL:?Missing SHOTGLASS_API_URL}" "${CRON_SECRET:?Missing CRON_SECRET}"
+          : "${API_URL:?Missing EASYSHOT_API_URL}" "${CRON_SECRET:?Missing CRON_SECRET}"
           for i in 1 2 3 4 5; do
             out=$(curl -fsS --retry 3 --retry-all-errors --max-time 90 -X POST -H "Authorization: Bearer $CRON_SECRET" "$API_URL/v1/internal/expire")
             echo "$out"

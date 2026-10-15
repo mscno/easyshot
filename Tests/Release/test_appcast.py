@@ -15,12 +15,12 @@ class AppcastTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             dmg=Path(folder)/"App-1.2.3-AppleSilicon.dmg";dmg.write_bytes(b"verified dmg")
             info=dict(CFBundleName="App",CFBundleShortVersionString="1.2.3",CFBundleVersion="42",LSMinimumSystemVersion="26.0")
-            tree=ET.fromstring(module.build_feed(info,dmg,"mscno/shotglass",base64.b64encode(bytes(64)).decode()))
+            tree=ET.fromstring(module.build_feed(info,dmg,"mscno/easyshot",base64.b64encode(bytes(64)).decode()))
             enclosure=tree.find("channel/item/enclosure")
-            self.assertEqual(enclosure.get("url"),"https://github.com/mscno/shotglass/releases/download/v1.2.3/"+dmg.name)
+            self.assertEqual(enclosure.get("url"),"https://github.com/mscno/easyshot/releases/download/v1.2.3/"+dmg.name)
             self.assertEqual(enclosure.get("length"),str(dmg.stat().st_size))
             self.assertEqual(enclosure.get("{"+module.NS+"}version"),"42")
             self.assertEqual(tree.find("channel/item/{"+module.NS+"}minimumSystemVersion").text,"26.0")
     def test_invalid_signatures_are_rejected(self):
         with self.assertRaises(AssertionError):
-            module.build_feed(dict(CFBundleShortVersionString="1.0.0",CFBundleVersion="1"),Path("unused"),"mscno/shotglass",base64.b64encode(bytes(32)).decode())
+            module.build_feed(dict(CFBundleShortVersionString="1.0.0",CFBundleVersion="1"),Path("unused"),"mscno/easyshot",base64.b64encode(bytes(32)).decode())

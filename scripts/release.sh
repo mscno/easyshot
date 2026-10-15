@@ -41,6 +41,6 @@ spctl --assess --type execute --verbose=2 "$APP"
 spctl --assess --type open --context context:primary-signature --verbose=2 "$STAGED_DMG"
 ditto "$STAGED_DMG" "$DMG"
 (cd "$RELEASE_DIR" && shasum -a 256 "$(basename "$DMG")" > SHA256SUMS.txt)
-python3 scripts/generate-appcast.py "$APP" "$DMG" mscno/shotglass
+python3 scripts/generate-appcast.py "$APP" "$DMG" mscno/easyshot
 (cd "$RELEASE_DIR" && shasum -a 256 appcast.xml >> SHA256SUMS.txt)
 echo "Release ready: $DMG"

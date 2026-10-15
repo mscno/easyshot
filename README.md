@@ -8,7 +8,7 @@ A native Apple Silicon macOS capture utility inspired by CleanShot X, built in S
 
 ## Run
 
-Source repository: [mscno/shotglass](https://github.com/mscno/shotglass) (public).
+Source repository: [mscno/easyshot](https://github.com/mscno/easyshot) (public).
 
 Open `dist/Easyshot.app`. Launching or reopening the app shows a compact Liquid Glass capture bar at the bottom of the current display. The capture bar and transparent selector open together, without waiting for desktop frames. Escape works throughout startup. The last capture mode and area are remembered across launches. There is no Dock icon, persistent menu-bar item, global hotkey registration, or login launch. Capture or cancel ends the session and exits the process. Settings and Library open only when requested. Quick Access cards keep the session until the last one closes; explicitly opened editors, pins, recordings, and library windows keep it active until finished.
 

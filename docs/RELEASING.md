@@ -15,7 +15,7 @@ security unlock-keychain -p "$(cat "$EASYSHOT_SIGNING_DIR/keychain-password")" \
 export SIGNING_IDENTITY='Developer ID Application: Paraply Ventures AS (93627F7C77)'
 export SIGNING_KEYCHAIN="$EASYSHOT_SIGNING_DIR/easyshot-signing.keychain-db"
 export NOTARY_KEYCHAIN="$SIGNING_KEYCHAIN"
-export NOTARY_PROFILE=shotglass-paraply
+export NOTARY_PROFILE=easyshot-paraply
 ```
 
 Keep a secure backup of the `.p12`, its `certificate-password` file, and the `.p8` API key from that directory. Their contents must stay outside Git, release artifacts, logs and chat.
@@ -35,7 +35,7 @@ Signing and notarization avoid the unidentified-developer/cannot-check-for-malic
 2. Create an [app-specific password](https://support.apple.com/en-us/102654) in your Apple Account. In your own Terminal, store it in Keychain:
 
    ```sh
-   xcrun notarytool store-credentials shotglass \
+   xcrun notarytool store-credentials easyshot \
      --apple-id 'YOUR_APPLE_ACCOUNT_EMAIL' \
      --team-id 'YOUR_TEAM_ID'
    ```
@@ -50,11 +50,11 @@ Signing and notarization avoid the unidentified-developer/cannot-check-for-malic
    python3 -m pip install 'dmgbuild==1.6.7'
 
    SIGNING_IDENTITY='Developer ID Application: YOUR NAME (YOUR_TEAM_ID)' \
-   NOTARY_PROFILE=shotglass \
+   NOTARY_PROFILE=easyshot \
    bash scripts/release.sh
    ```
 
-   This uses the signing identity already in your keychain. It creates `dist/release/Easyshot.app`, `dist/release/Easyshot-<version>-AppleSilicon.dmg` and `SHA256SUMS.txt`. Your installed app and the normal `dist/Easyshot.app` development build are not replaced. The app is notarized first so its ticket travels with it when dragged out of the DMG, including offline installation. Each submission can wait up to **90 minutes** by default; override with `NOTARY_TIMEOUT` if needed. The script records each submission ID before waiting and retains public status/log JSON files in `dist/release`. If a submission is rejected, inspect the log; if it times out, check that existing ID with `xcrun notarytool info ID --keychain-profile shotglass` before submitting again. A timeout does not cancel Apple's processing.
+   This uses the signing identity already in your keychain. It creates `dist/release/Easyshot.app`, `dist/release/Easyshot-<version>-AppleSilicon.dmg` and `SHA256SUMS.txt`. Your installed app and the normal `dist/Easyshot.app` development build are not replaced. The app is notarized first so its ticket travels with it when dragged out of the DMG, including offline installation. Each submission can wait up to **90 minutes** by default; override with `NOTARY_TIMEOUT` if needed. The script records each submission ID before waiting and retains public status/log JSON files in `dist/release`. If a submission is rejected, inspect the log; if it times out, check that existing ID with `xcrun notarytool info ID --keychain-profile easyshot` before submitting again. A timeout does not cancel Apple's processing.
 
    The DMG builder refuses to overwrite an existing image. Move an earlier DMG aside to retry the same version. `Resources/Info.plist` supplies the version and build number.
 
@@ -64,7 +64,7 @@ Signing and notarization avoid the unidentified-developer/cannot-check-for-malic
    gh release create v1.6.2 \
      dist/release/Easyshot-1.6.2-AppleSilicon.dmg \
      dist/release/SHA256SUMS.txt \
-     --repo mscno/shotglass --target master \
+     --repo mscno/easyshot --target master \
      --title 'Easyshot 1.6.2' --draft
    ```
 
@@ -96,16 +96,16 @@ For notarization, go to **App Store Connect → Users and Access → Integration
 Upload files directly to GitHub secrets through the CLI without printing their contents:
 
 ```sh
-base64 -i /path/to/DeveloperID.p12 | gh secret set CERTIFICATE_P12_BASE64 --repo mscno/shotglass
-base64 -i /path/to/AuthKey_KEYID.p8 | gh secret set NOTARY_API_KEY_BASE64 --repo mscno/shotglass
+base64 -i /path/to/DeveloperID.p12 | gh secret set CERTIFICATE_P12_BASE64 --repo mscno/easyshot
+base64 -i /path/to/AuthKey_KEYID.p8 | gh secret set NOTARY_API_KEY_BASE64 --repo mscno/easyshot
 ```
 
-Set the other values in GitHub's secrets form, or use interactive `gh secret set NAME --repo mscno/shotglass`. Certificate passwords and private keys belong in GitHub Secrets/Keychain, not this repo or chat. The key files and local release venv are ignored by Git.
+Set the other values in GitHub's secrets form, or use interactive `gh secret set NAME --repo mscno/easyshot`. Certificate passwords and private keys belong in GitHub Secrets/Keychain, not this repo or chat. The key files and local release venv are ignored by Git.
 
 After adding secrets, `master` pushes produce an artifact automatically. To build one manually, choose **Actions → Release signed DMG → Run workflow**, leaving the branch as `master` and **Create draft release** unchecked. Alternatively:
 
 ```sh
-gh workflow run release.yml --repo mscno/shotglass --ref master
+gh workflow run release.yml --repo mscno/easyshot --ref master
 ```
 
 For an optional draft release, select **Also create a versioned draft GitHub release**, or pass `-f create_draft_release=true` to the CLI command. This mode derives the tag from `CFBundleShortVersionString`, rejects an existing release/tag, and creates the tag against the exact built commit after the artifact is uploaded. Bump both version and build number in `Resources/Info.plist` before a new versioned release. Review the generated draft and test its DMG before publishing it. Do not move published version tags when amending `master`; old downloads should continue to identify their original source.

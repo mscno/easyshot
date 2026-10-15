@@ -16,7 +16,7 @@ def build_feed(info, dmg, repo, signature):
     version = info["CFBundleShortVersionString"]
     build = info["CFBundleVersion"]
     assert len(base64.b64decode(signature, validate=True)) == 64
-    assert repo in ("mscno/shotglass", "mscno/QuadcastRGB2S")
+    assert repo in ("mscno/easyshot", "mscno/QuadcastRGB2S")
     assert dmg.name.endswith(".dmg") and dmg.stat().st_size > 0
     rss = ET.Element("rss", version="2.0")
     channel = ET.SubElement(rss, "channel")

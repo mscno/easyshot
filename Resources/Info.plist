@@ -59,7 +59,7 @@
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
 	<key>SUFeedURL</key>
-	<string>https://github.com/mscno/shotglass/releases/latest/download/appcast.xml</string>
+	<string>https://github.com/mscno/easyshot/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
 	<string>JShYvnOt9ECJHGuzc9epe+OPd27vAJFRcp/FuoNJn6k=</string>
 	<key>SURequireSignedFeed</key>

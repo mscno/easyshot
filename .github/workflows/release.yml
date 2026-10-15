@@ -81,13 +81,13 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
           security import "$RUNNER_TEMP/easyshot-signing.p12" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -k "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
-          xcrun notarytool store-credentials shotglass --keychain "$KEYCHAIN_PATH" --key "$RUNNER_TEMP/easyshot-notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID"
-          printf 'SIGNING_KEYCHAIN=%s\nNOTARY_KEYCHAIN=%s\nNOTARY_PROFILE=shotglass\n' "$KEYCHAIN_PATH" "$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          xcrun notarytool store-credentials easyshot --keychain "$KEYCHAIN_PATH" --key "$RUNNER_TEMP/easyshot-notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID"
+          printf 'SIGNING_KEYCHAIN=%s\nNOTARY_KEYCHAIN=%s\nNOTARY_PROFILE=easyshot\n' "$KEYCHAIN_PATH" "$KEYCHAIN_PATH" >> "$GITHUB_ENV"
       - name: Sign, notarize, staple and build DMG
         env:
           SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
           NOTARY_TIMEOUT: 90m
-          EASYSHOT_CLOUD_URL: ${{ secrets.SHOTGLASS_API_URL }}
+          EASYSHOT_CLOUD_URL: ${{ secrets.EASYSHOT_API_URL }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           set -euo pipefail
