@@ -149,6 +149,7 @@ struct Clip: Codable, Identifiable, Equatable {
             let file = support.appendingPathComponent("history.json")
             if FileManager.default.fileExists(atPath: file.path) { clips = try JSONDecoder().decode([Clip].self,from: Data(contentsOf: file)) }
         } catch { self.error = "Could not load capture history: \(error.localizedDescription)" }
+        applyRetention()
     }
     func persist() {
         do { try JSONEncoder().encode(clips).write(to: support.appendingPathComponent("history.json"),options: .atomic) }

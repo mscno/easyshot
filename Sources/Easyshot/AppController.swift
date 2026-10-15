@@ -36,6 +36,7 @@ struct CaptureRequest {
     @Published var busy = false
     @Published var recording = false
     @Published var recordingSeconds = 0
+    @Published var recordingPaused = false
     @Published var scrollFrames = 0
     @Published var scrollNotice = "Scroll the content, then add another frame."
     @Published var autoScrolling = false
@@ -228,6 +229,7 @@ struct CaptureRequest {
             Task { let result = await CloudDiagnostics.run(base: base); fflush(stdout); exit(result) }
             return
         }
+        if EditorDiagnostics.launch(CommandLine.arguments) { return }
         if CommandLine.arguments.contains("--studio-test") {
             Task { let result = await Diagnostics.studioTest(); fflush(stdout); exit(result) }
             return
@@ -487,6 +489,7 @@ struct CaptureRequest {
         }
     }
     private func finishUpload(_ image: UploadableImage) async throws {
+        guard let image = try await Redaction.reviewBeforeUpload(image) else { hideToast(); status = "Upload cancelled"; return }
         let shot = try await CloudSession.shared.upload(image)
         guard copyLink(shot.shareURL) else { throw CloudError.invalidResponse }
         status = "Link copied · \(shot.shareURL)"
@@ -617,9 +620,11 @@ struct CaptureRequest {
             guard #available(macOS 15.0, *) else { throw ShotError.message("Microphone capture requires macOS 15 or later.") }
             if !(await AVCaptureDevice.requestAccess(for: .audio)) { throw ShotError.message("Microphone access was denied. Enable it in System Settings or turn off microphone capture.") }
         }
-        let (filter,config) = try engine.configuration(for: target,recording: true)
+        var (filter,config) = try engine.configuration(for: target,recording: true)
+        filter = engine.recordingFilter(for: target,default: filter,configuration: config)
         let p = Preferences.shared
-        let folder = try p.saveToDisk ? p.captureFolder() : store.support.appendingPathComponent("Captures")
+        // A GIF recording keeps its intermediate MP4 in internal history; only the GIF is delivered.
+        let folder = try p.saveToDisk && !p.recordAsGIF ? p.captureFolder() : store.support.appendingPathComponent("Captures")
         try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
         let url = folder.appendingPathComponent(CaptureFiles.filename(extension: "mp4"))
         let recorder = Recorder()
@@ -646,22 +651,22 @@ struct CaptureRequest {
         } catch { effects?.stop(); throw error }
         recordingEffects = effects
         self.recorder = recorder; recordURL = url; recordSize = CGSize(width: config.width,height: config.height)
-        recording = true; recordingSeconds = 0; status = "Recording…"
+        recording = true; recordingSeconds = 0; recordingPaused = false; status = "Recording…"
         recordTimer = Timer.scheduledTimer(withTimeInterval: 1,repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }; self.recordingSeconds += 1
+                guard let self,!self.recordingPaused else { return }; self.recordingSeconds += 1
             }
         }
         let screen = NSScreen.pointerScreen
-        let panel = NSPanel(contentRect: CGRect(x: screen.visibleFrame.midX-120,y: screen.visibleFrame.minY+25,width: 240,height: 56),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
+        let panel = NSPanel(contentRect: CGRect(x: screen.visibleFrame.midX-150,y: screen.visibleFrame.minY+25,width: 300,height: 56),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
         panel.level = .floating; panel.isOpaque = false; panel.backgroundColor = .clear
         panel.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary]
-        panel.contentView = NSHostingView(rootView: RecordingControls(controller: self)); panel.orderFrontRegardless(); recordPanel = panel
+        panel.contentView = NSHostingView(rootView: RecordingPill(controller: self)); panel.orderFrontRegardless(); recordPanel = panel
     }
     var timeString: String { String(format: "%02d:%02d",recordingSeconds/60,recordingSeconds%60) }
     func stopRecording() async {
         guard recording,let recorder else { return }
-        recording = false; busy = true; recordTimer?.invalidate(); recordPanel?.orderOut(nil)
+        recording = false; recordingPaused = false; busy = true; recordTimer?.invalidate(); recordPanel?.orderOut(nil)
         do {
             try await recorder.stop()
             recordingEffects?.stop()
@@ -670,7 +675,7 @@ struct CaptureRequest {
                     do { try await VideoTools.mixAudio(url) } catch { store.error = error.localizedDescription }
                 }
                 let clip = Clip(path: url.path,kind: "Recording",width: Int(recordSize.width),height: Int(recordSize.height))
-                store.add(clip); if Preferences.shared.copyToClipboard { store.copy(clip) }; showPreview(clip)
+                await deliverRecording(clip)
                 status = "Recording saved\(Preferences.shared.copyToClipboard ? " and copied" : "")"
             }
         } catch { recordingEffects?.stop(); fail(error) }
@@ -787,13 +792,11 @@ struct CaptureRequest {
         store.add(clip); editor(clip)
     }
     func importProject(_ url: URL) {
-        struct Project: Codable { var png: Data; var marks: [Mark]; var padding: Double; var background: [Double]; var shadow: Bool }
         do {
-            let project = try JSONDecoder().decode(Project.self,from: Data(contentsOf: url))
+            let project = try JSONDecoder().decode(EditorProject.self,from: Data(contentsOf: url))
             guard project.background.count == 4,project.marks.allSatisfy({ $0.color.count == 4 }),let image = NSImage(data: project.png)?.cgImage(forProposedRect: nil,context: nil,hints: nil) else { throw ShotError.message("Invalid Easyshot project.") }
             let clip = Clip(path: url.path,kind: "Project",width: image.width,height: image.height)
-            let model = EditorModel(image: image,clip: clip,store: store); model.marks = project.marks; model.padding = project.padding; model.shadow = project.shadow
-            model.background = Color(.sRGB,red: project.background[0],green: project.background[1],blue: project.background[2],opacity: project.background[3])
+            let model = EditorModel(image: image,clip: clip,store: store); model.apply(project)
             openWindow(title: "Editable project · Easyshot",size: CGSize(width: 1160,height: 800),view: EditorView(model: model))
         } catch { fail(error) }
     }

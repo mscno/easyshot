@@ -84,6 +84,18 @@ public enum StudioOutput: String, Codable, CaseIterable, Sendable {
     }
 }
 
+/// Output framing. Non-source aspects crop the recording to that shape and follow the zoom and cursor.
+public enum StudioAspect: String, Codable, CaseIterable, Sendable {
+    case source, landscape, square, vertical
+    public var title: String { switch self { case .source: "Original"; case .landscape: "16:9"; case .square: "1:1"; case .vertical: "9:16" } }
+    public var ratio: Double? { switch self { case .source: nil; case .landscape: 16/9; case .square: 1; case .vertical: 9/16 } }
+}
+
+public enum StudioCursorStyle: String, Codable, CaseIterable, Sendable {
+    case macOS, halo, dot
+    public var title: String { switch self { case .macOS: "macOS"; case .halo: "Highlighted"; case .dot: "Dot" } }
+}
+
 public struct StudioPlan: Codable, Equatable, Sendable {
     public var autoZoom = true
     public var zoom = 1.8
@@ -100,9 +112,36 @@ public struct StudioPlan: Codable, Equatable, Sendable {
     public var cornerRadius = 0.018
     public var shadow = true
     public var motionBlur = false
+    /// 0...1; 0.5 is the default strength.
+    public var motionBlurAmount = 0.5
     public var output: StudioOutput = .source
     public var hevc = false
+    public var aspect: StudioAspect = .source
+    public var cursorStyle: StudioCursorStyle = .macOS
     public init() {}
+
+    /// Visible source size at zoom 1: the largest rectangle of the output aspect inside the recording.
+    public static func viewport(source: CGSize, aspect: StudioAspect) -> CGSize {
+        guard let ratio = aspect.ratio, source.width > 0, source.height > 0 else { return source }
+        return source.width/source.height > ratio ? CGSize(width: source.height*ratio, height: source.height) : CGSize(width: source.width, height: source.width/ratio)
+    }
+    /// Encoded frame size: the framed viewport, bounded by the output preset, never upscaled.
+    public func canvasSize(for source: CGSize) -> CGSize { output.size(for: Self.viewport(source: source, aspect: aspect)) }
+}
+
+extension StudioPlan {
+    /// Plans saved by earlier versions lack newer keys; missing keys take their defaults.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = StudioPlan()
+        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) throws -> T { try c.decodeIfPresent(T.self, forKey: key) ?? fallback }
+        autoZoom = try v(.autoZoom, d.autoZoom); zoom = try v(.zoom, d.zoom); segments = try v(.segments, d.segments)
+        showCursor = try v(.showCursor, d.showCursor); cursorScale = try v(.cursorScale, d.cursorScale); smoothing = try v(.smoothing, d.smoothing)
+        transition = try v(.transition, d.transition); background = try v(.background, d.background); padding = try v(.padding, d.padding)
+        cornerRadius = try v(.cornerRadius, d.cornerRadius); shadow = try v(.shadow, d.shadow); motionBlur = try v(.motionBlur, d.motionBlur)
+        motionBlurAmount = try v(.motionBlurAmount, d.motionBlurAmount); output = try v(.output, d.output); hevc = try v(.hevc, d.hevc)
+        aspect = try v(.aspect, d.aspect); cursorStyle = try v(.cursorStyle, d.cursorStyle)
+    }
 }
 
 public enum StudioPlanner {
@@ -148,6 +187,8 @@ public enum StudioPlanner {
 public struct StudioTimeline: Sendable {
     public static let rate = 120.0
     public let size: CGSize
+    /// Viewport size at zoom 1 (the full frame unless the plan reframes to another aspect).
+    public let base: CGSize
     public let duration: Double
     public let plan: StudioPlan
     private let cursor: [CGPoint]
@@ -157,6 +198,9 @@ public struct StudioTimeline: Sendable {
 
     public init(track: CursorTrack, plan: StudioPlan, duration: Double) {
         self.size = CGSize(width: track.width, height: track.height)
+        let base = StudioPlan.viewport(source: size, aspect: plan.aspect)
+        self.base = base
+        let reframed = base.width < size.width-0.5 || base.height < size.height-0.5
         self.duration = max(0, duration)
         self.plan = plan
         self.segments = plan.segments.sorted { $0.start < $1.start }
@@ -177,11 +221,11 @@ public struct StudioTimeline: Sendable {
                 let goal = Self.raw(track.samples, at: t, hint: &index) ?? center
                 if omega.isInfinite { p = goal; v = .zero } else { Self.spring(&p, &v, goal, omega, dt) }
                 let zoom = Self.zoom(segments, at: t, transition: plan.transition)
-                if zoom < 1.01 { target = p }
+                if zoom < 1.01 && !reframed { target = p }
                 else if let segment = Self.active(segments, at: t), t < segment.start+plan.transition, let anchor = segment.anchor { target = anchor }
                 else {
                     // Keep the camera still while the cursor stays inside the middle of the view.
-                    let half = CGSize(width: track.width/(2*zoom)*0.55, height: track.height/(2*zoom)*0.55)
+                    let half = CGSize(width: base.width/(2*zoom)*0.55, height: base.height/(2*zoom)*0.55)
                     target.x = min(max(target.x, p.x-half.width), p.x+half.width)
                     target.y = min(max(target.y, p.y-half.height), p.y+half.height)
                 }
@@ -234,7 +278,7 @@ public struct StudioTimeline: Sendable {
     public func cursor(at t: Double) -> CGPoint { lookup(cursor, t) }
     /// Visible source rectangle in video pixels, top-left origin, always inside the frame.
     public func viewport(at t: Double) -> CGRect {
-        let z = zoom(at: t), w = size.width/z, h = size.height/z
+        let z = zoom(at: t), w = base.width/z, h = base.height/z
         let c = lookup(camera, t)
         let x = min(max(c.x-w/2, 0), size.width-w), y = min(max(c.y-h/2, 0), size.height-h)
         return CGRect(x: x, y: y, width: w, height: h)

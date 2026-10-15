@@ -14,6 +14,8 @@ import EasyshotCore
     private var renderer: StudioRenderer?
     private var composition: AVMutableVideoComposition?
     private weak var player: AVPlayer?
+    private var asset: AVURLAsset?
+    private var videoSize = CGSize.zero
     private var pending: Task<Void,Never>?
     private let saved: Bool
 
@@ -29,18 +31,38 @@ import EasyshotCore
         duration = try await asset.load(.duration).seconds
         if plan.autoZoom && !saved { plan.segments = StudioPlanner.segments(for: track, duration: duration, zoom: plan.zoom, transition: plan.transition) }
         let size = try await StudioExporter.videoSize(asset)
-        // Preview at most 1440 px wide; padding and radii are relative, so it matches export.
-        let factor = min(1, 1440/max(size.width, 1))
-        let canvas = CGSize(width: max(2, (size.width*factor/2).rounded()*2), height: max(2, (size.height*factor/2).rounded()*2))
-        let renderer = StudioRenderer(track: track, plan: plan, duration: duration, video: size, canvas: canvas)
+        self.asset = asset; videoSize = size
+        let renderer = StudioRenderer(track: track, plan: plan, duration: duration, video: size, canvas: previewCanvas(plan))
         let composition = try await StudioExporter.composition(asset: asset, renderer: renderer)
         let item = AVPlayerItem(asset: asset); item.videoComposition = composition
         let player = AVPlayer(playerItem: item)
         self.renderer = renderer; self.composition = composition; self.player = player
         return player
     }
+    /// Preview at most 1440 px on the long side; padding and radii are relative, so it matches export.
+    private func previewCanvas(_ plan: StudioPlan) -> CGSize {
+        let framed = StudioPlan.viewport(source: videoSize, aspect: plan.aspect)
+        let factor = min(1, 1440/max(framed.width, framed.height, 1))
+        return CGSize(width: max(2, (framed.width*factor/2).rounded()*2), height: max(2, (framed.height*factor/2).rounded()*2))
+    }
+    /// A new output aspect changes the frame size, so the preview needs a new composition.
+    private func rebuild() {
+        guard let asset, let player else { return }
+        let plan = self.plan, time = player.currentTime()
+        pending = Task { [weak self] in
+            guard let self else { return }
+            let renderer = StudioRenderer(track: track, plan: plan, duration: duration, video: videoSize, canvas: previewCanvas(plan))
+            guard let composition = try? await StudioExporter.composition(asset: asset, renderer: renderer), !Task.isCancelled else { return }
+            let item = AVPlayerItem(asset: asset); item.videoComposition = composition
+            player.replaceCurrentItem(with: item)
+            await player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+            self.renderer = renderer; self.composition = composition
+            StudioExporter.savePlan(plan, for: clip.url)
+        }
+    }
     private func schedule() {
         pending?.cancel()
+        if let renderer, renderer.plan.aspect != plan.aspect { rebuild(); return }
         let plan = self.plan, duration = self.duration, renderer = self.renderer
         pending = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(40))
@@ -76,7 +98,7 @@ import EasyshotCore
         try await StudioExporter.export(video: clip.url, track: track, plan: plan, to: url, range: range) { value in
             Task { @MainActor in if self.progress != nil { self.progress = value } }
         }
-        let size = plan.output.size(for: CGSize(width: clip.width, height: clip.height))
+        let size = plan.canvasSize(for: CGSize(width: clip.width, height: clip.height))
         return Clip(path: url.path, kind: "Studio", width: Int(size.width), height: Int(size.height))
     }
 }
@@ -92,17 +114,19 @@ struct StudioSidebar: View {
                     Toggle("Auto-zoom on clicks and typing", isOn: Binding(get: { model.plan.autoZoom }, set: { model.setAutoZoom($0) }))
                     slider("Level", Binding(get: { model.plan.zoom }, set: { model.setZoom($0) }), 1.2...3, "%.1f×")
                     Toggle("Motion blur", isOn: $model.plan.motionBlur)
+                    if model.plan.motionBlur { slider("Blur strength", $model.plan.motionBlurAmount, 0.1...1, "%.0f%%", percent: true) }
                 }
                 group("Cursor") {
                     Toggle("Show cursor", isOn: $model.plan.showCursor)
+                    Picker("Style", selection: $model.plan.cursorStyle) { ForEach(StudioCursorStyle.allCases, id: \.self) { Text($0.title).tag($0) } }
                     slider("Size", $model.plan.cursorScale, 1...3, "%.1f×")
                     slider("Smoothing", $model.plan.smoothing, 0...1, "%.2f")
                 }
                 group("Background") {
                     LazyVGrid(columns: Array(repeating: GridItem(.fixed(28), spacing: 6), count: 5), alignment: .leading, spacing: 6) {
                         swatch(.none) { RoundedRectangle(cornerRadius: 6).stroke(.white.opacity(0.4)).overlay(Image(systemName: "nosign").font(.system(size: 11))) }
-                        ForEach(0..<StudioRenderer.gradients.count, id: \.self) { i in
-                            swatch(.gradient(i)) { RoundedRectangle(cornerRadius: 6).fill(LinearGradient(colors: [Self.color(StudioRenderer.gradients[i].0), Self.color(StudioRenderer.gradients[i].1)], startPoint: .topLeading, endPoint: .bottomTrailing)) }
+                        ForEach(0..<Backdrops.count, id: \.self) { i in
+                            swatch(.gradient(i)) { Image(nsImage: Backdrops.thumbnail(i)).resizable().clipShape(RoundedRectangle(cornerRadius: 6)) }
                         }
                         Button { if let screen = NSScreen.main, let url = NSWorkspace.shared.desktopImageURL(for: screen) { model.plan.background = .image(url.path) } } label: {
                             RoundedRectangle(cornerRadius: 6).fill(.white.opacity(0.08)).overlay(Image(systemName: "photo").font(.system(size: 11)))
@@ -118,6 +142,8 @@ struct StudioSidebar: View {
                     }
                 }
                 group("Export") {
+                    Picker("Frame", selection: $model.plan.aspect) { ForEach(StudioAspect.allCases, id: \.self) { Text($0.title).tag($0) } }.pickerStyle(.segmented)
+                    if model.plan.aspect != .source { Text("Crops to this shape and follows the zoom and cursor.").foregroundStyle(.secondary) }
                     Picker("Size", selection: $model.plan.output) { ForEach(StudioOutput.allCases, id: \.self) { Text($0.title).tag($0) } }
                     Picker("Codec", selection: $model.plan.hevc) { Text("H.264").tag(false); Text("HEVC").tag(true) }
                     if let progress = model.progress { ProgressView(value: progress).controlSize(.small) }
@@ -131,9 +157,9 @@ struct StudioSidebar: View {
     func group<C: View>(_ title: String, @ViewBuilder content: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 8) { Text(title.uppercased()).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary); content() }
     }
-    func slider(_ title: String, _ value: Binding<Double>, _ range: ClosedRange<Double>, _ format: String) -> some View {
+    func slider(_ title: String, _ value: Binding<Double>, _ range: ClosedRange<Double>, _ format: String, percent: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack { Text(title); Spacer(); Text(String(format: format, value.wrappedValue)).monospacedDigit().foregroundStyle(.secondary) }
+            HStack { Text(title); Spacer(); Text(String(format: format, value.wrappedValue*(percent ? 100 : 1))).monospacedDigit().foregroundStyle(.secondary) }
             Slider(value: value, in: range)
         }
     }

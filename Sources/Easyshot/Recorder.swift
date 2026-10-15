@@ -3,6 +3,7 @@ import AVFoundation
 import ScreenCaptureKit
 import ImageIO
 import UniformTypeIdentifiers
+import EasyshotCore
 
 /// A serial queue owns the writer and all sample processing.
 final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
@@ -18,7 +19,36 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     private var started = false
     private var ending = false
     private var sampleError: Error?
+    /// Cuts paused time out of every track; owned by `queue`.
+    private var clock = PauseClock(frameDuration: 1/30)
     var didFail: ((Error) -> Void)?
+
+    /// Paused frames and audio are dropped; on resume, the output continues one frame after the pause.
+    func setPaused(_ paused: Bool) { queue.async { if paused { self.clock.pause() } else { self.clock.resume() } } }
+    /// Moves every timing entry of `sample` earlier by `delta` (audio buffers carry several).
+    static func retimed(_ sample: CMSampleBuffer,by delta: CMTime) -> CMSampleBuffer? {
+        guard delta != .zero else { return sample }
+        var count: CMItemCount = 0
+        CMSampleBufferGetSampleTimingInfoArray(sample,entryCount: 0,arrayToFill: nil,entriesNeededOut: &count)
+        var timing = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(),count: max(count,1))
+        guard CMSampleBufferGetSampleTimingInfoArray(sample,entryCount: count,arrayToFill: &timing,entriesNeededOut: &count) == noErr else { return nil }
+        for i in 0..<count {
+            timing[i].presentationTimeStamp = CMTimeSubtract(timing[i].presentationTimeStamp,delta)
+            if timing[i].decodeTimeStamp.isValid { timing[i].decodeTimeStamp = CMTimeSubtract(timing[i].decodeTimeStamp,delta) }
+        }
+        var out: CMSampleBuffer?
+        CMSampleBufferCreateCopyWithNewTiming(allocator: nil,sampleBuffer: sample,sampleTimingEntryCount: count,sampleTimingArray: &timing,sampleBufferOut: &out)
+        return out
+    }
+    private func map(_ pts: CMTime,track: Int) -> (time: CMTime,delta: CMTime)? { Self.map(pts,track: track,clock: &clock) }
+    /// Output time for a capture timestamp and how far it moved, or nil when the sample falls in a pause.
+    static func map(_ pts: CMTime,track: Int,clock: inout PauseClock) -> (time: CMTime,delta: CMTime)? {
+        guard let out = clock.map(pts.seconds,track: track) else { return nil }
+        let removed = pts.seconds-out
+        guard removed > 1e-9 else { return (pts,.zero) }
+        let delta = CMTime(seconds: removed,preferredTimescale: 1_000_000_000)
+        return (CMTimeSubtract(pts,delta),delta)
+    }
 
     /// With `telemetry`, frames pass through untouched and the cursor is logged for Studio export.
     func start(filter: SCContentFilter,configuration: SCStreamConfiguration,url: URL,effects: RecordingEffects? = nil,telemetry: CursorTelemetry? = nil) async throws {
@@ -41,6 +71,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
             ])
         }
         self.writer = writer; self.video = video; self.telemetry = telemetry
+        clock = PauseClock(frameDuration: configuration.minimumFrameInterval.seconds > 0 ? configuration.minimumFrameInterval.seconds : 1/30)
         configuration.queueDepth = 6
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.capturesAudio = Preferences.shared.systemAudio
@@ -73,16 +104,18 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         if type == .screen {
             guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample,createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
                   let raw = attachments.first?[.status] as? Int,SCFrameStatus(rawValue: raw) == .complete else { return }
-            if !started { writer.startSession(atSourceTime: sample.presentationTimeStamp); telemetry?.setOrigin(sample.presentationTimeStamp); started = true }
+            guard let (time,delta) = map(sample.presentationTimeStamp,track: 0) else { return }
+            if !started { writer.startSession(atSourceTime: time); telemetry?.setOrigin(time); started = true }
             if video?.isReadyForMoreMediaData == true {
                 if let effects,let adaptor,let pool = adaptor.pixelBufferPool,let input = CMSampleBufferGetImageBuffer(sample) {
-                    if let output = effects.composite(input,pool: pool),!adaptor.append(output,withPresentationTime: sample.presentationTimeStamp) { sampleError = writer.error }
-                } else if video?.append(sample) == false { sampleError = writer.error }
+                    if let output = effects.composite(input,pool: pool),!adaptor.append(output,withPresentationTime: time) { sampleError = writer.error }
+                } else if let retimed = Self.retimed(sample,by: delta),video?.append(retimed) == false { sampleError = writer.error }
             }
         } else if started {
-            let input: AVAssetWriterInput?
-            if #available(macOS 15.0, *),type == .microphone { input = mic } else { input = audio }
-            if input?.isReadyForMoreMediaData == true,input?.append(sample) == false { sampleError = writer.error }
+            let input: AVAssetWriterInput?,track: Int
+            if #available(macOS 15.0, *),type == .microphone { input = mic; track = 2 } else { input = audio; track = 1 }
+            guard let (_,delta) = map(sample.presentationTimeStamp,track: track) else { return }
+            if input?.isReadyForMoreMediaData == true,let retimed = Self.retimed(sample,by: delta),input?.append(retimed) == false { sampleError = writer.error }
         }
     }
     func stream(_ stream: SCStream,didStopWithError error: Error) { DispatchQueue.main.async { self.didFail?(error) } }
@@ -103,7 +136,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         if writer.status != .completed { telemetry?.cancel(); throw writer.error ?? sampleError ?? ShotError.message("Recording could not be finalized.") }
         // A missing sidecar only disables Studio editing; the recording itself is intact.
         let output = writer.outputURL
-        try? await withCheckedThrowingContinuation { (c: CheckedContinuation<Void,Error>) in queue.async { c.resume(with: Result { try self.telemetry?.finish(video: output) }) } }
+        try? await withCheckedThrowingContinuation { (c: CheckedContinuation<Void,Error>) in
+            queue.async { let clock = self.clock; c.resume(with: Result { try self.telemetry?.finish(video: output,retime: { clock.outputTime($0) },clamp: { clock.clampedOutputTime($0) }) }) }
+        }
     }
 }
 

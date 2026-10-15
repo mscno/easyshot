@@ -68,6 +68,8 @@ struct SettingsView: View {
                 Picker("Frame rate",selection: $preferences.fps) { Text("24 fps").tag(24); Text("30 fps").tag(30); Text("60 fps").tag(60) }.frame(maxWidth: 310,alignment: .leading)
                 Text("Recordings save as MP4. Open a recording to trim it or export a GIF. Studio recordings hide the cursor while recording and log its movement, so the editor can add automatic zooms, a smoothed cursor and a background. With microphone enabled, voice and system audio are mixed for playback.").font(.system(size: 10)).foregroundStyle(.secondary)
             }
+            settingsSection("Recording style",subtitle: "Clicks, keystrokes, camera and output.") { RecordingStyleSettings() }
+            settingsSection("History and privacy",subtitle: "What Easyshot keeps, and what it hides before sharing.") { HistoryPrivacySettings() }
             settingsSection("Capture shortcuts",subtitle: "Active only while the capture bar is open.") {
                 Text("A · area     D / N · draw new     F · full screen\nW · window     V · active window     R · last area\nT · capture text     M · magnifier     C · copy color\nReturn · capture     Esc · close     Space · area/window\n⌘, · basic settings     ⌘L · library")
                     .font(.system(size: 12,design: .monospaced)).lineSpacing(8)
