@@ -72,6 +72,17 @@ impl Ctx {
         token: Option<&str>,
         body: Option<Value>,
     ) -> (StatusCode, HeaderMap, Value) {
+        self.call_via(&self.app, method, path, token, body).await
+    }
+
+    async fn call_via(
+        &self,
+        app: &Router,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, HeaderMap, Value) {
         let mut req = Request::builder().method(method).uri(path);
         if let Some(t) = token {
             req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
@@ -83,18 +94,15 @@ impl Ctx {
             }
             None => Body::empty(),
         };
-        let res = self
-            .app
-            .clone()
-            .oneshot(req.body(body).unwrap())
-            .await
-            .unwrap();
+        let res = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
         let (parts, body) = res.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         let v = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (parts.status, parts.headers, v)
     }
 
+    /// Register (202, no session) and confirm with the mailed code through `otp/verify`;
+    /// returns the session token of the now verified account.
     async fn register(&self, email: &str) -> String {
         let (s, _, v) = self
             .call(
@@ -104,7 +112,50 @@ impl Ctx {
                 Some(json!({"email": email, "password": "supersecret123", "device_name": "test"})),
             )
             .await;
+        assert_eq!(
+            (s, &v),
+            (
+                StatusCode::ACCEPTED,
+                &json!({"verification_required": true})
+            )
+        );
+        let to = email.trim().to_lowercase();
+        let code = self.next_code(&to).await;
+        let (s, v) = self
+            .post(
+                "/v1/auth/otp/verify",
+                None,
+                json!({"email": to, "code": code, "device_name": "test"}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["user"]["email_verified"], true);
+        v["token"].as_str().unwrap().to_string()
+    }
+
+    /// The same app without mail: registration signs straight in, unverified.
+    fn without_mail(&self) -> Router {
+        router(AppState::new(
+            self.test_db.app.clone(),
+            self.store.clone(),
+            self.cfg.clone(),
+        ))
+    }
+
+    /// An unverified account holding a session: registered through the app without mail
+    /// (the only way to get one), to exercise what such a session may and may not do.
+    async fn unverified_session(&self, email: &str, password: &str) -> String {
+        let (s, _, v) = self
+            .call_via(
+                &self.without_mail(),
+                Method::POST,
+                "/v1/auth/register",
+                None,
+                Some(json!({"email": email, "password": password})),
+            )
+            .await;
         assert_eq!(s, StatusCode::CREATED, "{v}");
+        assert_eq!(v["user"]["email_verified"], false);
         v["token"].as_str().unwrap().to_string()
     }
 
@@ -246,8 +297,49 @@ async fn register_login_me(c: Ctx) {
 
 async fn register_validation_and_duplicates(c: Ctx) {
     c.register("a@example.com").await;
+    // A taken (verified) address answers exactly like a new one, mails its owner a sign-in
+    // code and keeps the owner's password.
     let (s, _, v) = c
         .call(
+            Method::POST,
+            "/v1/auth/register",
+            None,
+            Some(json!({"email": "A@example.com", "password": "another-password"})),
+        )
+        .await;
+    assert_eq!(
+        (s, v),
+        (StatusCode::ACCEPTED, json!({"verification_required": true}))
+    );
+    assert!(
+        c.next_mail("a@example.com")
+            .await
+            .subject
+            .contains("sign-in code")
+    );
+    let (s, _) = c
+        .post(
+            "/v1/auth/login",
+            None,
+            json!({"email": "a@example.com", "password": "supersecret123"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, v) = c
+        .post(
+            "/v1/auth/login",
+            None,
+            json!({"email": "a@example.com", "password": "another-password"}),
+        )
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("INVALID_CREDENTIALS"))
+    );
+    // Without mail there is nothing to verify with: the old answer.
+    let (s, _, v) = c
+        .call_via(
+            &c.without_mail(),
             Method::POST,
             "/v1/auth/register",
             None,
@@ -655,6 +747,15 @@ async fn api_tokens(c: Ctx) {
         .call(Method::GET, "/v1/me", Some("other_token"), None)
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+    // An unverified account (here a session made while mail was off) gets no token.
+    let u = c
+        .unverified_session("u@example.com", "supersecret123")
+        .await;
+    let (s, v) = c.post("/v1/tokens", Some(&u), json!({"name": "ci"})).await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("EMAIL_NOT_VERIFIED"))
+    );
     c.cleanup().await;
 }
 
@@ -1091,9 +1192,10 @@ async fn unique_violation_mapping(c: Ctx) {
         .await
         .unwrap_err();
     assert!(matches!(e, DbError::UniqueViolation), "{e:?}");
-    // and over HTTP: 409 EMAIL_TAKEN
+    // and over HTTP without mail: 409 EMAIL_TAKEN (with mail, register never tells)
     let (s, _, v) = c
-        .call(
+        .call_via(
+            &c.without_mail(),
             Method::POST,
             "/v1/auth/register",
             None,
@@ -1186,8 +1288,16 @@ async fn portable_layer(c: Ctx) {
     c.cleanup().await;
 }
 
+/// Confirmation from an existing (pre-verification) session: not a claim, so the session
+/// and the password stay.
 async fn email_verification(c: Ctx) {
-    let t = c.register("v@example.com").await;
+    let t = c
+        .unverified_session("v@example.com", "supersecret123")
+        .await;
+    let (s, ..) = c
+        .post("/v1/auth/verify-email/send", Some(&t), json!({}))
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
     let code = c.next_code("v@example.com").await;
     let (_, _, me) = c.call(Method::GET, "/v1/me", Some(&t), None).await;
     assert_eq!(me["email_verified"], false);
@@ -1238,12 +1348,24 @@ async fn email_verification(c: Ctx) {
     );
     let (s, ..) = c.post("/v1/auth/verify-email/send", None, json!({})).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = c
+        .post(
+            "/v1/auth/login",
+            None,
+            json!({"email": "v@example.com", "password": "supersecret123"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
     c.cleanup().await;
 }
 
 async fn verification_gate(c: Ctx) {
     let c = c.reconfigure(|cfg| cfg.require_email_verification = true);
-    let t = c.register("g@example.com").await;
+    let t = c
+        .unverified_session("g@example.com", "supersecret123")
+        .await;
+    c.post("/v1/auth/verify-email/send", Some(&t), json!({}))
+        .await;
     let code = c.next_code("g@example.com").await;
     let body = json!({"content_type": "image/png", "byte_size": 10});
     let (s, v) = c.post("/v1/screenshots", Some(&t), body.clone()).await;
@@ -1287,7 +1409,11 @@ async fn verification_gate(c: Ctx) {
 
 async fn password_reset_flow(c: Ctx) {
     let old = c.register("r@example.com").await;
-    c.next_code("r@example.com").await; // verification mail
+    let (s, v) = c
+        .post("/v1/tokens", Some(&old), json!({"name": "ci"}))
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let pat = v["token"].as_str().unwrap().to_string();
 
     // unknown account: same answer, no mail
     let (s, v) = c
@@ -1365,8 +1491,10 @@ async fn password_reset_flow(c: Ctx) {
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 
-    // old sessions are revoked, old password is dead, new one works
+    // old sessions and API tokens are revoked, old password is dead, new one works
     let (s, ..) = c.call(Method::GET, "/v1/me", Some(&old), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, ..) = c.call(Method::GET, "/v1/me", Some(&pat), None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, ..) = c
         .post(
@@ -1390,7 +1518,6 @@ async fn password_reset_flow(c: Ctx) {
 
 async fn otp_login_flow(c: Ctx) {
     c.register("o@example.com").await;
-    c.next_code("o@example.com").await;
 
     let (s, ..) = c
         .post(
@@ -1478,7 +1605,11 @@ async fn otp_login_flow(c: Ctx) {
 }
 
 async fn codes_expire_and_are_cleaned(c: Ctx) {
-    c.register("e@example.com").await;
+    let t = c
+        .unverified_session("e@example.com", "supersecret123")
+        .await;
+    c.post("/v1/auth/verify-email/send", Some(&t), json!({}))
+        .await;
     let code = c.next_code("e@example.com").await;
     c.db.execute(
         "UPDATE auth_codes SET expires_at = $1",
@@ -1486,15 +1617,6 @@ async fn codes_expire_and_are_cleaned(c: Ctx) {
     )
     .await
     .unwrap();
-    let t = c
-        .post(
-            "/v1/auth/login",
-            None,
-            json!({"email": "e@example.com", "password": "supersecret123"}),
-        )
-        .await
-        .1;
-    let t = t["token"].as_str().unwrap().to_string();
     let (s, ..) = c
         .post(
             "/v1/auth/verify-email/confirm",
@@ -1560,6 +1682,266 @@ async fn mail_disabled_returns_503(c: Ctx) {
     c.cleanup().await;
 }
 
+fn login_body(email: &str, password: &str) -> Value {
+    json!({"email": email, "password": password})
+}
+
+/// Mail on: registering never signs in; the right password before verification mails a
+/// code instead of a session; that code confirms the account and keeps the password.
+async fn unverified_accounts_hold_no_credentials(c: Ctx) {
+    let (s, _, v) = c
+        .call(
+            Method::POST,
+            "/v1/auth/register",
+            None,
+            Some(login_body("n@example.com", "supersecret123")),
+        )
+        .await;
+    assert_eq!(
+        (s, v),
+        (StatusCode::ACCEPTED, json!({"verification_required": true}))
+    );
+    let first = c.next_code("n@example.com").await;
+    c.age_codes(60_000).await;
+    let (s, v) = c
+        .post(
+            "/v1/auth/login",
+            None,
+            login_body("n@example.com", "supersecret123"),
+        )
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("EMAIL_NOT_VERIFIED"))
+    );
+    let code = c.next_code("n@example.com").await;
+    let (s, _) = c
+        .post(
+            "/v1/auth/login",
+            None,
+            login_body("n@example.com", "wrong-password"),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    c.assert_no_mail().await;
+    if first != code {
+        let (s, _) = c
+            .post(
+                "/v1/auth/otp/verify",
+                None,
+                json!({"email": "n@example.com", "code": first}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "superseded code");
+    }
+    let (s, v) = c
+        .post(
+            "/v1/auth/otp/verify",
+            None,
+            json!({"email": "n@example.com", "code": code, "device_name": "mac"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["user"]["email_verified"], true);
+    let t = v["token"].as_str().unwrap();
+    let (s, ..) = c.call(Method::GET, "/v1/me", Some(t), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, v) = c
+        .post(
+            "/v1/auth/login",
+            None,
+            login_body("n@example.com", "supersecret123"),
+        )
+        .await;
+    assert_eq!(
+        (s, v["user"]["email_verified"].as_bool()),
+        (StatusCode::OK, Some(true))
+    );
+    c.cleanup().await;
+}
+
+/// Pre-registration takeover over the API: whoever registered the address first (even
+/// holding a session and an API token, here made while mail was off) loses every
+/// credential when the mailbox owner confirms it, and the owner's password is the one the
+/// owner chose. A sign-in code claims too, leaving no usable password.
+async fn verification_claims_unverified_account(c: Ctx) {
+    let email = "victim@example.com";
+    let attacker = c.unverified_session(email, "attacker-password").await;
+    let (s, _, v) = c
+        .call_via(
+            &c.without_mail(),
+            Method::POST,
+            "/v1/tokens",
+            Some(&attacker),
+            Some(json!({"name": "planted"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let pat = v["token"].as_str().unwrap().to_string();
+    // With mail on, no new token for an unverified account.
+    let (s, _) = c
+        .post("/v1/tokens", Some(&attacker), json!({"name": "more"}))
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    let (s, _) = c
+        .post(
+            "/v1/auth/register",
+            None,
+            login_body(email, "victim-password"),
+        )
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let code = c.next_code(email).await;
+    let (s, v) = c
+        .post(
+            "/v1/auth/otp/verify",
+            None,
+            json!({"email": email, "code": code}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let owner = v["token"].as_str().unwrap().to_string();
+    for t in [&attacker, &pat] {
+        let (s, ..) = c.call(Method::GET, "/v1/me", Some(t), None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+    let (s, ..) = c.call(Method::GET, "/v1/me", Some(&owner), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = c
+        .post(
+            "/v1/auth/login",
+            None,
+            login_body(email, "attacker-password"),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = c
+        .post("/v1/auth/login", None, login_body(email, "victim-password"))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+
+    let other = "other@example.com";
+    let planted = c.unverified_session(other, "attacker-password").await;
+    let (s, _) = c
+        .post("/v1/auth/otp/request", None, json!({"email": other}))
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let code = c.next_code(other).await;
+    let (s, v) = c
+        .post(
+            "/v1/auth/otp/verify",
+            None,
+            json!({"email": other, "code": code}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, ..) = c.call(Method::GET, "/v1/me", Some(&planted), None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = c
+        .post(
+            "/v1/auth/login",
+            None,
+            login_body(other, "attacker-password"),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let hash =
+        c.db.query_one(
+            "SELECT password_hash FROM users WHERE email = $1",
+            &vals![other],
+        )
+        .await
+        .unwrap()
+        .text(0)
+        .unwrap();
+    assert_eq!(hash, easyshot_server::auth::UNUSABLE_PASSWORD);
+    c.cleanup().await;
+}
+
+/// Sign-ups and code requests are budgeted per client address before any hashing,
+/// account creation or mail.
+async fn auth_limits_per_address(c: Ctx) {
+    for i in 0..5 {
+        let (s, _) = c
+            .post(
+                "/v1/auth/register",
+                None,
+                login_body(&format!("u{i}@example.com"), "supersecret123"),
+            )
+            .await;
+        assert_eq!(s, StatusCode::ACCEPTED);
+    }
+    let (s, v) = c
+        .post(
+            "/v1/auth/register",
+            None,
+            login_body("u5@example.com", "supersecret123"),
+        )
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (StatusCode::TOO_MANY_REQUESTS, Some("RATE_LIMITED"))
+    );
+    assert_eq!(c.count("users").await, 5);
+    for _ in 0..10 {
+        let (s, _) = c
+            .post(
+                "/v1/auth/otp/request",
+                None,
+                json!({"email": "u0@example.com"}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::ACCEPTED);
+    }
+    let (s, _) = c
+        .post(
+            "/v1/auth/password/forgot",
+            None,
+            json!({"email": "u0@example.com"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    c.cleanup().await;
+}
+
+/// Concurrent wrong guesses cannot exceed the per-account failure limit: every attempt is
+/// recorded before its password is checked.
+async fn concurrent_login_failures_are_all_counted(c: Ctx) {
+    c.register("a@example.com").await;
+    let calls = (0..18).map(|_| {
+        c.post(
+            "/v1/auth/login",
+            None,
+            login_body("a@example.com", "wrong-password"),
+        )
+    });
+    let statuses: Vec<StatusCode> = futures_util::future::join_all(calls)
+        .await
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    let checked = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::UNAUTHORIZED)
+        .count();
+    assert!(checked <= 10, "{statuses:?}");
+    assert!(
+        statuses
+            .iter()
+            .all(|s| matches!(*s, StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS))
+    );
+    let (s, _) = c
+        .post(
+            "/v1/auth/login",
+            None,
+            login_body("a@example.com", "supersecret123"),
+        )
+        .await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    c.cleanup().await;
+}
+
 macro_rules! suite {
     ($($name:ident),* $(,)?) => {$(
         mod $name {
@@ -1599,6 +1981,10 @@ suite!(
     otp_login_flow,
     codes_expire_and_are_cleaned,
     mail_disabled_returns_503,
+    unverified_accounts_hold_no_credentials,
+    verification_claims_unverified_account,
+    auth_limits_per_address,
+    concurrent_login_failures_are_all_counted,
 );
 
 #[tokio::test]

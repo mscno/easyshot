@@ -1,12 +1,16 @@
 //! Tokens, password hashing and the `AuthUser` extractor.
 
-use std::sync::OnceLock;
+use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use argon2::Argon2;
 use argon2::password_hash::{
     PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng as PhRng,
 };
 use axum::extract::FromRequestParts;
+use axum::http::HeaderMap;
 use axum::http::request::Parts;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -14,8 +18,10 @@ use chrono::{DateTime, Utc};
 use rand::rngs::OsRng;
 use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use crate::config::Limit;
 use crate::error::AppError;
 use crate::repo::{self, ts};
 use crate::state::AppState;
@@ -62,6 +68,10 @@ pub fn generate_slug() -> String {
         .collect()
 }
 
+/// Stored for accounts that have no password (claimed through an emailed sign-in code):
+/// not a PHC string, so it never verifies.
+pub const UNUSABLE_PASSWORD: &str = "!";
+
 pub fn hash_password(password: &str) -> Result<String, AppError> {
     let salt = SaltString::generate(&mut PhRng);
     Argon2::default()
@@ -85,16 +95,183 @@ pub fn dummy_hash() -> &'static str {
     H.get_or_init(|| hash_password("dummy-password-for-timing").expect("hash"))
 }
 
-pub async fn hash_password_blocking(password: String) -> Result<String, AppError> {
-    tokio::task::spawn_blocking(move || hash_password(&password))
+/// Argon2 costs ~19 MiB and tens of milliseconds per call; at most this many run at once per
+/// process, so a burst of sign-ins queues instead of exhausting memory and blocking threads.
+fn argon_permits() -> Arc<Semaphore> {
+    static S: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    S.get_or_init(|| {
+        let n = std::thread::available_parallelism().map_or(2, |n| n.get());
+        Arc::new(Semaphore::new(n.max(2)))
+    })
+    .clone()
+}
+
+async fn argon<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, AppError> {
+    let permit = argon_permits()
+        .acquire_owned()
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    // The permit lives with the blocking work, even if the request is dropped meanwhile.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))
+}
+
+pub async fn hash_password_blocking(password: String) -> Result<String, AppError> {
+    argon(move || hash_password(&password)).await?
 }
 
 pub async fn verify_password_blocking(password: String, hash: String) -> Result<bool, AppError> {
-    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))
+    argon(move || verify_password(&password, &hash)).await
+}
+
+/// Check a sign-in password against the stored hash, if any. Unknown accounts and unusable
+/// passwords spend the same Argon2 work on the dummy hash, so timing reveals neither.
+pub async fn check_password(password: String, stored: Option<String>) -> Result<bool, AppError> {
+    let usable = stored.filter(|h| PasswordHash::new(h).is_ok());
+    let real = usable.is_some();
+    let hash = usable.unwrap_or_else(|| dummy_hash().to_string());
+    Ok(verify_password_blocking(password, hash).await? && real)
+}
+
+// ---------- per-address throttling (shared by the web pages and the API) ----------
+
+/// Auth budgets per client address; web pages and API endpoints count into the same ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bucket {
+    Login,
+    Signup,
+    CodeRequest,
+    CodeVerify,
+}
+
+impl Bucket {
+    pub fn limit(self, st: &AppState) -> Limit {
+        let l = &st.config.auth_limits;
+        match self {
+            Bucket::Login => l.login,
+            Bucket::Signup => l.signup,
+            Bucket::CodeRequest => l.code_request,
+            Bucket::CodeVerify => l.code_verify,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Bucket::Login => "login",
+            Bucket::Signup => "signup",
+            Bucket::CodeRequest => "code",
+            Bucket::CodeVerify => "verify",
+        }
+    }
+}
+
+/// Count one hit for `addr` (see [`ClientAddr`]); false once its budget is spent.
+pub fn allow(st: &AppState, bucket: Bucket, addr: &str) -> bool {
+    let l = bucket.limit(st);
+    st.limiter.allow(
+        &format!("{}:{addr}", bucket.name()),
+        l.max,
+        Duration::from_secs(l.window_secs),
+    )
+}
+
+/// [`allow`] for the API: `429 RATE_LIMITED` once the budget is spent.
+pub fn throttle(st: &AppState, bucket: Bucket, addr: &ClientAddr) -> Result<(), AppError> {
+    if allow(st, bucket, addr.as_str()) {
+        Ok(())
+    } else {
+        Err(AppError::RateLimited)
+    }
+}
+
+/// The client address of an API request, resolved like the web's (Topcoat
+/// `TrustedProxies::nearest(TRUSTED_PROXY_HOPS)`): the peer when no proxy is trusted,
+/// otherwise the address the outermost trusted proxy appended to `X-Forwarded-For`, never
+/// the client-written leftmost entry. `"unknown"` (one shared bucket) when there is none,
+/// as in the web's `fingerprint`.
+pub struct ClientAddr(pub String);
+
+impl ClientAddr {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromRequestParts<AppState> for ClientAddr {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, Infallible> {
+        // Topcoat hands the mounted API the request's extensions, peer address included.
+        let remote = parts
+            .extensions
+            .get::<topcoat::router::RemoteAddr>()
+            .map(|r| r.0.ip());
+        Ok(ClientAddr(
+            client_ip(remote, &parts.headers, st.config.trusted_proxy_hops)
+                .map_or_else(|| "unknown".into(), |ip| ip.to_string()),
+        ))
+    }
+}
+
+/// Topcoat's `TrustedProxies::client_ip` for a hop count (crate-private there): walk
+/// `X-Forwarded-For` from the entry nearest to us outward and return the first one past the
+/// trusted hops; when the list is shorter, the farthest read (the peer without a header).
+pub fn client_ip(remote: Option<IpAddr>, headers: &HeaderMap, hops: usize) -> Option<IpAddr> {
+    let remote = remote.map(|ip| ip.to_canonical());
+    if hops == 0 {
+        return remote;
+    }
+    let entries = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .rev()
+        .flat_map(|v| {
+            v.as_bytes()
+                .split(|&b| b == b',')
+                .map(<[u8]>::trim_ascii)
+                .filter(|e| !e.is_empty())
+                .rev()
+        });
+    let mut farthest = remote;
+    for (i, entry) in entries.enumerate() {
+        let address = std::str::from_utf8(entry).ok().and_then(parse_node);
+        if i + 1 >= hops {
+            return address;
+        }
+        farthest = address;
+    }
+    farthest
+}
+
+/// An address with an optional port: `1.2.3.4`, `1.2.3.4:80`, `::1`, `[::1]`, `[::1]:80`.
+fn parse_node(value: &str) -> Option<IpAddr> {
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(ip.to_canonical());
+    }
+    let (ip, port) = if let Some(rest) = value.strip_prefix('[') {
+        let (ip, rest) = rest.split_once(']')?;
+        let ip = IpAddr::V6(ip.parse::<Ipv6Addr>().ok()?);
+        if rest.is_empty() {
+            return Some(ip.to_canonical());
+        }
+        (ip, rest.strip_prefix(':')?)
+    } else {
+        let (ip, port) = value.rsplit_once(':')?;
+        (IpAddr::V4(ip.parse::<Ipv4Addr>().ok()?), port)
+    };
+    let port_ok = match port.strip_prefix('_') {
+        Some(o) => {
+            !o.is_empty()
+                && o.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        }
+        None => (1..=5).contains(&port.len()) && port.bytes().all(|b| b.is_ascii_digit()),
+    };
+    port_ok.then(|| ip.to_canonical())
 }
 
 #[derive(Debug, Clone)]
@@ -198,5 +375,48 @@ mod tests {
         assert!(h.starts_with("$argon2id$"));
         assert!(verify_password("correct horse battery", &h));
         assert!(!verify_password("wrong", &h));
+        assert!(!verify_password("", UNUSABLE_PASSWORD));
+        assert!(!verify_password("!", UNUSABLE_PASSWORD));
+    }
+
+    #[tokio::test]
+    async fn unusable_and_missing_passwords_fail() {
+        let h = hash_password_blocking("correct horse battery".into())
+            .await
+            .unwrap();
+        let ok = |pw: &str, h: Option<&str>| check_password(pw.into(), h.map(str::to_string));
+        assert!(ok("correct horse battery", Some(&h)).await.unwrap());
+        assert!(!ok("wrong one", Some(&h)).await.unwrap());
+        assert!(!ok("!", Some(UNUSABLE_PASSWORD)).await.unwrap());
+        assert!(!ok("dummy-password-for-timing", None).await.unwrap());
+    }
+
+    #[test]
+    fn client_ip_trusts_only_the_configured_hops() {
+        let peer: Option<IpAddr> = Some("10.0.0.9".parse().unwrap());
+        let ip = |h: &HeaderMap, n| client_ip(peer, h, n).map(|i| i.to_string());
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "6.6.6.6, 203.0.113.7".parse().unwrap());
+        // No trusted proxy: the peer, whatever the header claims.
+        assert_eq!(ip(&h, 0).as_deref(), Some("10.0.0.9"));
+        assert_eq!(client_ip(None, &h, 0), None);
+        // One proxy (Fly): the entry it appended, not the client-written leftmost one.
+        assert_eq!(ip(&h, 1).as_deref(), Some("203.0.113.7"));
+        assert_eq!(ip(&h, 2).as_deref(), Some("6.6.6.6"));
+        // Fewer entries than hops: the farthest; no header: the peer.
+        assert_eq!(ip(&h, 5).as_deref(), Some("6.6.6.6"));
+        assert_eq!(ip(&HeaderMap::new(), 1).as_deref(), Some("10.0.0.9"));
+        // Ports, brackets and repeated headers (the last is nearest).
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        let near = "[2001:db8::1]:443, 198.51.100.4:8080";
+        h.append("x-forwarded-for", near.parse().unwrap());
+        assert_eq!(ip(&h, 1).as_deref(), Some("198.51.100.4"));
+        assert_eq!(ip(&h, 2).as_deref(), Some("2001:db8::1"));
+        assert_eq!(ip(&h, 3).as_deref(), Some("6.6.6.6"));
+        // An unreadable entry at the trusted position names no one.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "1.2.3.4, garbage".parse().unwrap());
+        assert_eq!(ip(&h, 1), None);
     }
 }

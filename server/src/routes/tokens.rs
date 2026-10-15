@@ -21,6 +21,11 @@ pub async fn create(
     user: AuthUser,
     ApiJson(body): ApiJson<CreateToken>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
+    // An unverified account may be someone else's reservation of the address: it holds no
+    // lasting credentials until its mailbox is proven.
+    if st.mailer.enabled() && !user.email_verified {
+        return Err(AppError::EmailNotVerified);
+    }
     let name = body.name.trim().to_string();
     if name.is_empty() || name.chars().count() > 100 {
         return Err(AppError::Invalid("name must be 1-100 characters".into()));
