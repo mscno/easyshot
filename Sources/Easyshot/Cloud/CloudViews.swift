@@ -100,6 +100,10 @@ struct UploadKeyRow: View {
         }
         Text("In the capture bar, press \(preferences.uploadKey.uppercased()) or ⇧Return to capture, upload and copy a link. For a system-wide shortcut, give the Raycast command “Paste as Link” a hotkey: it turns the image on your clipboard into a link you can paste over SSH.")
             .font(.caption).foregroundStyle(.secondary)
+        Toggle("Record & Share: copy the link when recording starts",isOn: $preferences.shareCopyLinkAtStart)
+        Toggle("Record & Share: transcribe my voice on this Mac",isOn: $preferences.shareTranscribe)
+        Text("Record & Share uploads while you record, so the link plays the moment you stop. Captions are made on device from the microphone and uploaded as WebVTT.")
+            .font(.caption).foregroundStyle(.secondary)
     }
 }
 

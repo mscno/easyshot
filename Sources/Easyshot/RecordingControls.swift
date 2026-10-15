@@ -16,6 +16,17 @@ struct RecordingPill: View {
             Text(controller.timeString).font(.system(size: 14,weight: .medium,design: .monospaced))
             if paused { Text("Paused").font(.system(size: 11)).foregroundStyle(.secondary) }
             Spacer()
+            if controller.shareRecording != nil {
+                if let link = controller.shareLink {
+                    Button { if controller.copyLink(link) { controller.showToast("Link copied",symbol: "link",detail: link,hideAfter: 1.4) } } label: {
+                        Label(URL(string: link).map { "\($0.host() ?? "")\($0.path())" } ?? link,systemImage: "link").font(.system(size: 11)).lineLimit(1).truncationMode(.middle).frame(maxWidth: 150)
+                    }.buttonStyle(.glass).help("Copy the share link · it plays as soon as you stop")
+                } else {
+                    HStack(spacing: 5) { ProgressView().controlSize(.mini); Text("Creating link…").font(.system(size: 11)).foregroundStyle(.secondary) }
+                }
+                Button { controller.cancelShareRecording() } label: { Image(systemName: "trash").frame(width: 16) }
+                    .buttonStyle(.glass).help("Discard the recording and delete its link")
+            }
             Button { controller.togglePause() } label: { Image(systemName: paused ? "play.fill" : "pause.fill").frame(width: 16) }
                 .buttonStyle(.glass).help(paused ? "Resume recording" : "Pause recording")
             Button { Task { await controller.stopRecording() } } label: { Label("Stop",systemImage: "stop.fill").font(.system(size: 12,weight: .semibold)) }

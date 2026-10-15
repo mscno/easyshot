@@ -56,6 +56,11 @@ struct CaptureRequest {
     var recordSize = CGSize.zero
     var recordTimer: Timer?
     var recordPanel: NSPanel?
+    /// Record & Share: the Cloud upload running alongside the current recording, and its link once created.
+    var shareRecording: ShareRecording?
+    @Published var shareLink: String?
+    /// Seconds from stop to a ready link for the latest shared recording (diagnostics).
+    var lastShareReadyLatency: Double?
     var scrolling: (target: CaptureTarget,frames: [CGImage])?
     var scrollPanel: NSPanel?
     var scrollTask: Task<Void,Never>?
@@ -157,6 +162,7 @@ struct CaptureRequest {
             let cards = quickAccess ?? QuickAccess(controller: self); quickAccess = cards
             if !cards.restore() { showToast("Nothing to restore",symbol: "rectangle.stack",hideAfter: 2) }
         case .record: toggleRecord()
+        case .recordShare: recordShare()
         }
     }
     /// App Intents (Shortcuts, Spotlight, user-assigned keyboard shortcuts) take the same path as launcher URLs.
@@ -230,6 +236,7 @@ struct CaptureRequest {
             return
         }
         if EditorDiagnostics.launch(CommandLine.arguments) { return }
+        if ShareDiagnostics.launch(CommandLine.arguments,controller: self) { return }
         if CommandLine.arguments.contains("--studio-test") {
             Task { let result = await Diagnostics.studioTest(); fflush(stdout); exit(result) }
             return
@@ -404,7 +411,7 @@ struct CaptureRequest {
                 // Area/full-screen selection opens before capture metadata is needed.
                 // Refresh on the capture action, after removing the overlay.
                 try await engine.refresh()
-                if purpose == "Recording" { try await startRecording(target) }
+                if purpose == "Recording" || purpose == AppController.recordSharePurpose { try await startRecording(target,share: purpose == AppController.recordSharePurpose) }
                 else if purpose == "Scrolling capture" { try await beginScroll(target) }
                 else if purpose == "Text / QR" { try await captureText(target,frozen: frozen) }
                 else {
@@ -615,7 +622,8 @@ struct CaptureRequest {
         guard let last = Preferences.shared.lastRegion else { return }
         Preferences.shared.presets.append(RegionPreset(name: name.isEmpty ? "Area \(Preferences.shared.presets.count+1)" : name,region: last))
     }
-    func startRecording(_ target: CaptureTarget) async throws {
+    func startRecording(_ target: CaptureTarget,share: Bool = false) async throws {
+        if share { guard CloudSession.shared.isSignedIn,CloudSession.shared.client != nil else { throw CloudError.notSignedIn } }
         if Preferences.shared.microphone {
             guard #available(macOS 15.0, *) else { throw ShotError.message("Microphone capture requires macOS 15 or later.") }
             if !(await AVCaptureDevice.requestAccess(for: .audio)) { throw ShotError.message("Microphone access was denied. Enable it in System Settings or turn off microphone capture.") }
@@ -624,9 +632,10 @@ struct CaptureRequest {
         filter = engine.recordingFilter(for: target,default: filter,configuration: config)
         let p = Preferences.shared
         // A GIF recording keeps its intermediate MP4 in internal history; only the GIF is delivered.
-        let folder = try p.saveToDisk && !p.recordAsGIF ? p.captureFolder() : store.support.appendingPathComponent("Captures")
+        let folder = try p.saveToDisk && (share || !p.recordAsGIF) ? p.captureFolder() : store.support.appendingPathComponent("Captures")
         try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
         let url = folder.appendingPathComponent(CaptureFiles.filename(extension: "mp4"))
+        let shared = share ? try beginShare(url: url) : nil
         let recorder = Recorder()
         recorder.didFail = { [weak self] error in Task { @MainActor in self?.fail(error); await self?.stopRecording() } }
         let source: CGRect
@@ -647,8 +656,12 @@ struct CaptureRequest {
         let telemetry = p.studio ? CursorTelemetry(source: source,pixels: CGSize(width: config.width,height: config.height)) : nil
         do {
             try await effects?.start(cameraEnabled: p.recordCamera)
-            try await recorder.start(filter: filter,configuration: config,url: url,effects: effects,telemetry: telemetry)
-        } catch { effects?.stop(); throw error }
+            try await recorder.start(filter: filter,configuration: config,url: url,effects: effects,telemetry: telemetry,spool: shared?.spool)
+        } catch {
+            effects?.stop()
+            if let shared { await shared.cancel(); try? FileManager.default.removeItem(at: url); shareRecording = nil; shareLink = nil }
+            throw error
+        }
         recordingEffects = effects
         self.recorder = recorder; recordURL = url; recordSize = CGSize(width: config.width,height: config.height)
         recording = true; recordingSeconds = 0; recordingPaused = false; status = "Recording…"
@@ -658,7 +671,8 @@ struct CaptureRequest {
             }
         }
         let screen = NSScreen.pointerScreen
-        let panel = NSPanel(contentRect: CGRect(x: screen.visibleFrame.midX-150,y: screen.visibleFrame.minY+25,width: 300,height: 56),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
+        let width: CGFloat = shared == nil ? 300 : 420
+        let panel = NSPanel(contentRect: CGRect(x: screen.visibleFrame.midX-width/2,y: screen.visibleFrame.minY+25,width: width,height: 56),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
         panel.level = .floating; panel.isOpaque = false; panel.backgroundColor = .clear
         panel.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary]
         panel.contentView = NSHostingView(rootView: RecordingPill(controller: self)); panel.orderFrontRegardless(); recordPanel = panel
@@ -670,7 +684,13 @@ struct CaptureRequest {
         do {
             try await recorder.stop()
             recordingEffects?.stop()
-            if let url = recordURL {
+            if let share = shareRecording,let url = recordURL {
+                // The local file is the uploaded fragmented MP4; mixing would rewrite it.
+                let clip = Clip(path: url.path,kind: "Recording",width: Int(recordSize.width),height: Int(recordSize.height),share: CloudShare(video: share.video,title: nil,status: .uploading))
+                store.add(clip); ShareCenter.shared.states[clip.id] = clip.share
+                showPreview(clip)
+                finishShare(share,clip: clip,voice: Preferences.shared.microphone)
+            } else if let url = recordURL {
                 if Preferences.shared.microphone {
                     do { try await VideoTools.mixAudio(url) } catch { store.error = error.localizedDescription }
                 }
@@ -678,8 +698,11 @@ struct CaptureRequest {
                 await deliverRecording(clip)
                 status = "Recording saved\(Preferences.shared.copyToClipboard ? " and copied" : "")"
             }
-        } catch { recordingEffects?.stop(); fail(error) }
-        self.recorder = nil; recordingEffects = nil; recordURL = nil; busy = false; finishIfIdle()
+        } catch {
+            recordingEffects?.stop(); fail(error)
+            if let share = shareRecording { Task { await share.cancel() } }
+        }
+        self.recorder = nil; recordingEffects = nil; recordURL = nil; shareRecording = nil; shareLink = nil; busy = false; finishIfIdle()
     }
     func videoEditor(_ clip: Clip) { openWindow(title: "Recording · Easyshot",size: CGSize(width: 960,height: 680),view: VideoEditorView(clip: clip,controller: self)) }
     func beginScroll(_ target: CaptureTarget) async throws {

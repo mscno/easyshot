@@ -20,6 +20,7 @@
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSMicrophoneUsageDescription</key><string>Easyshot records your microphone when you enable voice recording.</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>Easyshot transcribes your voice on this Mac to add captions to recordings you share.</string>
     <key>NSCameraUsageDescription</key><string>Easyshot adds your webcam to recordings when you enable the camera bubble.</string>
     <key>NSScreenCaptureUsageDescription</key><string>Easyshot captures screenshots and recordings you choose, saving them locally.</string>
     <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>

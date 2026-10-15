@@ -249,7 +249,7 @@ struct ClipCard: View {
                 if let image = thumbnail { Image(nsImage: image).resizable().scaledToFit().padding(12) }
                 else { Image(systemName: clip.isVideo ? "video" : "photo").foregroundStyle(.secondary) }
                 if clip.isVideo { Image(systemName: "play.circle.fill").font(.system(size: 30)).shadow(radius: 8) }
-            }.frame(height: 135).clipped().contentShape(Rectangle()).onTapGesture { controller.editor(clip) }
+            }.overlay(alignment: .bottomTrailing) { if let share = clip.share { ShareBadge(share: share).padding(8) } }.frame(height: 135).clipped().contentShape(Rectangle()).onTapGesture { controller.editor(clip) }
             HStack {
                 VStack(alignment: .leading,spacing: 5) {
                     Text(clip.kind).font(.system(size: 11,weight: .medium))
@@ -266,7 +266,18 @@ struct ClipCard: View {
                     Button("Open with default app") { NSWorkspace.shared.open(clip.url) }
                     Divider()
                     if CloudSession.isAvailable {
-                        Button("Upload & copy link") { Task { await controller.uploadClip(clip) } }.disabled(clip.isVideo)
+                        if let share = clip.share {
+                            Button("Copy link") { controller.copyShareLink(clip) }.disabled(share.url == nil)
+                            Button("Copy Markdown for GitHub") { controller.copyShareMarkdown(clip) }.disabled(share.url == nil)
+                            Button("Open in browser") { controller.openShare(clip) }.disabled(share.url == nil)
+                            if share.status == .failed { Button("Retry upload") { controller.retryShare(clip) } }
+                            Button("Rename link…") { controller.renameShare(clip) }.disabled(share.videoID == nil)
+                            Button("Delete link…") { controller.deleteShare(clip) }
+                        } else if clip.isVideo {
+                            Button("Share recording & copy link") { controller.retryShare(clip) }.disabled(clip.kind == "GIF")
+                        } else {
+                            Button("Upload & copy link") { Task { await controller.uploadClip(clip) } }
+                        }
                         Divider()
                     }
                     Button("Remove from history") { store.removeFromHistory(clip) }
