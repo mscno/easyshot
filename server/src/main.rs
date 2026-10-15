@@ -68,9 +68,15 @@ async fn main() -> Result<(), BoxErr> {
             Ok(())
         }
         ["db", "bootstrap"] => {
-            let password = std::env::var("APP_DATABASE_PASSWORD")
-                .map_err(|_| "set APP_DATABASE_PASSWORD (the new easyshot_app password)")?;
-            for line in easyshot_server::prod::bootstrap(&owner_url()?, &password).await? {
+            use easyshot_server::prod::AppLogin;
+            let password = std::env::var("APP_DATABASE_PASSWORD").ok();
+            let app_url = std::env::var("DATABASE_URL").ok();
+            let login = match (&password, &app_url) {
+                (Some(p), _) if !p.is_empty() => AppLogin::Password(p),
+                (_, Some(u)) if !u.is_empty() => AppLogin::Provider { app_url: u },
+                _ => return Err("set DATABASE_URL (a provider login such as `pscale role create`) or APP_DATABASE_PASSWORD".into()),
+            };
+            for line in easyshot_server::prod::bootstrap(&owner_url()?, login).await? {
                 println!("{line}");
             }
             Ok(())

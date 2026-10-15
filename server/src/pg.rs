@@ -39,6 +39,11 @@ fn config(url: &str) -> DbResult<Config> {
         .map_err(|e| DbError::Other(format!("database url: {e}")))
 }
 
+/// The user name in a connection URL, if any.
+pub fn url_user(url: &str) -> Option<String> {
+    config(url).ok()?.get_user().map(str::to_string)
+}
+
 /// tokio-postgres only parses `sslmode=disable|prefer|require` and rejects libpq's
 /// certificate parameters. Our TLS config always checks the chain and host name with the
 /// platform verifier, so `verify-ca`/`verify-full` become `require` and `sslrootcert`,

@@ -446,8 +446,42 @@ async fn applied(conn: &Client) -> DbResult<Vec<String>> {
 
 /// Apply pending migrations as the table owner. Each file runs in its own transaction.
 pub async fn migrate(owner_url: &str) -> DbResult<Vec<&'static str>> {
-    let mut conn = crate::pg::connect(owner_url, None).await?;
+    let mut conn = owner_session(owner_url).await?;
     migrate_conn(&mut conn).await
+}
+
+/// Owner session for migrations and production checks. Provider logins (PlanetScale's
+/// `pscale role create … --inherited-roles postgres`) are not the schema owner themselves;
+/// `MIGRATION_ROLE` switches to the role that is, so every object keeps one owner. The
+/// server's login, for the membership grant in migration 0007, comes from
+/// `APP_DATABASE_LOGIN` or the user of `DATABASE_URL`.
+pub async fn owner_session(owner_url: &str) -> DbResult<Client> {
+    let conn = crate::pg::connect(owner_url, None).await?;
+    if let Some(role) = env_nonempty("MIGRATION_ROLE") {
+        let sql: String = conn
+            .query_one("SELECT format('SET ROLE %I', $1::text)", &[&role])
+            .await?
+            .get(0);
+        conn.batch_execute(&sql).await?;
+    }
+    if let Some(login) = app_login() {
+        conn.execute(
+            "SELECT set_config('easyshot.app_login', $1, false)",
+            &[&login],
+        )
+        .await?;
+    }
+    Ok(conn)
+}
+
+/// The login the server connects as, when configured.
+pub fn app_login() -> Option<String> {
+    env_nonempty("APP_DATABASE_LOGIN")
+        .or_else(|| env_nonempty("DATABASE_URL").and_then(|u| crate::pg::url_user(&u)))
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
 pub async fn migrate_conn(conn: &mut Client) -> DbResult<Vec<&'static str>> {
@@ -483,7 +517,7 @@ pub async fn migrate_conn(conn: &mut Client) -> DbResult<Vec<&'static str>> {
 
 /// `(name, applied)` for every embedded migration.
 pub async fn status(owner_url: &str) -> DbResult<Vec<(&'static str, bool)>> {
-    let conn = crate::pg::connect(owner_url, None).await?;
+    let conn = owner_session(owner_url).await?;
     let done = applied(&conn).await?;
     Ok(MIGRATIONS
         .iter()

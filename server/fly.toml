@@ -9,12 +9,14 @@ primary_region = "fra"
 
 [deploy]
   # Migrations run as the owner role before new machines start.
-  release_command = "/usr/local/bin/easyshot-server migrate up"
+  release_command = "migrate up"
 
 [env]
   BIND_ADDR = "0.0.0.0:8080"
   RUST_LOG = "info"
   TRUSTED_PROXY_HOPS = "1"
+  # PlanetScale migration login inherits postgres; migrate as postgres so it owns every object.
+  MIGRATION_ROLE = "postgres"
 
 [http_service]
   internal_port = 8080

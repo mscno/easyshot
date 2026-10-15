@@ -1,11 +1,18 @@
 //! Production database setup: `easyshot-server db bootstrap|verify`.
 //!
-//! `bootstrap` (owner URL + `APP_DATABASE_PASSWORD`) creates the `easyshot_app` role with
-//! that password, or rotates it, grants it connect, then runs migrations, which add the
-//! table grants and policies. Rerunning it is safe. `verify` (owner and app URLs) checks
-//! that the server's role cannot bypass row-level security, does not own the tables, does
-//! not use the development password, and that every migration is applied and every
-//! owner-scoped table has a FORCE'd policy.
+//! `bootstrap` has two modes, both safe to rerun:
+//! - Provider login (`DATABASE_URL`, the preferred mode; PlanetScale): the login was created
+//!   with `pscale role create` and has no inherited roles. Migrations run (as `MIGRATION_ROLE`
+//!   when set), then `easyshot_grant_app_login` makes the login a member of the
+//!   `easyshot_app` privilege role and removes easyshot_app's own login. Rotate by creating a
+//!   new login and running bootstrap with its URL.
+//! - Password (`APP_DATABASE_PASSWORD`), for providers without managed logins: creates the
+//!   `easyshot_app` login with that password, or rotates it, then migrates.
+//!
+//! `verify` (owner and app URLs) checks that the server's login has easyshot_app's
+//! privileges, cannot bypass row-level security, is not an admin and does not own the
+//! tables, does not use the development password, and that every migration is applied and
+//! every owner-scoped table has a FORCE'd policy.
 
 use crate::db::{self, DbError, DbResult};
 use crate::pg;
@@ -20,7 +27,43 @@ pub const RLS_TABLES: [&str; 5] = [
     "item_views",
 ];
 
-pub async fn bootstrap(owner_url: &str, app_password: &str) -> DbResult<Vec<String>> {
+/// How the server signs in.
+pub enum AppLogin<'a> {
+    /// A provider-managed login; the app URL's user is granted easyshot_app.
+    Provider { app_url: &'a str },
+    /// easyshot_app itself, with this password.
+    Password(&'a str),
+}
+
+pub async fn bootstrap(owner_url: &str, login: AppLogin<'_>) -> DbResult<Vec<String>> {
+    match login {
+        AppLogin::Provider { app_url } => bootstrap_provider(owner_url, app_url).await,
+        AppLogin::Password(password) => bootstrap_password(owner_url, password).await,
+    }
+}
+
+async fn bootstrap_provider(owner_url: &str, app_url: &str) -> DbResult<Vec<String>> {
+    let user = pg::url_user(app_url)
+        .ok_or_else(|| DbError::Other("DATABASE_URL has no user name".into()))?;
+    let mut out: Vec<String> = db::migrate(owner_url)
+        .await?
+        .into_iter()
+        .map(|n| format!("applied {n}"))
+        .collect();
+    // Explicitly as well: 0007 may already be applied (a rotated login).
+    let conn = db::owner_session(owner_url).await?;
+    let role: String = conn
+        .query_one("SELECT easyshot_grant_app_login($1, true)", &[&user])
+        .await?
+        .get(0);
+    out.push(format!(
+        "granted {APP_ROLE} to login {role}; {APP_ROLE} itself cannot log in"
+    ));
+    out.push("migrations up to date".into());
+    Ok(out)
+}
+
+async fn bootstrap_password(owner_url: &str, app_password: &str) -> DbResult<Vec<String>> {
     if app_password.len() < 16 || app_password == APP_ROLE {
         return Err(DbError::Other(
             "APP_DATABASE_PASSWORD must be at least 16 characters and not the dev default".into(),
@@ -70,14 +113,37 @@ pub async fn verify(owner_url: &str, app_url: &str) -> DbResult<Vec<Check>> {
     let app = pg::connect(app_url, None).await?;
     let row = app
         .query_one(
-            "SELECT current_user::text, r.rolsuper, r.rolbypassrls, current_schema()::text \
+            "SELECT current_user::text, r.rolsuper, r.rolbypassrls, current_schema()::text, \
+                    pg_has_role(current_user, 'easyshot_app', 'USAGE'), \
+                    EXISTS (SELECT 1 FROM pg_roles a WHERE a.rolname IN ('postgres', 'pg_write_all_data') \
+                            AND pg_has_role(current_user, a.oid, 'MEMBER')) \
              FROM pg_roles r WHERE r.rolname = current_user",
             &[],
         )
         .await?;
-    let (user, superuser, bypass, schema): (String, bool, bool, String) =
-        (row.get(0), row.get(1), row.get(2), row.get(3));
-    checks.push((format!("app URL connects as {user}"), user == APP_ROLE));
+    let (user, superuser, bypass, schema, has_app, admin): (
+        String,
+        bool,
+        bool,
+        String,
+        bool,
+        bool,
+    ) = (
+        row.get(0),
+        row.get(1),
+        row.get(2),
+        row.get(3),
+        row.get(4),
+        row.get(5),
+    );
+    checks.push((
+        format!("app login {user} has {APP_ROLE}'s privileges"),
+        has_app,
+    ));
+    checks.push((
+        "app login inherits no admin or write-all role".into(),
+        !admin,
+    ));
     checks.push(("app role is not a superuser".into(), !superuser));
     checks.push(("app role cannot bypass row-level security".into(), !bypass));
     let owned: i64 = app

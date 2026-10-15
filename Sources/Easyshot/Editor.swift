@@ -287,7 +287,10 @@ struct EditorProject: Codable {
         let preset = mark.preset ?? .plain
         let size = max(22,mark.width*5)*(preset == .title ? 1.7 : preset == .mono ? 0.8 : 1)
         let color = mark.nsColor
-        let light = (color.usingColorSpace(.sRGB).map { 0.299*$0.redComponent+0.587*$0.greenComponent+0.114*$0.blueComponent } ?? 0) > 0.7
+        // Typed steps: the one-line form exceeds the CI runner's type-checking time limit.
+        let rgb: NSColor? = color.usingColorSpace(.sRGB)
+        let luminance: CGFloat = rgb.map { (c: NSColor) -> CGFloat in 0.299*c.redComponent+0.587*c.greenComponent+0.114*c.blueComponent } ?? 0
+        let light = luminance > 0.7
         var attributes: [NSAttributedString.Key: Any] = [.font: preset == .mono ? NSFont.monospacedSystemFont(ofSize: size,weight: .medium) : NSFont.systemFont(ofSize: size,weight: preset == .title ? .heavy : .bold),.foregroundColor: color]
         switch preset {
         case .outlined: attributes[.strokeColor] = light ? NSColor.black : NSColor.white; attributes[.strokeWidth] = -4.0

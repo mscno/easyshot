@@ -350,3 +350,75 @@ async fn production_verify_reports_the_rls_posture() {
     assert!(checks.iter().any(|(w, ok)| w.contains("bypass") && !ok));
     t.finish().await;
 }
+
+/// Production logins come from the provider (`pscale role create`): migration 0007's
+/// `easyshot_grant_app_login` makes such a login a member of easyshot_app, after which the
+/// FORCE'd policies bind it exactly like easyshot_app. Admin-like logins are refused.
+#[tokio::test]
+async fn provider_login_gets_app_privileges_through_membership() {
+    let t = common::database().await;
+    let login = format!(
+        "easyshot_login_{}",
+        &Uuid::new_v4().simple().to_string()[..12]
+    );
+    let bypass = format!("{login}_bypass");
+    for sql in [
+        format!("CREATE ROLE {login} LOGIN PASSWORD '{login}'"),
+        format!("CREATE ROLE {bypass} LOGIN BYPASSRLS"),
+    ] {
+        t.owner.execute(&sql, &[]).await.unwrap();
+    }
+    // PlanetScale puts the branch after a dot on the wire; the role has no suffix.
+    let granted = t
+        .owner
+        .query_one(
+            "SELECT easyshot_grant_app_login($1)",
+            &vals![format!("{login}.branchid")],
+        )
+        .await
+        .unwrap()
+        .text(0)
+        .unwrap();
+    assert_eq!(granted, login);
+    assert!(
+        t.owner
+            .query_one(
+                "SELECT easyshot_grant_app_login($1)",
+                &vals![bypass.as_str()]
+            )
+            .await
+            .is_err(),
+        "a BYPASSRLS login must be refused"
+    );
+
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    video(&t.owner, "va", &a.to_string(), "slugA", None).await;
+    video(&t.owner, "vb", &b.to_string(), "slugB", None).await;
+    let login_url = t.app_url.replacen(
+        "easyshot_app:easyshot_app@",
+        &format!("{login}:{login}@"),
+        1,
+    );
+    let db = Db::connect_url(&login_url, 1).await.unwrap();
+    assert!(ids(&db, "SELECT id FROM videos").await.is_empty());
+    assert_eq!(
+        ids(&db.scoped(Context::user(a)), "SELECT id FROM videos").await,
+        ["va"]
+    );
+
+    let checks = easyshot_server::prod::verify(&t.owner_url, &login_url)
+        .await
+        .unwrap();
+    assert!(checks.iter().all(|(_, ok)| *ok), "{checks:?}");
+    drop(db);
+    let _ = t
+        .owner
+        .execute(&format!("DROP ROLE IF EXISTS {bypass}"), &[])
+        .await;
+    t.finish().await;
+    let _ = common::database()
+        .await
+        .owner
+        .execute(&format!("DROP ROLE IF EXISTS {login}"), &[])
+        .await;
+}

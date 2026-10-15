@@ -2,8 +2,9 @@
 # Production database setup: bootstrap (create/rotate the easyshot_app role, migrate) or
 # verify (RLS posture and migration state). Run through `mise run db:bootstrap|db:verify`.
 #
-# Needs MIGRATION_DATABASE_URL (owner role), plus APP_DATABASE_PASSWORD for bootstrap or
-# DATABASE_URL (the server's app-role URL) for verify. Explicit variables win; otherwise
+# Needs MIGRATION_DATABASE_URL (owner role; MIGRATION_ROLE=postgres for a PlanetScale login
+# that inherits postgres), plus DATABASE_URL (the server's provider login) or
+# APP_DATABASE_PASSWORD for bootstrap, and DATABASE_URL for verify. Explicit variables win; otherwise
 # the encrypted .env.production at the repository root is loaded with esec.
 set -euo pipefail
 
@@ -16,7 +17,7 @@ cd "$(dirname "$0")/.."
 run=(cargo run -q --release -- db "$1")
 
 if [[ -n "${MIGRATION_DATABASE_URL:-}" ]]; then
-  if [[ "$1" == bootstrap && -n "${APP_DATABASE_PASSWORD:-}" ]] || [[ "$1" == verify && -n "${DATABASE_URL:-}" ]]; then
+  if [[ "$1" == bootstrap && -n "${APP_DATABASE_PASSWORD:-}${DATABASE_URL:-}" ]] || [[ "$1" == verify && -n "${DATABASE_URL:-}" ]]; then
     exec "${run[@]}"
   fi
 fi
