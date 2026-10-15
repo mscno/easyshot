@@ -1,14 +1,20 @@
 # The app name is not stored here: deploy with `fly deploy -a "$FLY_APP"`.
-# Runtime configuration and credentials are Fly secrets (DATABASE_URL, DATABASE_AUTH_TOKEN,
-# CRON_SECRET, PUBLIC_BASE_URL, and the Tigris variables), synced from GitHub secrets by CI.
+# Runtime configuration and credentials are Fly secrets (DATABASE_URL for the shotglass_app
+# role, MIGRATION_DATABASE_URL for the owner, CRON_SECRET, PUBLIC_BASE_URL, WEB_SECRET and the
+# Tigris variables), synced from GitHub secrets by CI. PostgreSQL: Fly Managed Postgres or Neon.
 primary_region = "fra"
 
 [build]
   dockerfile = "Dockerfile"
 
+[deploy]
+  # Migrations run as the owner role before new machines start.
+  release_command = "/usr/local/bin/shotglass-server migrate up"
+
 [env]
   BIND_ADDR = "0.0.0.0:8080"
   RUST_LOG = "info"
+  TRUSTED_PROXY_HOPS = "1"
 
 [http_service]
   internal_port = 8080
