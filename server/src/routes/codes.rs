@@ -5,19 +5,19 @@
 //! Endpoints that take an email address never reveal whether the account exists, and the
 //! email is sent from a background task so response timing doesn't either.
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use super::auth::{clean_device, issue_session, normalize_email, user_json};
 use super::ApiJson;
-use crate::auth::{generate_code, hash_code, hash_password_blocking, AuthUser};
+use super::auth::{clean_device, issue_session, normalize_email, user_json};
+use crate::auth::{AuthUser, generate_code, hash_code, hash_password_blocking};
 use crate::error::{AppError, AppResult};
-use crate::mailer::{code_email, CodePurpose};
+use crate::mailer::{CodePurpose, code_email};
 use crate::repo::{self, now_ms, ts};
 use crate::state::AppState;
 
@@ -73,7 +73,7 @@ async fn issue_and_send(
 }
 
 /// Validates a submitted code and spends it. Every failure is the same `InvalidCode`.
-async fn check_code(
+pub async fn check_code(
     st: &AppState,
     user_id: Uuid,
     purpose: CodePurpose,
@@ -160,10 +160,10 @@ pub async fn password_forgot(
 ) -> AppResult<(StatusCode, Json<Value>)> {
     require_mail(&st)?;
     let email = normalize_email(&b.email)?;
-    if let Some(u) = repo::find_user_for_login(&st.db, &email).await? {
-        if !u.disabled {
-            send_code(&st, u.id, &email, CodePurpose::ResetPassword);
-        }
+    if let Some(u) = repo::find_user_for_login(&st.db, &email).await?
+        && !u.disabled
+    {
+        send_code(&st, u.id, &email, CodePurpose::ResetPassword);
     }
     Ok(accepted())
 }
@@ -208,10 +208,10 @@ pub async fn otp_request(
 ) -> AppResult<(StatusCode, Json<Value>)> {
     require_mail(&st)?;
     let email = normalize_email(&b.email)?;
-    if let Some(u) = repo::find_user_for_login(&st.db, &email).await? {
-        if !u.disabled {
-            send_code(&st, u.id, &email, CodePurpose::LoginOtp);
-        }
+    if let Some(u) = repo::find_user_for_login(&st.db, &email).await?
+        && !u.disabled
+    {
+        send_code(&st, u.id, &email, CodePurpose::LoginOtp);
     }
     Ok(accepted())
 }

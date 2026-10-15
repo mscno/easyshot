@@ -1,10 +1,14 @@
-//! All SQL of the app, written once in the portable dialect (see `db`).
+//! The repository layer's SQL (sqlx over Postgres, see `db`); the video domain uses Toasty.
 //! Ids are UUID strings, timestamps epoch milliseconds, booleans 0/1.
+//!
+//! users, sessions, auth_codes, api_tokens and login_attempts have no row-level-security
+//! policy on purpose: they are read before a principal is known (sign-in, token lookup,
+//! code checks) and are always filtered by an explicit user id or token hash.
 
 use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
-use crate::db::{placeholders, Db, DbResult, Row};
+use crate::db::{Context, Db, DbResult, Row, placeholders};
 use crate::vals;
 
 /// Rows per `IN (...)` / `DELETE` statement.
@@ -39,7 +43,7 @@ pub async fn create_user(
 ) -> DbResult<()> {
     db.execute(
         "INSERT INTO users (id, email, password_hash, created_at, updated_at, last_seen_at) \
-         VALUES (?1, ?2, ?3, ?4, ?4, ?4)",
+         VALUES ($1, $2, $3, $4, $4, $4)",
         &vals![id, email, password_hash, now],
     )
     .await?;
@@ -48,7 +52,7 @@ pub async fn create_user(
 
 pub async fn find_user_for_login(db: &Db, email: &str) -> DbResult<Option<LoginUser>> {
     db.query_opt(
-        "SELECT id, password_hash, plan, created_at, disabled_at, email_verified_at FROM users WHERE email = ?1",
+        "SELECT id, password_hash, plan, created_at, disabled_at, email_verified_at FROM users WHERE email = $1",
         &vals![email],
     )
     .await?
@@ -67,7 +71,7 @@ pub async fn find_user_for_login(db: &Db, email: &str) -> DbResult<Option<LoginU
 
 pub async fn touch_user(db: &Db, id: Uuid, now: i64) -> DbResult<()> {
     db.execute(
-        "UPDATE users SET last_seen_at = ?2 WHERE id = ?1",
+        "UPDATE users SET last_seen_at = $2 WHERE id = $1",
         &vals![id, now],
     )
     .await?;
@@ -76,7 +80,7 @@ pub async fn touch_user(db: &Db, id: Uuid, now: i64) -> DbResult<()> {
 
 pub async fn set_email_verified(db: &Db, id: Uuid, now: i64) -> DbResult<()> {
     db.execute(
-        "UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?2), updated_at = ?2 WHERE id = ?1",
+        "UPDATE users SET email_verified_at = COALESCE(email_verified_at, $2), updated_at = $2 WHERE id = $1",
         &vals![id, now],
     )
     .await?;
@@ -85,7 +89,7 @@ pub async fn set_email_verified(db: &Db, id: Uuid, now: i64) -> DbResult<()> {
 
 pub async fn set_password(db: &Db, id: Uuid, password_hash: &str, now: i64) -> DbResult<()> {
     db.execute(
-        "UPDATE users SET password_hash = ?2, updated_at = ?3 WHERE id = ?1",
+        "UPDATE users SET password_hash = $2, updated_at = $3 WHERE id = $1",
         &vals![id, password_hash, now],
     )
     .await?;
@@ -93,7 +97,7 @@ pub async fn set_password(db: &Db, id: Uuid, password_hash: &str, now: i64) -> D
 }
 
 pub async fn delete_user_sessions(db: &Db, user_id: Uuid) -> DbResult<()> {
-    db.execute("DELETE FROM sessions WHERE user_id = ?1", &vals![user_id])
+    db.execute("DELETE FROM sessions WHERE user_id = $1", &vals![user_id])
         .await?;
     Ok(())
 }
@@ -115,7 +119,7 @@ pub async fn code_issue_state(
     let r = db
         .query_one(
             "SELECT MAX(created_at), COUNT(*) FROM auth_codes \
-             WHERE user_id = ?1 AND purpose = ?2 AND created_at >= ?3",
+             WHERE user_id = $1 AND purpose = $2 AND created_at >= $3",
             &vals![user_id, purpose, since],
         )
         .await?;
@@ -136,13 +140,13 @@ pub async fn insert_code(
     expires_at: i64,
 ) -> DbResult<()> {
     db.execute(
-        "UPDATE auth_codes SET consumed_at = ?3 WHERE user_id = ?1 AND purpose = ?2 AND consumed_at IS NULL",
+        "UPDATE auth_codes SET consumed_at = $3 WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL",
         &vals![user_id, purpose, now],
     )
     .await?;
     db.execute(
         "INSERT INTO auth_codes (id, user_id, purpose, code_hash, created_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         VALUES ($1, $2, $3, $4, $5, $6)",
         &vals![id, user_id, purpose, code_hash, now, expires_at],
     )
     .await?;
@@ -162,7 +166,7 @@ pub async fn live_code(
 ) -> DbResult<Option<LiveCode>> {
     db.query_opt(
         "SELECT id, code_hash FROM auth_codes \
-         WHERE user_id = ?1 AND purpose = ?2 AND consumed_at IS NULL AND expires_at > ?3 \
+         WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL AND expires_at > $3 \
          ORDER BY created_at DESC LIMIT 1",
         &vals![user_id, purpose, now],
     )
@@ -181,7 +185,7 @@ pub async fn spend_code_attempt(db: &Db, id: Uuid, max: i64) -> DbResult<bool> {
     Ok(db
         .execute(
             "UPDATE auth_codes SET attempts = attempts + 1 \
-             WHERE id = ?1 AND consumed_at IS NULL AND attempts < ?2",
+             WHERE id = $1 AND consumed_at IS NULL AND attempts < $2",
             &vals![id, max],
         )
         .await?
@@ -192,7 +196,7 @@ pub async fn spend_code_attempt(db: &Db, id: Uuid, max: i64) -> DbResult<bool> {
 pub async fn consume_code(db: &Db, id: Uuid, now: i64) -> DbResult<bool> {
     Ok(db
         .execute(
-            "UPDATE auth_codes SET consumed_at = ?2 WHERE id = ?1 AND consumed_at IS NULL",
+            "UPDATE auth_codes SET consumed_at = $2 WHERE id = $1 AND consumed_at IS NULL",
             &vals![id, now],
         )
         .await?
@@ -201,7 +205,7 @@ pub async fn consume_code(db: &Db, id: Uuid, now: i64) -> DbResult<bool> {
 
 pub async fn delete_old_codes(db: &Db, expired_before: i64) -> DbResult<u64> {
     db.execute(
-        "DELETE FROM auth_codes WHERE expires_at < ?1",
+        "DELETE FROM auth_codes WHERE expires_at < $1",
         &vals![expired_before],
     )
     .await
@@ -219,7 +223,7 @@ pub async fn insert_session(
 ) -> DbResult<()> {
     db.execute(
         "INSERT INTO sessions (id, user_id, token_hash, device_name, created_at, last_used_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+         VALUES ($1, $2, $3, $4, $5, $5, $6)",
         &vals![Uuid::new_v4(), user_id, token_hash, device, now, expires_at],
     )
     .await?;
@@ -253,7 +257,7 @@ pub async fn find_session(db: &Db, token_hash: &str, now: i64) -> DbResult<Optio
     db.query_opt(
         "SELECT s.id, s.last_used_at, u.id, u.email, u.plan, u.created_at, u.email_verified_at \
          FROM sessions s JOIN users u ON u.id = s.user_id \
-         WHERE s.token_hash = ?1 AND s.expires_at > ?2 AND u.disabled_at IS NULL",
+         WHERE s.token_hash = $1 AND s.expires_at > $2 AND u.disabled_at IS NULL",
         &vals![token_hash, now],
     )
     .await?
@@ -264,7 +268,7 @@ pub async fn find_session(db: &Db, token_hash: &str, now: i64) -> DbResult<Optio
 
 pub async fn refresh_session(db: &Db, id: Uuid, now: i64, expires_at: i64) -> DbResult<()> {
     db.execute(
-        "UPDATE sessions SET last_used_at = ?2, expires_at = ?3 WHERE id = ?1",
+        "UPDATE sessions SET last_used_at = $2, expires_at = $3 WHERE id = $1",
         &vals![id, now, expires_at],
     )
     .await?;
@@ -272,13 +276,33 @@ pub async fn refresh_session(db: &Db, id: Uuid, now: i64, expires_at: i64) -> Db
 }
 
 pub async fn delete_session(db: &Db, id: Uuid) -> DbResult<()> {
-    db.execute("DELETE FROM sessions WHERE id = ?1", &vals![id])
+    db.execute("DELETE FROM sessions WHERE id = $1", &vals![id])
         .await?;
     Ok(())
 }
 
+pub async fn delete_session_by_hash(db: &Db, token_hash: &str) -> DbResult<()> {
+    db.execute(
+        "DELETE FROM sessions WHERE token_hash = $1",
+        &vals![token_hash],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Email of an active user (for showing who shared a video).
+pub async fn user_email(db: &Db, id: &str) -> DbResult<Option<String>> {
+    db.query_opt(
+        "SELECT email FROM users WHERE id = $1 AND disabled_at IS NULL",
+        &vals![id],
+    )
+    .await?
+    .map(|r| r.text(0))
+    .transpose()
+}
+
 pub async fn delete_expired_sessions(db: &Db, now: i64) -> DbResult<u64> {
-    db.execute("DELETE FROM sessions WHERE expires_at < ?1", &vals![now])
+    db.execute("DELETE FROM sessions WHERE expires_at < $1", &vals![now])
         .await
 }
 
@@ -293,7 +317,7 @@ pub async fn insert_api_token(
     now: i64,
 ) -> DbResult<()> {
     db.execute(
-        "INSERT INTO api_tokens (id, user_id, name, token_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO api_tokens (id, user_id, name, token_hash, created_at) VALUES ($1, $2, $3, $4, $5)",
         &vals![id, user_id, name, token_hash, now],
     )
     .await?;
@@ -304,7 +328,7 @@ pub async fn find_api_token(db: &Db, token_hash: &str) -> DbResult<Option<AuthRo
     db.query_opt(
         "SELECT t.id, t.last_used_at, u.id, u.email, u.plan, u.created_at, u.email_verified_at \
          FROM api_tokens t JOIN users u ON u.id = t.user_id \
-         WHERE t.token_hash = ?1 AND t.revoked_at IS NULL AND u.disabled_at IS NULL",
+         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND u.disabled_at IS NULL",
         &vals![token_hash],
     )
     .await?
@@ -315,7 +339,7 @@ pub async fn find_api_token(db: &Db, token_hash: &str) -> DbResult<Option<AuthRo
 
 pub async fn touch_api_token(db: &Db, id: Uuid, now: i64) -> DbResult<()> {
     db.execute(
-        "UPDATE api_tokens SET last_used_at = ?2 WHERE id = ?1",
+        "UPDATE api_tokens SET last_used_at = $2 WHERE id = $1",
         &vals![id, now],
     )
     .await?;
@@ -332,7 +356,7 @@ pub struct TokenRow {
 pub async fn list_api_tokens(db: &Db, user_id: Uuid) -> DbResult<Vec<TokenRow>> {
     db.query(
         "SELECT id, name, created_at, last_used_at FROM api_tokens \
-         WHERE user_id = ?1 AND revoked_at IS NULL ORDER BY created_at DESC, id DESC",
+         WHERE user_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC, id DESC",
         &vals![user_id],
     )
     .await?
@@ -352,7 +376,7 @@ pub async fn list_api_tokens(db: &Db, user_id: Uuid) -> DbResult<Vec<TokenRow>> 
 pub async fn revoke_api_token(db: &Db, id: Uuid, user_id: Uuid, now: i64) -> DbResult<bool> {
     Ok(db
         .execute(
-            "UPDATE api_tokens SET revoked_at = ?3 WHERE id = ?1 AND user_id = ?2 AND revoked_at IS NULL",
+            "UPDATE api_tokens SET revoked_at = $3 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
             &vals![id, user_id, now],
         )
         .await?
@@ -363,7 +387,7 @@ pub async fn revoke_api_token(db: &Db, id: Uuid, user_id: Uuid, now: i64) -> DbR
 
 pub async fn count_failed_logins(db: &Db, email: &str, since: i64) -> DbResult<i64> {
     db.query_one(
-        "SELECT count(*) FROM login_attempts WHERE email = ?1 AND succeeded = 0 AND created_at > ?2",
+        "SELECT count(*) FROM login_attempts WHERE email = $1 AND succeeded = 0 AND created_at > $2",
         &vals![email, since],
     )
     .await?
@@ -378,7 +402,7 @@ pub async fn record_login_attempt(
     now: i64,
 ) -> DbResult<()> {
     db.execute(
-        "INSERT INTO login_attempts (id, email, ip, succeeded, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO login_attempts (id, email, ip, succeeded, created_at) VALUES ($1, $2, $3, $4, $5)",
         &vals![Uuid::new_v4(), email, ip, succeeded, now],
     )
     .await?;
@@ -387,13 +411,17 @@ pub async fn record_login_attempt(
 
 pub async fn delete_old_login_attempts(db: &Db, before: i64) -> DbResult<u64> {
     db.execute(
-        "DELETE FROM login_attempts WHERE created_at < ?1",
+        "DELETE FROM login_attempts WHERE created_at < $1",
         &vals![before],
     )
     .await
 }
 
 // ---------- screenshots ----------
+//
+// `screenshots` is owner-scoped and under FORCE'd row-level security (migration
+// 0004_rls_app_role). Every function here sets its RLS context itself: the owner's id,
+// the one share slug being resolved, or the marked maintenance bypass.
 
 pub struct Screenshot {
     pub id: Uuid,
@@ -444,9 +472,10 @@ pub struct NewScreenshot<'a> {
 /// Returns false when the slug is already taken (caller retries with another slug).
 pub async fn insert_screenshot(db: &Db, s: &NewScreenshot<'_>) -> DbResult<bool> {
     Ok(db
+        .scoped(Context::user(s.user_id))
         .execute(
             "INSERT INTO screenshots (id, user_id, slug, object_key, content_type, byte_size, width, height, filename, created_at, expires_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT (slug) DO NOTHING",
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (slug) DO NOTHING",
             &vals![
                 s.id,
                 s.user_id,
@@ -466,19 +495,21 @@ pub async fn insert_screenshot(db: &Db, s: &NewScreenshot<'_>) -> DbResult<bool>
 }
 
 pub async fn get_screenshot(db: &Db, id: Uuid, user_id: Uuid) -> DbResult<Option<Screenshot>> {
-    db.query_opt(
-        &format!("SELECT {COLS} FROM screenshots WHERE id = ?1 AND user_id = ?2"),
-        &vals![id, user_id],
-    )
-    .await?
-    .as_ref()
-    .map(screenshot)
-    .transpose()
+    db.scoped(Context::user(user_id))
+        .query_opt(
+            &format!("SELECT {COLS} FROM screenshots WHERE id = $1 AND user_id = $2"),
+            &vals![id, user_id],
+        )
+        .await?
+        .as_ref()
+        .map(screenshot)
+        .transpose()
 }
 
-pub async fn mark_ready(db: &Db, id: Uuid, now: i64) -> DbResult<()> {
-    db.execute(
-        "UPDATE screenshots SET status = 'ready', uploaded_at = ?2 WHERE id = ?1 AND status = 'pending'",
+pub async fn mark_ready(db: &Db, id: Uuid, user_id: Uuid, now: i64) -> DbResult<()> {
+    db.scoped(Context::user(user_id))
+        .execute(
+        "UPDATE screenshots SET status = 'ready', uploaded_at = $2 WHERE id = $1 AND status = 'pending'",
         &vals![id, now],
     )
     .await?;
@@ -486,11 +517,12 @@ pub async fn mark_ready(db: &Db, id: Uuid, now: i64) -> DbResult<()> {
 }
 
 pub async fn delete_screenshot(db: &Db, id: Uuid, user_id: Uuid) -> DbResult<()> {
-    db.execute(
-        "DELETE FROM screenshots WHERE id = ?1 AND user_id = ?2",
-        &vals![id, user_id],
-    )
-    .await?;
+    db.scoped(Context::user(user_id))
+        .execute(
+            "DELETE FROM screenshots WHERE id = $1 AND user_id = $2",
+            &vals![id, user_id],
+        )
+        .await?;
     Ok(())
 }
 
@@ -503,20 +535,21 @@ pub async fn list_ready(
     limit: i64,
 ) -> DbResult<Vec<Screenshot>> {
     let mut sql = format!(
-        "SELECT {COLS} FROM screenshots WHERE user_id = ?1 AND status = 'ready' AND expires_at > ?2"
+        "SELECT {COLS} FROM screenshots WHERE user_id = $1 AND status = 'ready' AND expires_at > $2"
     );
     let mut params = vals![user_id, now].to_vec();
     if let Some((created, id)) = before {
-        sql.push_str(" AND (created_at < ?3 OR (created_at = ?3 AND id < ?4))");
+        sql.push_str(" AND (created_at < $3 OR (created_at = $3 AND id < $4))");
         params.push(created.into());
         params.push(id.into());
     }
     sql.push_str(&format!(
-        " ORDER BY created_at DESC, id DESC LIMIT ?{}",
+        " ORDER BY created_at DESC, id DESC LIMIT ${}",
         params.len() + 1
     ));
     params.push(limit.into());
-    db.query(&sql, &params)
+    db.scoped(Context::user(user_id))
+        .query(&sql, &params)
         .await?
         .iter()
         .map(screenshot)
@@ -526,9 +559,10 @@ pub async fn list_ready(
 /// (count, total bytes) of a user's ready, unexpired screenshots.
 pub async fn usage(db: &Db, user_id: Uuid, now: i64) -> DbResult<(i64, i64)> {
     let r = db
+        .scoped(Context::user(user_id))
         .query_one(
             "SELECT count(*), CAST(COALESCE(SUM(byte_size), 0) AS BIGINT) FROM screenshots \
-             WHERE user_id = ?1 AND status = 'ready' AND expires_at > ?2",
+             WHERE user_id = $1 AND status = 'ready' AND expires_at > $2",
             &vals![user_id, now],
         )
         .await?;
@@ -536,9 +570,14 @@ pub async fn usage(db: &Db, user_id: Uuid, now: i64) -> DbResult<(i64, i64)> {
 }
 
 /// (object_key, content_type, expires_at) of a ready screenshot by slug.
+/// RLS share path: the context names exactly this slug, so only its row is readable.
 pub async fn find_share(db: &Db, slug: &str) -> DbResult<Option<(String, String, i64)>> {
-    db.query_opt(
-        "SELECT object_key, content_type, expires_at FROM screenshots WHERE slug = ?1 AND status = 'ready'",
+    db.scoped(Context {
+        share_slug: Some(slug.to_string()),
+        ..Context::default()
+    })
+    .query_opt(
+        "SELECT object_key, content_type, expires_at FROM screenshots WHERE slug = $1 AND status = 'ready'",
         &vals![slug],
     )
     .await?
@@ -557,8 +596,8 @@ fn keyed(rows: Vec<Row>) -> DbResult<KeyedIds> {
 
 pub async fn expired_screenshots(db: &Db, now: i64, limit: i64) -> DbResult<KeyedIds> {
     keyed(
-        db.query(
-            "SELECT id, object_key FROM screenshots WHERE expires_at <= ?1 ORDER BY expires_at LIMIT ?2",
+        db.scoped(Context::maintenance()).query(
+            "SELECT id, object_key FROM screenshots WHERE expires_at <= $1 ORDER BY expires_at LIMIT $2",
             &vals![now, limit],
         )
         .await?,
@@ -567,9 +606,9 @@ pub async fn expired_screenshots(db: &Db, now: i64, limit: i64) -> DbResult<Keye
 
 pub async fn stale_pending_screenshots(db: &Db, before: i64, limit: i64) -> DbResult<KeyedIds> {
     keyed(
-        db.query(
-            "SELECT id, object_key FROM screenshots WHERE status = 'pending' AND created_at < ?1 \
-             ORDER BY created_at LIMIT ?2",
+        db.scoped(Context::maintenance()).query(
+            "SELECT id, object_key FROM screenshots WHERE status = 'pending' AND created_at < $1 \
+             ORDER BY created_at LIMIT $2",
             &vals![before, limit],
         )
         .await?,
@@ -578,6 +617,7 @@ pub async fn stale_pending_screenshots(db: &Db, before: i64, limit: i64) -> DbRe
 
 /// Idempotent; chunks the id list into bounded `IN (...)` statements.
 pub async fn delete_screenshots_by_ids(db: &Db, ids: &[Uuid]) -> DbResult<()> {
+    let db = db.scoped(Context::maintenance());
     for chunk in ids.chunks(IN_CHUNK) {
         let sql = format!(
             "DELETE FROM screenshots WHERE id IN ({})",
@@ -591,7 +631,7 @@ pub async fn delete_screenshots_by_ids(db: &Db, ids: &[Uuid]) -> DbResult<()> {
 
 pub async fn inactive_users(db: &Db, last_seen_before: i64, limit: i64) -> DbResult<Vec<Uuid>> {
     db.query(
-        "SELECT id FROM users WHERE last_seen_at < ?1 ORDER BY last_seen_at LIMIT ?2",
+        "SELECT id FROM users WHERE last_seen_at < $1 ORDER BY last_seen_at LIMIT $2",
         &vals![last_seen_before, limit],
     )
     .await?
@@ -602,11 +642,12 @@ pub async fn inactive_users(db: &Db, last_seen_before: i64, limit: i64) -> DbRes
 
 pub async fn user_screenshots(db: &Db, user_id: Uuid, limit: i64) -> DbResult<KeyedIds> {
     keyed(
-        db.query(
-            "SELECT id, object_key FROM screenshots WHERE user_id = ?1 LIMIT ?2",
-            &vals![user_id, limit],
-        )
-        .await?,
+        db.scoped(Context::user(user_id))
+            .query(
+                "SELECT id, object_key FROM screenshots WHERE user_id = $1 LIMIT $2",
+                &vals![user_id, limit],
+            )
+            .await?,
     )
 }
 
@@ -614,17 +655,17 @@ pub async fn user_screenshots(db: &Db, user_id: Uuid, limit: i64) -> DbResult<Ke
 /// (Their screenshots must already be gone.) No FK cascades are relied upon.
 pub async fn delete_user_records(db: &Db, user_id: Uuid) -> DbResult<()> {
     db.execute(
-        "DELETE FROM login_attempts WHERE email IN (SELECT email FROM users WHERE id = ?1)",
+        "DELETE FROM login_attempts WHERE email IN (SELECT email FROM users WHERE id = $1)",
         &vals![user_id],
     )
     .await?;
-    db.execute("DELETE FROM sessions WHERE user_id = ?1", &vals![user_id])
+    db.execute("DELETE FROM sessions WHERE user_id = $1", &vals![user_id])
         .await?;
-    db.execute("DELETE FROM auth_codes WHERE user_id = ?1", &vals![user_id])
+    db.execute("DELETE FROM auth_codes WHERE user_id = $1", &vals![user_id])
         .await?;
-    db.execute("DELETE FROM api_tokens WHERE user_id = ?1", &vals![user_id])
+    db.execute("DELETE FROM api_tokens WHERE user_id = $1", &vals![user_id])
         .await?;
-    db.execute("DELETE FROM users WHERE id = ?1", &vals![user_id])
+    db.execute("DELETE FROM users WHERE id = $1", &vals![user_id])
         .await?;
     Ok(())
 }

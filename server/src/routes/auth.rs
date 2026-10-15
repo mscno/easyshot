@@ -1,15 +1,15 @@
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::ApiJson;
 use crate::auth::{
-    dummy_hash, generate_token, hash_password_blocking, verify_password_blocking, AuthUser,
-    SESSION_PREFIX, SESSION_TTL_MS,
+    AuthUser, SESSION_PREFIX, SESSION_TTL_MS, dummy_hash, generate_token, hash_password_blocking,
+    verify_password_blocking,
 };
 use crate::db::DbError;
 use crate::error::{AppError, AppResult};

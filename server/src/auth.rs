@@ -2,14 +2,14 @@
 
 use std::sync::OnceLock;
 
-use argon2::password_hash::{
-    rand_core::OsRng as PhRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-};
 use argon2::Argon2;
+use argon2::password_hash::{
+    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng as PhRng,
+};
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use rand::rngs::OsRng;
 use rand::{Rng, RngCore};
@@ -174,9 +174,10 @@ mod tests {
         assert!(t.starts_with("sgs_"));
         assert_eq!(t.len(), 4 + 43);
         assert_eq!(h.len(), 64);
-        assert!(h
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         assert_eq!(h, hash_token(&t));
         let (t2, _) = generate_token(API_PREFIX);
         assert!(t2.starts_with("sgp_"));

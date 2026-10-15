@@ -1,7 +1,7 @@
 [package]
 name = "shotglass-server"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [workspace]
@@ -24,7 +24,6 @@ tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "limit"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
-libsql = { version = "0.10", default-features = false, features = ["core", "remote", "tls"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 async-trait = "0.1"
@@ -42,6 +41,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 thiserror = "2"
 lambda_http = { version = "1", optional = true }
+# Web presence: Topcoat SSR host + Datastar; Toasty models for the video domain.
+topcoat = { version = "0.10", default-features = false, features = ["router", "serve", "view", "cookie", "session", "datastar", "tower", "compression"] }
+toasty = { version = "0.11", default-features = false, features = ["postgresql"] }
+toasty-driver-postgresql = "0.11"
+http = "1"
+bytes = "1"
+futures-util = "0.3"
+hmac = "0.12"
+
 
 [dev-dependencies]
 http-body-util = "0.1"

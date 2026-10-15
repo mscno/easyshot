@@ -1,8 +1,7 @@
--- Portable schema: runs unchanged on Postgres and SQLite/libSQL (Turso).
+-- PostgreSQL. Each migration file runs in one transaction as the table owner.
 -- Conventions: ids are UUID strings made by the app; timestamps are unix epoch
 -- milliseconds set by the app; token hashes are lowercase sha256 hex; booleans are 0/1.
 -- No foreign keys / ON DELETE CASCADE: the app deletes child rows explicitly.
--- Statements are split on ';' by the migration runner, so keep ';' out of literals.
 
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,

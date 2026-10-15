@@ -1,0 +1,94 @@
+# Server tasks (the Mac app builds with scripts/build-app.sh). Run from anywhere in the repo:
+#   mise run db:create && mise run db:migrate && mise run db:seed && mise run server:dev
+#
+# Migrations run as the table owner (the *_DATABASE_URL below); the server connects as the
+# shotglass_app role (NOSUPERUSER NOBYPASSRLS) so row-level security applies. Override any
+# value in a gitignored mise.local.toml or your shell. Local PostgreSQL 18 listens on 5433.
+
+[env]
+DEV_DATABASE_URL = { default = "postgres://postgres:postgres@localhost:5433/shotglass_dev?sslmode=disable" }
+TEST_DATABASE_URL = { default = "postgres://postgres:postgres@localhost:5433/shotglass_test?sslmode=disable" }
+DEV_APP_DATABASE_URL = { default = "postgres://shotglass_app:shotglass_app@localhost:5433/shotglass_dev?sslmode=disable" }
+
+# ── database ──────────────────────────────────────────────────────────────────
+
+[tasks."db:_ensure"]
+hide = true
+run = '''
+db="${DB_URL##*/}"; db="${db%%\?*}"
+admin="${DB_URL%/*}/postgres?sslmode=disable"
+psql "$admin" -tAc "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1 || psql "$admin" -c "CREATE DATABASE $db"
+'''
+
+[tasks."db:create"]
+description = "Create the dev database if it is missing"
+run = 'DB_URL="$DEV_DATABASE_URL" mise run db:_ensure'
+
+[tasks."db:migrate"]
+description = "Apply pending migrations to the dev database (owner role)"
+dir = "{{config_root}}/server"
+run = 'cargo run -q -- migrate up --database-url "$DEV_DATABASE_URL"'
+
+[tasks."db:status"]
+description = "Applied and pending migrations for the dev database"
+dir = "{{config_root}}/server"
+run = 'cargo run -q -- migrate status --database-url "$DEV_DATABASE_URL"'
+
+[tasks."db:reset"]
+description = "Drop the dev public schema and re-apply every migration (dev only)"
+dir = "{{config_root}}/server"
+run = 'cargo run -q -- migrate reset --yes --database-url "$DEV_DATABASE_URL"'
+
+[tasks."db:new"]
+description = "New timestamped SQL migration: mise run db:new -- add_widgets"
+usage = 'arg "<name>" help="snake_case migration name"'
+dir = "{{config_root}}/server"
+run = '''
+f="migrations/$(date -u +%Y%m%d%H%M%S)_${usage_name}.sql"
+printf -- '-- %s\n' "$usage_name" > "$f"
+echo "created $f"
+'''
+
+[tasks."db:seed"]
+description = "Seed two confirmed dev accounts (safe to rerun)"
+dir = "{{config_root}}/server"
+run = 'cargo run -q -- seed --database-url "$DEV_DATABASE_URL"'
+
+[tasks."db:test"]
+description = "Create and migrate the test database (tests also create one schema per test)"
+dir = "{{config_root}}/server"
+run = [
+  'DB_URL="$TEST_DATABASE_URL" mise run db:_ensure',
+  'cargo run -q -- migrate up --database-url "$TEST_DATABASE_URL"',
+]
+
+[tasks."db:test:reset"]
+description = "Rebuild the test database from scratch"
+dir = "{{config_root}}/server"
+run = [
+  'DB_URL="$TEST_DATABASE_URL" mise run db:_ensure',
+  'cargo run -q -- migrate reset --yes --database-url "$TEST_DATABASE_URL"',
+]
+
+# ── server ────────────────────────────────────────────────────────────────────
+
+[tasks."server:dev"]
+description = "Run the server against the dev database and local MinIO (docker compose up -d minio minio-init)"
+dir = "{{config_root}}/server"
+run = '''
+DATABASE_URL="${DATABASE_URL:-$DEV_APP_DATABASE_URL}" \
+MIGRATION_DATABASE_URL="${MIGRATION_DATABASE_URL:-$DEV_DATABASE_URL}" \
+RUN_MIGRATIONS="${RUN_MIGRATIONS:-true}" \
+S3_BUCKET="${S3_BUCKET:-shotglass}" S3_ENDPOINT="${S3_ENDPOINT:-http://127.0.0.1:9000}" \
+S3_FORCE_PATH_STYLE="${S3_FORCE_PATH_STYLE:-true}" AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-minioadmin}" \
+AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-minioadmin}" BIND_ADDR="${BIND_ADDR:-127.0.0.1:8080}" \
+WEB_SECRET="${WEB_SECRET:-dev-web-secret}" RUST_LOG="${RUST_LOG:-info}" cargo run
+'''
+
+[tasks."server:test"]
+description = "Server test suite against TEST_DATABASE_URL (one throwaway schema per test)"
+dir = "{{config_root}}/server"
+run = [
+  'DB_URL="$TEST_DATABASE_URL" mise run db:_ensure',
+  'cargo test',
+]

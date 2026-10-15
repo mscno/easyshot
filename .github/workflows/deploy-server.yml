@@ -19,8 +19,10 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Sync runtime secrets
         env:
+          # App role (shotglass_app) and owner role connection strings.
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          DATABASE_AUTH_TOKEN: ${{ secrets.DATABASE_AUTH_TOKEN }}
+          MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+          WEB_SECRET: ${{ secrets.WEB_SECRET }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           PUBLIC_BASE_URL: ${{ secrets.SHOTGLASS_API_URL }}
           # Optional email config; unset values are simply not synced.
@@ -30,9 +32,9 @@ jobs:
           REQUIRE_EMAIL_VERIFICATION: ${{ vars.REQUIRE_EMAIL_VERIFICATION }}
         run: |
           set -euo pipefail
-          for v in FLY_APP DATABASE_URL DATABASE_AUTH_TOKEN CRON_SECRET PUBLIC_BASE_URL; do : "${!v:?Missing $v}"; done
-          printf 'DATABASE_URL=%s\nDATABASE_AUTH_TOKEN=%s\nCRON_SECRET=%s\nPUBLIC_BASE_URL=%s\n' \
-            "$DATABASE_URL" "$DATABASE_AUTH_TOKEN" "$CRON_SECRET" "$PUBLIC_BASE_URL" > "$RUNNER_TEMP/secrets.env"
+          for v in FLY_APP DATABASE_URL MIGRATION_DATABASE_URL WEB_SECRET CRON_SECRET PUBLIC_BASE_URL; do : "${!v:?Missing $v}"; done
+          printf 'DATABASE_URL=%s\nMIGRATION_DATABASE_URL=%s\nWEB_SECRET=%s\nCRON_SECRET=%s\nPUBLIC_BASE_URL=%s\n' \
+            "$DATABASE_URL" "$MIGRATION_DATABASE_URL" "$WEB_SECRET" "$CRON_SECRET" "$PUBLIC_BASE_URL" > "$RUNNER_TEMP/secrets.env"
           for v in LETTERMINT_API_TOKEN MAIL_FROM LETTERMINT_ROUTE REQUIRE_EMAIL_VERIFICATION; do
             [[ -n "${!v:-}" ]] && printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/secrets.env"
           done

@@ -1,104 +1,53 @@
-//! Integration tests. The same suite runs against every available backend:
-//! * local libSQL (a temp-file database per test; always available), and
-//! * Postgres, when `DATABASE_URL` is a postgres:// URL (one throwaway schema per test;
-//!   skipped with a message otherwise).
+//! Integration tests against PostgreSQL (`TEST_DATABASE_URL`, one throwaway schema per
+//! test). The app runs as the `shotglass_app` role, so row-level security applies.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
+use axum::body::Body;
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use shotglass_server::config::Config;
 use shotglass_server::db::{Db, DbError};
 use shotglass_server::mailer::{Email, LettermintMailer, Mailer, MemoryMailer};
 use shotglass_server::repo::{self, now_ms};
 use shotglass_server::storage::MemoryStore;
-use shotglass_server::{router, vals, AppState};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{Executor, PgPool};
+use shotglass_server::{AppState, router, vals};
 use tower::ServiceExt;
 
 const HOUR: i64 = 3_600_000;
 const DAY: i64 = 24 * HOUR;
 
-enum Cleanup {
-    File(PathBuf),
-    Pg { admin: PgPool, schema: String },
-}
+mod common;
 
 struct Ctx {
     app: Router,
+    /// Owner handle for setup and inspection (bypasses RLS); the app uses the app role.
     db: Db,
     store: Arc<MemoryStore>,
     mail: Arc<MemoryMailer>,
     cfg: Config,
-    cleanup: Cleanup,
+    test_db: common::TestDb,
 }
 
 impl Ctx {
-    async fn libsql() -> Ctx {
-        let path = std::env::temp_dir().join(format!("shotglass-test-{}.db", uuid::Uuid::new_v4()));
-        let url = format!("file:{}", path.display());
-        let cfg = Config::for_tests(&url);
-        let db = Db::connect(&cfg).unwrap();
-        db.migrate().await.unwrap();
-        Self::build(db, cfg, Cleanup::File(path))
-    }
-
-    async fn postgres() -> Option<Ctx> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
-            eprintln!("DATABASE_URL is not postgres; skipping postgres run");
-            return None;
-        }
-        let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .expect("connect");
-        admin
-            .execute(format!("CREATE SCHEMA {schema}").as_str())
-            .await
-            .unwrap();
-        let s = schema.clone();
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .after_connect(move |conn, _| {
-                let s = s.clone();
-                Box::pin(async move {
-                    conn.execute(format!("SET search_path TO {s}").as_str())
-                        .await?;
-                    Ok(())
-                })
-            })
-            .connect(&url)
-            .await
-            .unwrap();
-        let db = Db::Pg(pool);
-        db.migrate().await.unwrap();
-        Some(Self::build(
-            db,
-            Config::for_tests(&url),
-            Cleanup::Pg { admin, schema },
-        ))
-    }
-
-    fn build(db: Db, cfg: Config, cleanup: Cleanup) -> Ctx {
+    async fn postgres() -> Ctx {
+        let test_db = common::database().await;
+        let cfg = test_db.config();
         let store = Arc::new(MemoryStore::new());
         let mail = MemoryMailer::new();
-        let app =
-            router(AppState::new(db.clone(), store.clone(), cfg.clone()).with_mailer(mail.clone()));
+        let app = router(
+            AppState::new(test_db.app.clone(), store.clone(), cfg.clone())
+                .with_mailer(mail.clone()),
+        );
         Ctx {
             app,
-            db,
+            db: test_db.owner.clone(),
             store,
             mail,
             cfg,
-            cleanup,
+            test_db,
         }
     }
 
@@ -106,8 +55,12 @@ impl Ctx {
     fn reconfigure(mut self, f: impl FnOnce(&mut Config)) -> Ctx {
         f(&mut self.cfg);
         self.app = router(
-            AppState::new(self.db.clone(), self.store.clone(), self.cfg.clone())
-                .with_mailer(self.mail.clone()),
+            AppState::new(
+                self.test_db.app.clone(),
+                self.store.clone(),
+                self.cfg.clone(),
+            )
+            .with_mailer(self.mail.clone()),
         );
         self
     }
@@ -207,7 +160,7 @@ impl Ctx {
     async fn age_codes(&self, ms: i64) {
         self.db
             .execute(
-                "UPDATE auth_codes SET created_at = created_at - ?1",
+                "UPDATE auth_codes SET created_at = created_at - $1",
                 &vals![ms],
             )
             .await
@@ -222,7 +175,7 @@ impl Ctx {
     async fn key_of(&self, id: &str) -> String {
         self.db
             .query_one(
-                "SELECT object_key FROM screenshots WHERE id = ?1",
+                "SELECT object_key FROM screenshots WHERE id = $1",
                 &vals![id],
             )
             .await
@@ -241,21 +194,7 @@ impl Ctx {
     }
 
     async fn cleanup(self) {
-        match self.cleanup {
-            Cleanup::File(p) => {
-                for suffix in ["", "-wal", "-shm", "-journal"] {
-                    let _ = std::fs::remove_file(format!("{}{suffix}", p.display()));
-                }
-            }
-            Cleanup::Pg { admin, schema } => {
-                if let Db::Pg(pool) = &self.db {
-                    pool.close().await;
-                }
-                let _ = admin
-                    .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
-                    .await;
-            }
-        }
+        self.test_db.finish().await;
     }
 }
 
@@ -721,7 +660,7 @@ async fn api_tokens(c: Ctx) {
 
 async fn disabled_user_rejected(c: Ctx) {
     let t = c.register("a@example.com").await;
-    c.db.execute("UPDATE users SET disabled_at = ?1", &vals![now_ms()])
+    c.db.execute("UPDATE users SET disabled_at = $1", &vals![now_ms()])
         .await
         .unwrap();
     let (s, ..) = c.call(Method::GET, "/v1/me", Some(&t), None).await;
@@ -742,7 +681,7 @@ async fn session_sliding_expiry(c: Ctx) {
     let t = c.register("a@example.com").await;
     let now = now_ms();
     c.db.execute(
-        "UPDATE sessions SET last_used_at = ?1, expires_at = ?2",
+        "UPDATE sessions SET last_used_at = $1, expires_at = $2",
         &vals![now - 2 * HOUR, now + 5 * DAY],
     )
     .await
@@ -757,7 +696,7 @@ async fn session_sliding_expiry(c: Ctx) {
     let days = (exp - now_ms()) as f64 / DAY as f64;
     assert!(days > 29.0, "{days}");
     c.db.execute(
-        "UPDATE sessions SET expires_at = ?1",
+        "UPDATE sessions SET expires_at = $1",
         &vals![now_ms() - 1000],
     )
     .await
@@ -786,7 +725,7 @@ async fn expiry_and_cron(c: Ctx) {
     let stale_key = c.key_of(p["id"].as_str().unwrap()).await;
     c.store.put(&stale_key, 3, "image/gif");
     c.db.execute(
-        "UPDATE screenshots SET created_at = ?1 WHERE id = ?2",
+        "UPDATE screenshots SET created_at = $1 WHERE id = $2",
         &vals![now_ms() - 2 * HOUR, p["id"].as_str().unwrap()],
     )
     .await
@@ -802,14 +741,14 @@ async fn expiry_and_cron(c: Ctx) {
     // expired session
     c.db.execute(
         "INSERT INTO sessions (id, user_id, token_hash, created_at, last_used_at, expires_at) \
-         SELECT ?1, id, 'deadbeef', ?2, ?2, ?3 FROM users",
+         SELECT $1, id, 'deadbeef', $2, $2, $3 FROM users",
         &vals![uuid::Uuid::new_v4(), now_ms() - 2 * DAY, now_ms() - DAY],
     )
     .await
     .unwrap();
 
     c.db.execute(
-        "UPDATE screenshots SET expires_at = ?1 WHERE id = ?2",
+        "UPDATE screenshots SET expires_at = $1 WHERE id = $2",
         &vals![now_ms() - 60_000, old_id],
     )
     .await
@@ -845,7 +784,7 @@ async fn expiry_and_cron(c: Ctx) {
     assert_eq!(s, StatusCode::BAD_GATEWAY);
     let n =
         c.db.query_one(
-            "SELECT count(*) FROM screenshots WHERE id = ?1",
+            "SELECT count(*) FROM screenshots WHERE id = $1",
             &vals![old_id],
         )
         .await
@@ -866,23 +805,24 @@ async fn expiry_and_cron(c: Ctx) {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(
         v,
-        json!({"expired": 1, "purged_pending": 1, "purged_sessions": 1, "purged_users": 0, "more": false})
+        json!({"expired": 1, "purged_pending": 1, "purged_sessions": 1, "purged_users": 0, "expired_videos": 0, "aborted_uploads": 0, "more": false})
     );
     assert!(!c.store.contains(&old_key));
     assert!(!c.store.contains(&stale_key));
-    assert!(c
-        .store
-        .contains(&c.key_of(keep["id"].as_str().unwrap()).await));
+    assert!(
+        c.store
+            .contains(&c.key_of(keep["id"].as_str().unwrap()).await)
+    );
     assert_eq!(c.count("screenshots").await, 2); // keep + fresh pending
-    assert!(c
-        .db
-        .query_opt(
-            "SELECT 1 FROM screenshots WHERE id = ?1",
+    assert!(
+        c.db.query_opt(
+            "SELECT 1 FROM screenshots WHERE id = $1",
             &vals![fresh["id"].as_str().unwrap()]
         )
         .await
         .unwrap()
-        .is_some());
+        .is_some()
+    );
     let (s, ..) = c
         .call(Method::GET, &format!("/s/{old_slug}"), None, None)
         .await;
@@ -899,7 +839,7 @@ async fn expiry_and_cron(c: Ctx) {
         .await;
     assert_eq!(
         v,
-        json!({"expired": 0, "purged_pending": 0, "purged_sessions": 0, "purged_users": 0, "more": false})
+        json!({"expired": 0, "purged_pending": 0, "purged_sessions": 0, "purged_users": 0, "expired_videos": 0, "aborted_uploads": 0, "more": false})
     );
     c.cleanup().await;
 }
@@ -915,7 +855,7 @@ async fn cron_disabled_without_secret(c: Ctx) {
 
 async fn last_seen(c: &Ctx, email: &str) -> i64 {
     c.db.query_one(
-        "SELECT last_seen_at FROM users WHERE email = ?1",
+        "SELECT last_seen_at FROM users WHERE email = $1",
         &vals![email],
     )
     .await
@@ -926,7 +866,7 @@ async fn last_seen(c: &Ctx, email: &str) -> i64 {
 
 async fn backdate_user(c: &Ctx, email: &str, age_ms: i64) {
     c.db.execute(
-        "UPDATE users SET last_seen_at = ?1 WHERE email = ?2",
+        "UPDATE users SET last_seen_at = $1 WHERE email = $2",
         &vals![now_ms() - age_ms, email],
     )
     .await
@@ -965,7 +905,7 @@ async fn last_seen_tracking(c: Ctx) {
 
     // session use refreshes it, but at most hourly (piggybacking on the session throttle)
     let old = now_ms() - 10 * DAY;
-    c.db.execute("UPDATE users SET last_seen_at = ?1", &vals![old])
+    c.db.execute("UPDATE users SET last_seen_at = $1", &vals![old])
         .await
         .unwrap();
     c.call(Method::GET, "/v1/me", Some(&t), None).await;
@@ -975,7 +915,7 @@ async fn last_seen_tracking(c: Ctx) {
         "session used <1h ago: no write"
     );
     c.db.execute(
-        "UPDATE sessions SET last_used_at = ?1",
+        "UPDATE sessions SET last_used_at = $1",
         &vals![now_ms() - 2 * HOUR],
     )
     .await
@@ -993,7 +933,7 @@ async fn last_seen_tracking(c: Ctx) {
         )
         .await;
     let pat = v["token"].as_str().unwrap().to_string();
-    c.db.execute("UPDATE users SET last_seen_at = ?1", &vals![old])
+    c.db.execute("UPDATE users SET last_seen_at = $1", &vals![old])
         .await
         .unwrap();
     c.call(Method::GET, "/v1/me", Some(&pat), None).await; // first use of the token
@@ -1060,7 +1000,7 @@ async fn inactive_user_purge(c: Ctx) {
     }
     // live: session last used >1h ago, then it authenticates again
     c.db.execute(
-        "UPDATE sessions SET last_used_at = ?1 WHERE user_id IN (SELECT id FROM users WHERE email = ?2)",
+        "UPDATE sessions SET last_used_at = $1 WHERE user_id IN (SELECT id FROM users WHERE email = $2)",
         &vals![now_ms() - 2 * HOUR, "live@example.com"],
     )
     .await
@@ -1069,7 +1009,7 @@ async fn inactive_user_purge(c: Ctx) {
     assert_eq!(s, StatusCode::OK);
     // pat: only an API token was used
     c.db.execute(
-        "UPDATE api_tokens SET last_used_at = ?1",
+        "UPDATE api_tokens SET last_used_at = $1",
         &vals![now_ms() - 2 * HOUR],
     )
     .await
@@ -1219,7 +1159,7 @@ async fn portable_layer(c: Ctx) {
     assert!(!dup);
     let r =
         c.db.query_one(
-            "SELECT width, height, filename, byte_size FROM screenshots WHERE slug = ?1",
+            "SELECT width, height, filename, byte_size FROM screenshots WHERE slug = $1",
             &vals!["slug3"],
         )
         .await
@@ -1541,7 +1481,7 @@ async fn codes_expire_and_are_cleaned(c: Ctx) {
     c.register("e@example.com").await;
     let code = c.next_code("e@example.com").await;
     c.db.execute(
-        "UPDATE auth_codes SET expires_at = ?1",
+        "UPDATE auth_codes SET expires_at = $1",
         &vals![now_ms() - 1],
     )
     .await
@@ -1564,7 +1504,7 @@ async fn codes_expire_and_are_cleaned(c: Ctx) {
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     c.db.execute(
-        "UPDATE auth_codes SET expires_at = ?1",
+        "UPDATE auth_codes SET expires_at = $1",
         &vals![now_ms() - 2 * DAY],
     )
     .await
@@ -1625,15 +1565,8 @@ macro_rules! suite {
         mod $name {
             use super::*;
             #[tokio::test]
-            async fn libsql() {
-                super::$name(Ctx::libsql().await).await;
-            }
-            #[tokio::test]
             async fn postgres() {
-                match Ctx::postgres().await {
-                    Some(c) => super::$name(c).await,
-                    None => eprintln!("no postgres DATABASE_URL; skipped"),
-                }
+                super::$name(Ctx::postgres().await).await;
             }
         }
     )*};

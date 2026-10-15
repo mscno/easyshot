@@ -2,8 +2,10 @@
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// App-role connection (`shotglass_app`, NOSUPERUSER NOBYPASSRLS).
     pub database_url: String,
-    pub database_auth_token: Option<String>,
+    /// Owner-role connection for migrations; `RUN_MIGRATIONS` and `migrate` need it.
+    pub migration_database_url: Option<String>,
     pub bind_addr: String,
     pub public_base_url: String,
     pub s3_bucket: String,
@@ -27,7 +29,20 @@ pub struct Config {
     /// Block creating uploads until the account's email is confirmed.
     pub require_email_verification: bool,
     pub auth_code_ttl_minutes: i64,
+    /// Days a shared video stays available.
+    pub video_retention_days: i64,
+    /// Largest accepted recording, in bytes.
+    pub max_video_bytes: i64,
+    /// Key for password-unlock cookies and viewer hashes. Random per process when unset, so
+    /// unlocks and same-day view dedupe reset on restart.
+    pub web_secret: Option<String>,
+    /// Reverse-proxy hops in front of the server that set `X-Forwarded-For` (1 on Fly.io).
+    pub trusted_proxy_hops: usize,
+    /// Where the landing page sends people to get the Mac app.
+    pub download_url: String,
 }
+
+pub const DEFAULT_DOWNLOAD_URL: &str = "https://github.com/mscno/shotglass/releases/latest";
 
 fn parse_bool(s: &str) -> Option<bool> {
     match s.trim().to_ascii_lowercase().as_str() {
@@ -76,7 +91,7 @@ impl Config {
             }
         };
         Ok(Config {
-            database_auth_token: get("DATABASE_AUTH_TOKEN"),
+            migration_database_url: get("MIGRATION_DATABASE_URL"),
             database_url: get("DATABASE_URL").ok_or("DATABASE_URL is required")?,
             bind_addr: get("BIND_ADDR").unwrap_or_else(|| "0.0.0.0:8080".into()),
             public_base_url: get("PUBLIC_BASE_URL")
@@ -96,7 +111,7 @@ impl Config {
             inactive_user_days: non_negative("INACTIVE_USER_DAYS", 90)?,
             max_upload_bytes: number("MAX_UPLOAD_BYTES", 26_214_400)?,
             allow_signups: boolean("ALLOW_SIGNUPS", true)?,
-            run_migrations: boolean("RUN_MIGRATIONS", true)?,
+            run_migrations: boolean("RUN_MIGRATIONS", false)?,
             db_max_connections: number("DB_MAX_CONNECTIONS", 5)? as u32,
             lettermint_api_token: get("LETTERMINT_API_TOKEN"),
             lettermint_api_url: get("LETTERMINT_API_URL")
@@ -110,6 +125,11 @@ impl Config {
                 get("LETTERMINT_API_TOKEN").is_some(),
             )?,
             auth_code_ttl_minutes: number("AUTH_CODE_TTL_MINUTES", 10)?,
+            video_retention_days: number("VIDEO_RETENTION_DAYS", 90)?,
+            max_video_bytes: number("MAX_VIDEO_BYTES", 5 * 1024 * 1024 * 1024)?,
+            web_secret: get("WEB_SECRET"),
+            trusted_proxy_hops: non_negative("TRUSTED_PROXY_HOPS", 0)? as usize,
+            download_url: get("DOWNLOAD_URL").unwrap_or_else(|| DEFAULT_DOWNLOAD_URL.into()),
         })
         .and_then(|c| {
             if c.lettermint_api_token.is_some() && c.mail_from.is_none() {
@@ -128,7 +148,7 @@ impl Config {
     pub fn for_tests(database_url: &str) -> Self {
         Config {
             database_url: database_url.into(),
-            database_auth_token: None,
+            migration_database_url: None,
             bind_addr: "127.0.0.1:0".into(),
             public_base_url: "http://localhost:8080".into(),
             s3_bucket: "test".into(),
@@ -148,6 +168,11 @@ impl Config {
             mail_from: None,
             require_email_verification: false,
             auth_code_ttl_minutes: 10,
+            video_retention_days: 90,
+            max_video_bytes: 5 * 1024 * 1024 * 1024,
+            web_secret: Some("test-web-secret".into()),
+            trusted_proxy_hops: 0,
+            download_url: DEFAULT_DOWNLOAD_URL.into(),
         }
     }
 }
@@ -175,10 +200,10 @@ mod tests {
         assert_eq!(c.bind_addr, "0.0.0.0:8080");
         assert_eq!(c.retention_days, 30);
         assert_eq!(c.inactive_user_days, 90);
-        assert!(c.database_auth_token.is_none());
+        assert!(c.migration_database_url.is_none());
         assert_eq!(c.s3_region, "us-east-1");
         assert_eq!(c.max_upload_bytes, 26_214_400);
-        assert!(c.allow_signups && c.run_migrations && !c.s3_force_path_style);
+        assert!(c.allow_signups && !c.run_migrations && !c.s3_force_path_style);
         assert_eq!(c.db_max_connections, 5);
         assert!(c.cron_secret.is_none());
     }
@@ -204,8 +229,8 @@ mod tests {
     #[test]
     fn fly_tigris_fallbacks_and_inactive_days() {
         let c = Config::from_lookup(lookup(&[
-            ("DATABASE_URL", "libsql://x.turso.io"),
-            ("DATABASE_AUTH_TOKEN", "tok"),
+            ("DATABASE_URL", "postgres://shotglass_app@db/x"),
+            ("MIGRATION_DATABASE_URL", "postgres://owner@db/x"),
             ("BUCKET_NAME", "tigris-bucket"),
             ("AWS_REGION", "auto"),
             ("INACTIVE_USER_DAYS", "0"),
@@ -213,7 +238,10 @@ mod tests {
         .unwrap();
         assert_eq!(c.s3_bucket, "tigris-bucket");
         assert_eq!(c.s3_region, "auto");
-        assert_eq!(c.database_auth_token.as_deref(), Some("tok"));
+        assert_eq!(
+            c.migration_database_url.as_deref(),
+            Some("postgres://owner@db/x")
+        );
         assert_eq!(c.inactive_user_days, 0);
         let c = Config::from_lookup(lookup(&[
             ("DATABASE_URL", "x"),
@@ -227,12 +255,14 @@ mod tests {
             (c.s3_bucket.as_str(), c.s3_region.as_str()),
             ("a", "eu-west-1")
         );
-        assert!(Config::from_lookup(lookup(&[
-            ("DATABASE_URL", "x"),
-            ("S3_BUCKET", "b"),
-            ("INACTIVE_USER_DAYS", "-1")
-        ]))
-        .is_err());
+        assert!(
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "x"),
+                ("S3_BUCKET", "b"),
+                ("INACTIVE_USER_DAYS", "-1")
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -265,17 +295,21 @@ mod tests {
     #[test]
     fn errors() {
         assert!(Config::from_lookup(lookup(&[])).is_err());
-        assert!(Config::from_lookup(lookup(&[
-            ("DATABASE_URL", "x"),
-            ("S3_BUCKET", "b"),
-            ("RETENTION_DAYS", "abc")
-        ]))
-        .is_err());
-        assert!(Config::from_lookup(lookup(&[
-            ("DATABASE_URL", "x"),
-            ("S3_BUCKET", "b"),
-            ("ALLOW_SIGNUPS", "maybe")
-        ]))
-        .is_err());
+        assert!(
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "x"),
+                ("S3_BUCKET", "b"),
+                ("RETENTION_DAYS", "abc")
+            ]))
+            .is_err()
+        );
+        assert!(
+            Config::from_lookup(lookup(&[
+                ("DATABASE_URL", "x"),
+                ("S3_BUCKET", "b"),
+                ("ALLOW_SIGNUPS", "maybe")
+            ]))
+            .is_err()
+        );
     }
 }
