@@ -100,7 +100,7 @@ enum MCPMode {
             MCPTool("record_stop","Stop a recording and return its MP4 path and duration; for a shared recording also the ready share_url and Markdown for GitHub.",properties: ["recording_id": ["type": "string","description": "From record_start. Optional when only one recording exists."]]),
             MCPTool("upload","Upload an image file to Easyshot Cloud and return a short share link (expires after 30 days). Requires signing in under Settings → Easyshot Cloud.",properties: path.merging(["copy": ["type": "boolean","description": "Also copy the link to the clipboard. Default false."],
                                      "redact": ["type": "boolean","description": "Black out detected secrets (API keys, tokens, emails, card numbers) before uploading. Default false: uploads with findings are refused."],
-                                     "allow_secrets": ["type": "boolean","description": "Upload unchanged despite findings. Only when the user has confirmed the image is safe to share."]]) { a,_ in a },required: ["path"]),
+                                     "allow_secrets": ["type": "boolean","description": "Upload unchanged despite findings, or when the image cannot be checked (animations with findings, undecodable or very long animations). Only when the user has confirmed the image is safe to share."]]) { a,_ in a },required: ["path"]),
             MCPTool("open_in_editor","Open an image, recording or .easyshot.json project in the Easyshot editor for the user.",properties: path,required: ["path"])
         ]
     }()
@@ -351,11 +351,20 @@ enum MCPMode {
         var image = try await Task.detached(priority: .userInitiated) { try UploadableImage.load(from: url) }.value
         // The app's pre-upload secret check has no dialog here: refuse, or redact when the agent asks to.
         var redactions = 0
-        if Preferences.shared.redactBeforeUpload,!args.bool("allow_secrets",default: false),let (decoded,secrets) = try await Redaction.scan(image) {
-            guard args.bool("redact",default: false) else {
-                throw ShotError.message("Not uploaded: the image may contain secrets (\(Redaction.summary(secrets))). Retry with redact: true to black them out, or allow_secrets: true only if the user confirms the image is safe to share.")
+        if Preferences.shared.redactBeforeUpload,!args.bool("allow_secrets",default: false) {
+            let confirm = "allow_secrets: true only if the user confirms the image is safe to share"
+            switch try await Redaction.scan(image) {
+            case .clean: break
+            case .secrets(let decoded,let secrets):
+                guard args.bool("redact",default: false) else {
+                    throw ShotError.message("Not uploaded: the image may contain secrets (\(Redaction.summary(secrets))). Retry with redact: true to black them out, or \(confirm).")
+                }
+                image = try Redaction.redacted(image,image: decoded,secrets: secrets); redactions = secrets.count
+            case .animated(let secrets,let frames):
+                throw ShotError.message("Not uploaded: \(frames) frames of this animation may contain secrets (\(Redaction.summary(secrets))), and animations cannot be redacted. Retry with \(confirm).")
+            case .unscanned(let reason):
+                throw ShotError.message("Not uploaded: the image could not be checked for secrets. \(reason) Retry with \(confirm).")
             }
-            image = try Redaction.redacted(image,image: decoded,secrets: secrets); redactions = secrets.count
         }
         let shot = try await CloudSession.shared.upload(image)
         if args.bool("copy",default: false),let link = ShareLink.validated(shot.shareURL) {

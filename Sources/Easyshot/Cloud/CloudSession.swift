@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import EasyshotCore
 
 /// Sign-in state and upload orchestration. The session token lives in the Keychain, never in preferences.
@@ -119,11 +120,16 @@ struct UploadableImage: Sendable {
 
     /// Reads an image file, shrinking oversized PNGs to JPEG so they fit the server limit.
     static func load(from url: URL) throws -> UploadableImage {
-        let data = try Data(contentsOf: url,options: .mappedIfSafe)
-        guard let rep = NSBitmapImageRep(data: data) else { throw ShotError.message("This file is not an image Easyshot can upload.") }
-        let ext = url.pathExtension.lowercased()
-        let type = ["jpg": "image/jpeg","jpeg": "image/jpeg","gif": "image/gif","webp": "image/webp"][ext] ?? "image/png"
-        return try make(data: data,contentType: type,rep: rep,filename: url.lastPathComponent)
+        try decode(Data(contentsOf: url,options: .mappedIfSafe),filename: url.lastPathComponent)
+    }
+    /// The content type comes from the bytes, not the filename; formats the server doesn't store
+    /// (TIFF, HEIC, BMP, …) are re-encoded as PNG so the label always matches what is uploaded.
+    static func decode(_ data: Data,filename: String) throws -> UploadableImage {
+        guard let source = CGImageSourceCreateWithData(data as CFData,nil),let identifier = CGImageSourceGetType(source) as String?,
+              let rep = NSBitmapImageRep(data: data) else { throw ShotError.message("This file is not an image Easyshot can upload.") }
+        if let type = UploadImageType.mime(forTypeIdentifier: identifier) { return try make(data: data,contentType: type,rep: rep,filename: filename) }
+        guard let png = rep.representation(using: .png,properties: [:]) else { throw ShotError.message("This file is not an image Easyshot can upload.") }
+        return try make(data: png,contentType: "image/png",rep: rep,filename: (filename as NSString).deletingPathExtension + ".png")
     }
     static func make(data: Data,contentType: String,rep: NSBitmapImageRep,filename: String) throws -> UploadableImage {
         if data.count <= maxBytes { return UploadableImage(data: data,contentType: contentType,width: rep.pixelsWide,height: rep.pixelsHigh,filename: filename) }
@@ -137,9 +143,7 @@ struct UploadableImage: Sendable {
         if let url = (pasteboard.readObjects(forClasses: [NSURL.self],options: [.urlReadingFileURLsOnly: true,.urlReadingContentsConformToTypes: ["public.image"]]) as? [URL])?.first {
             return try load(from: url)
         }
-        if let png = pasteboard.data(forType: .png),let rep = NSBitmapImageRep(data: png) {
-            return try make(data: png,contentType: "image/png",rep: rep,filename: CaptureFiles.filename(extension: "png"))
-        }
+        if let png = pasteboard.data(forType: .png) { return try decode(png,filename: CaptureFiles.filename(extension: "png")) }
         if let tiff = pasteboard.data(forType: .tiff),let rep = NSBitmapImageRep(data: tiff),let png = rep.representation(using: .png,properties: [:]) {
             return try make(data: png,contentType: "image/png",rep: rep,filename: CaptureFiles.filename(extension: "png"))
         }

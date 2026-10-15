@@ -45,7 +45,7 @@ Other clients that support local stdio servers use the same command and argument
 | `ocr` | Text and QR/barcodes from a capture or an image `path`, with a frame for each line. |
 | `record_start` | Start an MP4 recording of a display, window, area or the active window. Returns `recording_id`. |
 | `record_stop` | Finish a recording; returns its path, duration and size. |
-| `upload` | Upload an image to Easyshot Cloud and return its share link (direct-download edition, signed in). With **Check for secrets before uploading** on, an image with detected secrets is refused unless the call passes `redact: true` (black them out) or `allow_secrets: true`. |
+| `upload` | Upload an image to Easyshot Cloud and return its share link (direct-download edition, signed in). With **Check for secrets before uploading** on, an image with detected secrets is refused unless the call passes `redact: true` (black them out) or `allow_secrets: true`. The type is read from the file's bytes, every frame of an animation is checked, and an image that cannot be checked (undecodable, or more than 120 frames) or an animation with findings (which cannot be redacted) is refused unless `allow_secrets: true`. |
 | `open_in_editor` | Open an image, recording or `.easyshot.json` project in the Easyshot editor for the user. |
 
 **Coordinates.** All frames and `rect` arguments are global points with the origin at the top left of the main display, the same space as `list_displays` and `list_windows`. A display to the left of the main display has negative `x`. Capture files keep native pixels; `scale` relates the two.

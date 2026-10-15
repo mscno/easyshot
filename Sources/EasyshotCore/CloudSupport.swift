@@ -51,3 +51,14 @@ public enum ShareLink {
         return url
     }
 }
+
+/// Screenshot uploads are labelled by their decoded bytes, never by the filename: a PNG renamed
+/// `.gif` is still a PNG to the secret scan and to the server.
+public enum UploadImageType {
+    /// The MIME type Easyshot Cloud stores for an ImageIO type identifier, or nil when the image must be re-encoded.
+    public static func mime(forTypeIdentifier identifier: String) -> String? {
+        ["public.png": "image/png","public.jpeg": "image/jpeg","com.compuserve.gif": "image/gif","org.webmproject.webp": "image/webp"][identifier]
+    }
+    /// Animations longer than this are not OCR'd frame by frame; they count as unscanned rather than clean.
+    public static let maxScannedFrames = 120
+}

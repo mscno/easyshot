@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import ImageIO
 import Vision
 import EasyshotCore
@@ -59,28 +60,62 @@ enum Redaction {
         for secret in secrets { counts[secret.kind.title,default: 0] += 1 }
         return counts.sorted { $0.key < $1.key }.map { "\($0.value) × \($0.key)" }.joined(separator: ", ")
     }
+    /// What the pre-upload check concluded. Only `.clean` uploads without asking; an image that could
+    /// not be checked is never treated as clean.
+    enum Scan {
+        case clean
+        /// Findings in a single still image, which can be blacked out.
+        case secrets(CGImage,[TextAnalysis.Secret])
+        /// Findings in an animation, which cannot be redacted frame by frame.
+        case animated([TextAnalysis.Secret],frames: Int)
+        case unscanned(String)
+    }
     /// With "Redact secrets before upload" on, looks for secrets and lets the user redact them,
     /// upload unchanged, or cancel (nil). Images without findings pass straight through.
     @MainActor static func reviewBeforeUpload(_ upload: UploadableImage) async throws -> UploadableImage? {
-        guard Preferences.shared.redactBeforeUpload,let (image,secrets) = try await scan(upload) else { return upload }
+        guard Preferences.shared.redactBeforeUpload else { return upload }
         let alert = NSAlert()
-        alert.messageText = "This image may contain secrets"
-        alert.informativeText = "Easyshot found \(summary(secrets)). Redact them before the link is created?"
-        alert.addButton(withTitle: "Redact and Upload"); alert.addButton(withTitle: "Upload Unchanged"); alert.addButton(withTitle: "Cancel")
-        NSApp.activate()
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            return try redacted(upload,image: image,secrets: secrets)
-        case .alertSecondButtonReturn: return upload
-        default: return nil
+        switch try await scan(upload) {
+        case .clean: return upload
+        case .secrets(let image,let secrets):
+            alert.messageText = "This image may contain secrets"
+            alert.informativeText = "Easyshot found \(summary(secrets)). Redact them before the link is created?"
+            alert.addButton(withTitle: "Redact and Upload"); alert.addButton(withTitle: "Upload Unchanged"); alert.addButton(withTitle: "Cancel")
+            NSApp.activate()
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: return try redacted(upload,image: image,secrets: secrets)
+            case .alertSecondButtonReturn: return upload
+            default: return nil
+            }
+        case .animated(let secrets,let frames):
+            alert.messageText = "This animation may contain secrets"
+            alert.informativeText = "Easyshot found \(summary(secrets)) in \(frames) frames. Animations can't be redacted automatically; upload it anyway?"
+        case .unscanned(let reason):
+            alert.messageText = "This image couldn't be checked for secrets"
+            alert.informativeText = "\(reason) Upload it anyway?"
         }
+        alert.addButton(withTitle: "Upload Unchanged"); alert.addButton(withTitle: "Cancel")
+        NSApp.activate()
+        return alert.runModal() == .alertFirstButtonReturn ? upload : nil
     }
-    /// The decoded image and its findings, or nil when it is a GIF, undecodable or clean.
-    @MainActor static func scan(_ upload: UploadableImage) async throws -> (CGImage,[TextAnalysis.Secret])? {
-        guard upload.contentType != "image/gif",let source = CGImageSourceCreateWithData(upload.data as CFData,nil),
-              let image = CGImageSourceCreateImageAtIndex(source,0,nil) else { return nil }
-        let secrets = try await TextAnalysis.analyze(image,scanner: Preferences.shared.secretScanner).secrets
-        return secrets.isEmpty ? nil : (image,secrets)
+    /// OCRs every frame of the exact bytes being uploaded; the declared content type plays no part.
+    @MainActor static func scan(_ upload: UploadableImage) async throws -> Scan {
+        let scanner = Preferences.shared.secretScanner
+        guard let source = CGImageSourceCreateWithData(upload.data as CFData,nil),CGImageSourceGetCount(source) > 0 else { return .unscanned("Easyshot could not decode it.") }
+        let count = CGImageSourceGetCount(source)
+        guard count <= UploadImageType.maxScannedFrames else { return .unscanned("It has \(count) frames, more than Easyshot checks (\(UploadImageType.maxScannedFrames)).") }
+        var findings: [TextAnalysis.Secret] = [],frames = 0,first: CGImage?,seen = Set<SHA256.Digest>()
+        for index in 0..<count {
+            guard let image = CGImageSourceCreateImageAtIndex(source,index,nil) else { return .unscanned("Frame \(index+1) could not be decoded.") }
+            if index == 0 { first = image }
+            // Screen recordings repeat frames; OCR each distinct one once.
+            if count > 1,let pixels = image.dataProvider?.data,!seen.insert(SHA256.hash(data: pixels as Data)).inserted { continue }
+            let secrets = try await TextAnalysis.analyze(image,scanner: scanner).secrets
+            if !secrets.isEmpty { findings += secrets; frames += 1 }
+        }
+        if findings.isEmpty { return .clean }
+        if count == 1,let first { return .secrets(first,findings) }
+        return .animated(findings,frames: frames)
     }
     static func redacted(_ upload: UploadableImage,image: CGImage,secrets: [TextAnalysis.Secret]) throws -> UploadableImage {
         // Vision boxes are bottom-left; CGContext fills use the same origin.

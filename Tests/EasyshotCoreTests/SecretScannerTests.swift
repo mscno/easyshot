@@ -1,4 +1,6 @@
 import XCTest
+import ImageIO
+import UniformTypeIdentifiers
 @testable import EasyshotCore
 
 final class SecretScannerTests: XCTestCase {
@@ -74,5 +76,26 @@ final class SecretScannerTests: XCTestCase {
         XCTAssertFalse(SecretScanner.luhn("42"))
         XCTAssertEqual(SecretScanner.entropy("aaaa"), 0)
         XCTAssertEqual(SecretScanner.entropy("abcd"), 2, accuracy: 0.0001)
+    }
+    /// The upload type is sniffed from bytes: a PNG renamed .gif is still scanned and labelled as a PNG.
+    func testUploadTypeComesFromTheBytes() throws {
+        func encode(_ type: UTType,frames: Int) throws -> Data {
+            let data = NSMutableData()
+            let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data,type.identifier as CFString,frames,nil))
+            let ctx = try XCTUnwrap(CGContext(data: nil,width: 4,height: 4,bitsPerComponent: 8,bytesPerRow: 0,space: CGColorSpaceCreateDeviceRGB(),bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            for _ in 0..<frames { CGImageDestinationAddImage(destination,try XCTUnwrap(ctx.makeImage()),nil) }
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
+            return data as Data
+        }
+        func sniff(_ data: Data) throws -> (String?,Int) {
+            let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData,nil))
+            return (UploadImageType.mime(forTypeIdentifier: try XCTUnwrap(CGImageSourceGetType(source)) as String),CGImageSourceGetCount(source))
+        }
+        XCTAssertEqual(try sniff(encode(.png,frames: 1)).0,"image/png")
+        XCTAssertEqual(try sniff(encode(.jpeg,frames: 1)).0,"image/jpeg")
+        let gif = try sniff(encode(.gif,frames: 3))
+        XCTAssertEqual(gif.0,"image/gif"); XCTAssertEqual(gif.1,3)
+        XCTAssertNil(try sniff(encode(.tiff,frames: 1)).0,"TIFF is re-encoded as PNG before upload")
+        XCTAssertGreaterThan(UploadImageType.maxScannedFrames,1)
     }
 }
