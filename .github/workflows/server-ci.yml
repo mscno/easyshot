@@ -52,6 +52,11 @@ jobs:
       - name: Clippy
         working-directory: server
         run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Dependency audit
+        working-directory: server
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --file Cargo.lock
       - name: Test database
         run: mise run db:test:reset
       - name: Tests

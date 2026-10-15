@@ -51,7 +51,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check && topcoat fmt --check src tests   # cargo install topcoat-cli --version 0.10.0
 ```
 
-CI (`.github/workflows/server-ci.yml`) runs the same checks against a `postgres:18` service container on every server change, and the deploy workflow runs it before deploying.
+CI (`.github/workflows/server-ci.yml`) runs the same checks against a `postgres:18` service container on every server change, plus `cargo-audit` 0.22.2, and the deploy workflow runs it before deploying. The S3 SDK selects its current HTTPS client explicitly; the deprecated Hyper 0.14 / rustls 0.21 connector is disabled. The audit has no vulnerability findings; Toasty 0.11 still brings an upstream maintenance warning for `rustls-pemfile` 2.2.0 (not suppressed).
 
 Whole stack in containers: `docker compose --profile postgres --profile app up --build`.
 
