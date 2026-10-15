@@ -5,11 +5,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use easyshot_server::mailer::MemoryMailer;
+use easyshot_server::storage::MemoryStore;
+use easyshot_server::{AppState, vals, web};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use shotglass_server::mailer::MemoryMailer;
-use shotglass_server::storage::MemoryStore;
-use shotglass_server::{AppState, vals, web};
 use topcoat::router::{Body, Router, StatusCode, request::Request, response::Response};
 
 mod common;
@@ -393,7 +393,7 @@ async fn instant_link_upload_and_watch() {
     assert_eq!(big.status, StatusCode::PAYLOAD_TOO_LARGE);
 
     let page = app.get(&format!("/v/{slug}"), None).await;
-    assert!(page.body.contains("<shotglass-player"), "{}", page.body);
+    assert!(page.body.contains("<easyshot-player"), "{}", page.body);
     assert!(page.body.contains(&format!("/v/{slug}/transcript.vtt")));
     assert!(page.body.contains("og:title"));
     let media = app.get(&format!("/v/{slug}/media"), None).await;
@@ -636,7 +636,7 @@ async fn password_and_private_visibility() {
     assert_eq!(r.json()["title"], "Secret plan");
     let gate = app.get(&format!("/v/{slug}"), None).await;
     assert!(gate.body.contains("password protected"));
-    assert!(!gate.body.contains("<shotglass-player"));
+    assert!(!gate.body.contains("<easyshot-player"));
     assert!(!gate.body.contains("og:image"));
     assert_eq!(
         app.get(&format!("/v/{slug}/media"), None).await.status,
@@ -672,7 +672,7 @@ async fn password_and_private_visibility() {
     let cookie = ok.cookie("sgu_").expect("unlock cookie");
     assert!(cookie.starts_with("__Host-sgu_"));
     let page = app.get(&format!("/v/{slug}"), Some(&cookie)).await;
-    assert!(page.body.contains("<shotglass-player"));
+    assert!(page.body.contains("<easyshot-player"));
     assert_eq!(
         app.get(&format!("/v/{slug}/media"), Some(&cookie))
             .await
@@ -718,7 +718,7 @@ async fn password_and_private_visibility() {
     let session = app.web_login("owner@example.com").await;
     let page = app.get(&format!("/v/{slug}"), Some(&session)).await;
     assert_eq!(page.status, StatusCode::OK);
-    assert!(page.body.contains("<shotglass-player"));
+    assert!(page.body.contains("<easyshot-player"));
     app.t.finish().await;
 }
 

@@ -1,4 +1,4 @@
-// Shotglass web: the <shotglass-player> Rocket component and two small page behaviors.
+// Easyshot web: the <easyshot-player> Rocket component and two small page behaviors.
 // Imports the runtime by the exact URL the layout loads, so the page has one Datastar.
 import { rocket } from '/static/datastar-rocket-1.0.4.js'
 
@@ -10,12 +10,12 @@ const clock = (ms) => {
   return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`
 }
 
-// <shotglass-player> wraps the server-rendered <video> (light DOM, no render function, so
+// <easyshot-player> wraps the server-rendered <video> (light DOM, no render function, so
 // the native player and its no-JavaScript fallback stay as rendered). It publishes the
 // playback position to inputs marked [data-player-time] / [data-player-clock] (comment and
 // reaction forms), seeks when anything marked [data-seek-ms] is clicked, fills the
 // transcript list from the captions track and highlights the current line.
-rocket('shotglass-player', {
+rocket('easyshot-player', {
   mode: 'light',
   onFirstRender({ host, cleanup }) {
     const video = host.querySelector('video')

@@ -19,7 +19,7 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Sync runtime secrets
         env:
-          # App role (shotglass_app) and owner role connection strings.
+          # App role (easyshot_app) and owner role connection strings.
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
           WEB_SECRET: ${{ secrets.WEB_SECRET }}

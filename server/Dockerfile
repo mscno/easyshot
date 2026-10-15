@@ -16,9 +16,9 @@ RUN touch build.rs src/main.rs src/lib.rs && cargo build --release --locked
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 shotglass
-COPY --from=build /app/target/release/shotglass-server /usr/local/bin/shotglass-server
-USER shotglass
+    && useradd --system --uid 10001 easyshot
+COPY --from=build /app/target/release/easyshot-server /usr/local/bin/easyshot-server
+USER easyshot
 ENV BIND_ADDR=0.0.0.0:8080 RUST_LOG=info
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/shotglass-server"]
+ENTRYPOINT ["/usr/local/bin/easyshot-server"]

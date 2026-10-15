@@ -10,7 +10,7 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: shotglass_dev
+      POSTGRES_DB: easyshot_dev
     ports: ["${POSTGRES_PORT:-5433}:5432"]
     volumes: [pgdata:/var/lib/postgresql]
     healthcheck:
@@ -38,8 +38,8 @@ services:
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb --ignore-existing local/shotglass &&
-      mc ilm rule add --expire-days 31 local/shotglass || true"
+      mc mb --ignore-existing local/easyshot &&
+      mc ilm rule add --expire-days 31 local/easyshot || true"
 
   server:
     profiles: ["app"]
@@ -49,12 +49,12 @@ services:
       minio-init: { condition: service_completed_successfully }
     ports: ["8080:8080"]
     environment:
-      # Migrations as the owner at startup; the server itself connects as shotglass_app.
-      MIGRATION_DATABASE_URL: postgres://postgres:postgres@postgres:5432/shotglass_dev
-      DATABASE_URL: postgres://shotglass_app:shotglass_app@postgres:5432/shotglass_dev
+      # Migrations as the owner at startup; the server itself connects as easyshot_app.
+      MIGRATION_DATABASE_URL: postgres://postgres:postgres@postgres:5432/easyshot_dev
+      DATABASE_URL: postgres://easyshot_app:easyshot_app@postgres:5432/easyshot_dev
       RUN_MIGRATIONS: "true"
       PUBLIC_BASE_URL: http://localhost:8080
-      S3_BUCKET: shotglass
+      S3_BUCKET: easyshot
       S3_ENDPOINT: http://minio:9000
       S3_FORCE_PATH_STYLE: "true"
       AWS_ACCESS_KEY_ID: minioadmin

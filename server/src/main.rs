@@ -1,9 +1,9 @@
-//! `shotglass-server [serve]` runs the web app and API; `migrate up|status|reset --yes` and
+//! `easyshot-server [serve]` runs the web app and API; `migrate up|status|reset --yes` and
 //! `seed` manage the database as the owner role (`--database-url` or
 //! `MIGRATION_DATABASE_URL`).
 
-use shotglass_server::config::Config;
-use shotglass_server::{AppState, db};
+use easyshot_server::config::Config;
+use easyshot_server::{AppState, db};
 use tracing_subscriber::EnvFilter;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
@@ -63,11 +63,11 @@ async fn main() -> Result<(), BoxErr> {
         }
         ["seed"] => {
             let url = owner_url()?;
-            let summary = shotglass_server::seed::run(&url).await?;
+            let summary = easyshot_server::seed::run(&url).await?;
             println!("{summary}");
             Ok(())
         }
-        _ => Err("usage: shotglass-server [serve] | migrate up|status|reset --yes | seed".into()),
+        _ => Err("usage: easyshot-server [serve] | migrate up|status|reset --yes | seed".into()),
     }
 }
 
@@ -88,14 +88,14 @@ async fn serve() -> Result<(), BoxErr> {
     {
         // Lambda serves the JSON API only; web pages need the container deploy.
         let _ = bind;
-        lambda_http::run(shotglass_server::router(state)).await
+        lambda_http::run(easyshot_server::router(state)).await
     }
 
     #[cfg(not(feature = "lambda"))]
     {
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         tracing::info!(addr = %bind, "listening");
-        topcoat::serve(listener, shotglass_server::web::router(state)).await?;
+        topcoat::serve(listener, easyshot_server::web::router(state)).await?;
         Ok(())
     }
 }

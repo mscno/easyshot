@@ -38,10 +38,10 @@ pub async fn shell(
     #[default] bare: bool,
     child: Child<'_>,
 ) -> Result<impl View> {
-    let title = if meta.title == "Shotglass" {
+    let title = if meta.title == "Easyshot" {
         meta.title.clone()
     } else {
-        format!("{} · Shotglass", meta.title)
+        format!("{} · Easyshot", meta.title)
     };
     Ok(view! {
         <!DOCTYPE html>
@@ -81,7 +81,7 @@ pub async fn shell(
                                 width="28"
                                 height="28"
                             >
-                            <span>"Shotglass"</span>
+                            <span>"Easyshot"</span>
                         </a>
                         <nav>
                             if signed_in {
@@ -98,7 +98,7 @@ pub async fn shell(
                 <main id="main">(child)</main>
                 if !bare {
                     <footer class="footer">
-                        <span>"Shotglass · recorded and encoded on your Mac"</span>
+                        <span>"Easyshot · recorded and encoded on your Mac"</span>
                         <a href="/static/DATASTAR-LICENSE.md">"Licenses"</a>
                     </footer>
                 }

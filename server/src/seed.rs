@@ -5,8 +5,8 @@ use crate::auth::hash_password_blocking;
 use crate::db::{Db, DbError};
 use crate::repo::{self, now_ms};
 
-pub const ACCOUNTS: [&str; 2] = ["dev@shotglass.test", "teammate@shotglass.test"];
-pub const PASSWORD: &str = "shotglass-dev-password";
+pub const ACCOUNTS: [&str; 2] = ["dev@easyshot.test", "teammate@easyshot.test"];
+pub const PASSWORD: &str = "easyshot-dev-password";
 
 pub async fn run(owner_url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let pool = sqlx::PgPool::connect(owner_url).await?;

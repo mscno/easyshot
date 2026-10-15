@@ -2,7 +2,7 @@
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// App-role connection (`shotglass_app`, NOSUPERUSER NOBYPASSRLS).
+    /// App-role connection (`easyshot_app`, NOSUPERUSER NOBYPASSRLS).
     pub database_url: String,
     /// Owner-role connection for migrations; `RUN_MIGRATIONS` and `migrate` need it.
     pub migration_database_url: Option<String>,
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn fly_tigris_fallbacks_and_inactive_days() {
         let c = Config::from_lookup(lookup(&[
-            ("DATABASE_URL", "postgres://shotglass_app@db/x"),
+            ("DATABASE_URL", "postgres://easyshot_app@db/x"),
             ("MIGRATION_DATABASE_URL", "postgres://owner@db/x"),
             ("BUCKET_NAME", "tigris-bucket"),
             ("AWS_REGION", "auto"),

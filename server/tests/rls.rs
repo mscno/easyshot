@@ -1,12 +1,12 @@
 //! Row-level security is a second wall: these tests run deliberately unfiltered SQL as the
-//! app role (`shotglass_app`, NOBYPASSRLS) and check that PostgreSQL itself denies
+//! app role (`easyshot_app`, NOBYPASSRLS) and check that PostgreSQL itself denies
 //! cross-owner, cross-workspace and out-of-share access, both through sqlx and inside
 //! Toasty transactions.
 
-use shotglass_server::db::{Context, Db, DbError};
-use shotglass_server::orm;
-use shotglass_server::vals;
-use shotglass_server::video::model::Video;
+use easyshot_server::db::{Context, Db, DbError};
+use easyshot_server::orm;
+use easyshot_server::vals;
+use easyshot_server::video::model::Video;
 use uuid::Uuid;
 
 mod common;

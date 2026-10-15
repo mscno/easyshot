@@ -4,7 +4,7 @@
 //! milliseconds, booleans 0/1. Placeholders are `$1, $2, ...`.
 //!
 //! Two roles: migrations run as the table owner (`MIGRATION_DATABASE_URL`); the server
-//! connects as `shotglass_app`, which is `NOSUPERUSER NOBYPASSRLS`, so row-level security
+//! connects as `easyshot_app`, which is `NOSUPERUSER NOBYPASSRLS`, so row-level security
 //! applies. A plain [`Db`] carries no tenant context and therefore sees no rows of
 //! owner-scoped tables; use [`Db::scoped`] for those (see [`Context`]).
 

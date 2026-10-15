@@ -1,19 +1,19 @@
 //! Integration tests against PostgreSQL (`TEST_DATABASE_URL`, one throwaway schema per
-//! test). The app runs as the `shotglass_app` role, so row-level security applies.
+//! test). The app runs as the `easyshot_app` role, so row-level security applies.
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use easyshot_server::config::Config;
+use easyshot_server::db::{Db, DbError};
+use easyshot_server::mailer::{Email, LettermintMailer, Mailer, MemoryMailer};
+use easyshot_server::repo::{self, now_ms};
+use easyshot_server::storage::MemoryStore;
+use easyshot_server::{AppState, router, vals};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use shotglass_server::config::Config;
-use shotglass_server::db::{Db, DbError};
-use shotglass_server::mailer::{Email, LettermintMailer, Mailer, MemoryMailer};
-use shotglass_server::repo::{self, now_ms};
-use shotglass_server::storage::MemoryStore;
-use shotglass_server::{AppState, router, vals};
 use tower::ServiceExt;
 
 const HOUR: i64 = 3_600_000;
@@ -1630,8 +1630,8 @@ async fn lettermint_client_request_shape() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let mail = shotglass_server::mailer::code_email(
-        shotglass_server::mailer::CodePurpose::LoginOtp,
+    let mail = easyshot_server::mailer::code_email(
+        easyshot_server::mailer::CodePurpose::LoginOtp,
         "u@example.com",
         "424242",
         10,
@@ -1640,7 +1640,7 @@ async fn lettermint_client_request_shape() {
     let m = LettermintMailer::new(
         &format!("http://{addr}/v1"),
         "lm_secret",
-        "Shotglass <no-reply@example.com>",
+        "Easyshot <no-reply@example.com>",
         Some("outbound"),
     );
     m.send(mail.clone()).await.unwrap();
@@ -1648,7 +1648,7 @@ async fn lettermint_client_request_shape() {
     assert_eq!(headers["x-lettermint-token"], "lm_secret");
     assert_eq!(headers["idempotency-key"], "login_otp-k");
     assert_eq!(body["to"], json!(["u@example.com"]));
-    assert_eq!(body["from"], "Shotglass <no-reply@example.com>");
+    assert_eq!(body["from"], "Easyshot <no-reply@example.com>");
     assert_eq!(body["route"], "outbound");
     assert!(body["text"].as_str().unwrap().contains("424242"));
 

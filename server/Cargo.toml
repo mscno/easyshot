@@ -1,5 +1,5 @@
 [package]
-name = "shotglass-server"
+name = "easyshot-server"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -7,11 +7,11 @@ publish = false
 [workspace]
 
 [lib]
-name = "shotglass_server"
+name = "easyshot_server"
 path = "src/lib.rs"
 
 [[bin]]
-name = "shotglass-server"
+name = "easyshot-server"
 path = "src/main.rs"
 
 [features]

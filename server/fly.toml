@@ -1,5 +1,5 @@
 # The app name is not stored here: deploy with `fly deploy -a "$FLY_APP"`.
-# Runtime configuration and credentials are Fly secrets (DATABASE_URL for the shotglass_app
+# Runtime configuration and credentials are Fly secrets (DATABASE_URL for the easyshot_app
 # role, MIGRATION_DATABASE_URL for the owner, CRON_SECRET, PUBLIC_BASE_URL, WEB_SECRET and the
 # Tigris variables), synced from GitHub secrets by CI. PostgreSQL: Fly Managed Postgres or Neon.
 primary_region = "fra"
@@ -9,7 +9,7 @@ primary_region = "fra"
 
 [deploy]
   # Migrations run as the owner role before new machines start.
-  release_command = "/usr/local/bin/shotglass-server migrate up"
+  release_command = "/usr/local/bin/easyshot-server migrate up"
 
 [env]
   BIND_ADDR = "0.0.0.0:8080"

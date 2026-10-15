@@ -42,7 +42,7 @@ pub async fn landing(cx: &Cx) -> Result<impl View> {
     let signed_in = member(cx).await?.is_some();
     let download = state(cx).config.download_url.clone();
     let meta = Meta {
-        title: "Shotglass".into(),
+        title: "Easyshot".into(),
         description: Some(
             "Record your screen on the Mac and share a link before you stop talking.".into(),
         ),
@@ -56,7 +56,7 @@ pub async fn landing(cx: &Cx) -> Result<impl View> {
                 <p class="eyebrow">"Screen recording for Mac"</p>
                 <h1>"Record it. Share the link. Get answers."</h1>
                 <p class="lede">
-                    "Shotglass uploads while you record, so the link is on your clipboard the moment you stop. "
+                    "Easyshot uploads while you record, so the link is on your clipboard the moment you stop. "
                     "Teammates watch in the browser, react, and leave comments pinned to the exact second."
                 </p>
                 <div class="cta">
@@ -101,7 +101,7 @@ pub async fn landing(cx: &Cx) -> Result<impl View> {
             <section class="privacy">
                 <h2>"Private by default"</h2>
                 <p>
-                    "Recording and encoding happen on your Mac. Shotglass has no tracking, no analytics and no ads. "
+                    "Recording and encoding happen on your Mac. Easyshot has no tracking, no analytics and no ads. "
                     "Views are counted with a daily keyed hash, never your IP address."
                 </p>
             </section>
@@ -155,7 +155,7 @@ async fn login_card(next: String, step: LoginStep, mail_ok: bool) -> Result<impl
                 match step {
                     LoginStep::Email { error } => {
                         <p class="muted">
-                            "We'll email you a 6-digit code. Accounts are created in the Shotglass app."
+                            "We'll email you a 6-digit code. Accounts are created in the Easyshot app."
                         </p>
                         match error {
                             Some(e) => <p class="notice error" role="alert">(e)</p>,
@@ -181,7 +181,7 @@ async fn login_card(next: String, step: LoginStep, mail_ok: bool) -> Result<impl
                         <p class="muted">
                             "If "
                             <strong>(email.as_str())</strong>
-                            " has a Shotglass account, a code is on its way."
+                            " has a Easyshot account, a code is on its way."
                         </p>
                         match error {
                             Some(e) => <p class="notice error" role="alert">(e)</p>,
@@ -395,7 +395,7 @@ pub async fn library(cx: &Cx) -> Result<impl View> {
                     <div class="empty card">
                         <h2>"No recordings yet"</h2>
                         <p>
-                            "Record in the Shotglass app with Shotglass Cloud enabled. The link appears here and on your clipboard."
+                            "Record in the Easyshot app with Easyshot Cloud enabled. The link appears here and on your clipboard."
                         </p>
                     </div>
                 }

@@ -176,20 +176,20 @@ pub fn code_email(
 ) -> Email {
     let (subject, intro) = match purpose {
         CodePurpose::VerifyEmail => (
-            "Confirm your Shotglass email",
-            "Enter this code in Shotglass to confirm your email address.",
+            "Confirm your Easyshot email",
+            "Enter this code in Easyshot to confirm your email address.",
         ),
         CodePurpose::ResetPassword => (
-            "Reset your Shotglass password",
-            "Enter this code in Shotglass to choose a new password.",
+            "Reset your Easyshot password",
+            "Enter this code in Easyshot to choose a new password.",
         ),
         CodePurpose::LoginOtp => (
-            "Your Shotglass sign-in code",
-            "Enter this code in Shotglass to sign in.",
+            "Your Easyshot sign-in code",
+            "Enter this code in Easyshot to sign in.",
         ),
     };
     let footer = match purpose {
-        CodePurpose::VerifyEmail => "If you didn't create a Shotglass account, ignore this email.",
+        CodePurpose::VerifyEmail => "If you didn't create a Easyshot account, ignore this email.",
         _ => "If you didn't request this, you can ignore this email. Your account is safe.",
     };
     let text = format!(
@@ -216,15 +216,10 @@ mod tests {
 
     #[test]
     fn payload_shape() {
-        let m = LettermintMailer::new(
-            "https://x/v1/",
-            "tok",
-            "Shotglass <a@b.c>",
-            Some("outbound"),
-        );
+        let m = LettermintMailer::new("https://x/v1/", "tok", "Easyshot <a@b.c>", Some("outbound"));
         let e = code_email(CodePurpose::LoginOtp, "u@e.com", "123456", 10, "k1");
         let p = m.payload(&e);
-        assert_eq!(p["from"], "Shotglass <a@b.c>");
+        assert_eq!(p["from"], "Easyshot <a@b.c>");
         assert_eq!(p["to"], json!(["u@e.com"]));
         assert_eq!(p["route"], "outbound");
         assert!(p["text"].as_str().unwrap().contains("123456"));

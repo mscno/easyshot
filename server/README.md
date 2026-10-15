@@ -1,6 +1,6 @@
-# Shotglass server
+# Easyshot server
 
-Rust backend and web presence for Shotglass: accounts, presigned screenshot uploads with short share links (`/s/{slug}[.ext]`), Loom-style video sharing (instant links, a watch page with timestamped comments, reactions and transcripts), retention, and automatic removal of accounts inactive for 90 days. PostgreSQL only. Billing is not implemented; `users.plan` exists for later.
+Rust backend and web presence for Easyshot: accounts, presigned screenshot uploads with short share links (`/s/{slug}[.ext]`), Loom-style video sharing (instant links, a watch page with timestamped comments, reactions and transcripts), retention, and automatic removal of accounts inactive for 90 days. PostgreSQL only. Billing is not implemented; `users.plan` exists for later.
 
 Media bytes never pass through the server: clients PUT straight to presigned URLs (screenshots as one object, recordings as S3 multipart parts streamed while recording), and viewers are redirected to short-lived presigned GETs.
 
@@ -11,11 +11,11 @@ Media bytes never pass through the server: clients PUT straight to presigned URL
 - **Schema ownership.** `migrations/*.sql` owns every table, including those Toasty maps; Toasty never creates or alters schema. Files are embedded at build time (`build.rs`), applied in name order as the owner role inside one transaction each, under an advisory lock, and recorded in `_migrations`. New migrations: `mise run db:new -- name` (timestamped).
 - **Team-ready, without teams.** Every video-domain table has a nullable `workspace_id`; conversation tables reference a generic `item_id` and `videos` has a `kind`, so videos can later merge with screenshots into one `items` table with child assets; `visibility` is an application enum (`link`, `password`, `private`) stored without a CHECK constraint so it can gain `workspace`; all access decisions go through one scope helper (`src/video/scope.rs`).
 - **Live updates.** Each watch page holds one Datastar SSE stream (`/v/{slug}/live`). Writes publish a change to an in-process hub; the stream re-renders the affected region and patches it by id. A 20 s resync covers changes made on other instances and keeps view counts fresh; streams close while the tab is hidden.
-- **Browser runtime.** One self-hosted bundle, `static/datastar-rocket-1.0.4.js` (Datastar v1.0.4 + Rocket beta.2, MIT, `static/DATASTAR-LICENSE.md`, sha256 `c723fb309157a555609df273e4693dcc4e193e68e6d7477f3285b955288e1e7b`), loaded once by the layout and imported by `static/app.js` from the same URL. Topcoat's own reactive runtime is not enabled. `<shotglass-player>` is a light-DOM Rocket component over a native `<video controls>`, which also works without JavaScript. Forms are native posts that Datastar enhances (form encoding, retries off). Assets are compiled into the binary and cached immutably.
+- **Browser runtime.** One self-hosted bundle, `static/datastar-rocket-1.0.4.js` (Datastar v1.0.4 + Rocket beta.2, MIT, `static/DATASTAR-LICENSE.md`, sha256 `c723fb309157a555609df273e4693dcc4e193e68e6d7477f3285b955288e1e7b`), loaded once by the layout and imported by `static/app.js` from the same URL. Topcoat's own reactive runtime is not enabled. `<easyshot-player>` is a light-DOM Rocket component over a native `<video controls>`, which also works without JavaScript. Forms are native posts that Datastar enhances (form encoding, retries off). Assets are compiled into the binary and cached immutably.
 
 ## Database roles and row-level security
 
-Migrations run as the table owner (`MIGRATION_DATABASE_URL`, or `--database-url`). The server connects as `shotglass_app` (`DATABASE_URL`), created by migration `0004_rls_app_role` with `NOSUPERUSER NOBYPASSRLS`. In production, create the role beforehand with its own password; the migration then only grants. A superuser or `BYPASSRLS` connection defeats RLS.
+Migrations run as the table owner (`MIGRATION_DATABASE_URL`, or `--database-url`). The server connects as `easyshot_app` (`DATABASE_URL`), created by migration `0004_rls_app_role` with `NOSUPERUSER NOBYPASSRLS`. In production, create the role beforehand with its own password; the migration then only grants. A superuser or `BYPASSRLS` connection defeats RLS.
 
 `screenshots`, `videos` and the `item_*` tables have `FORCE`d policies keyed on transaction-local settings, set with `set_config(..., true)` as the first statement of every transaction:
 
@@ -34,16 +34,16 @@ sqlx code applies a `db::Context` per statement (`Db::scoped`); Toasty work runs
 Requires PostgreSQL 18 on `localhost:5433` (user/password `postgres`), [mise](https://mise.jdx.dev) and Docker for MinIO. Tasks live in the repository's `mise.toml`:
 
 ```sh
-docker compose up -d minio minio-init     # MinIO :9000 (console :9001), bucket `shotglass`
-mise run db:create                         # shotglass_dev
-mise run db:migrate                        # as the owner; creates shotglass_app
-mise run db:seed                           # dev@shotglass.test / teammate@shotglass.test
+docker compose up -d minio minio-init     # MinIO :9000 (console :9001), bucket `easyshot`
+mise run db:create                         # easyshot_dev
+mise run db:migrate                        # as the owner; creates easyshot_app
+mise run db:seed                           # dev@easyshot.test / teammate@easyshot.test
 mise run server:dev                        # http://127.0.0.1:8080, app role, MinIO
 ```
 
-`db:status`, `db:reset` (dev only: drops and rebuilds `public`), `db:new -- name`, `db:test` and `db:test:reset` work the same way. Override `DEV_DATABASE_URL`, `TEST_DATABASE_URL` or `DEV_APP_DATABASE_URL` in `mise.local.toml`. Without Lettermint, web sign-in codes cannot be mailed; the API (`/v1/auth/login`) still works with the seeded password `shotglass-dev-password`.
+`db:status`, `db:reset` (dev only: drops and rebuilds `public`), `db:new -- name`, `db:test` and `db:test:reset` work the same way. Override `DEV_DATABASE_URL`, `TEST_DATABASE_URL` or `DEV_APP_DATABASE_URL` in `mise.local.toml`. Without Lettermint, web sign-in codes cannot be mailed; the API (`/v1/auth/login`) still works with the seeded password `easyshot-dev-password`.
 
-Tests run against `TEST_DATABASE_URL` (default `shotglass_test` on :5433), one throwaway schema per test, migrated as the owner, with the code under test connected as `shotglass_app`:
+Tests run against `TEST_DATABASE_URL` (default `easyshot_test` on :5433), one throwaway schema per test, migrated as the owner, with the code under test connected as `easyshot_app`:
 
 ```sh
 mise run server:test                       # or: cd server && cargo test
@@ -53,7 +53,7 @@ cargo fmt --check && topcoat fmt --check src/web/*.rs   # cargo install topcoat-
 
 Whole stack in containers: `docker compose --profile postgres --profile app up --build`.
 
-The binary's own commands: `shotglass-server [serve]`, `migrate up|status|reset --yes`, `seed` (owner URL via `--database-url` or `MIGRATION_DATABASE_URL`).
+The binary's own commands: `easyshot-server [serve]`, `migrate up|status|reset --yes`, `seed` (owner URL via `--database-url` or `MIGRATION_DATABASE_URL`).
 
 ## Web pages
 
@@ -91,7 +91,7 @@ Every part except the last must be at least 5 MiB (S3 rule). Upload parts while 
 
 ## Deploy (Fly.io + PostgreSQL)
 
-Production is PostgreSQL, e.g. Fly Managed Postgres or Neon, with two connection strings: the owner (`MIGRATION_DATABASE_URL`) and `shotglass_app` (`DATABASE_URL`). Once per database, as the owner: `CREATE ROLE shotglass_app LOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT PASSWORD '...'` (Neon: the `*_owner` role can create it; Fly MPG: the provided owner user). `fly.toml` runs `shotglass-server migrate up` as the release command, so migrations apply as the owner before new machines start; the app itself never needs the owner URL. Use the pooled endpoint for `DATABASE_URL` only if it is a session pooler: transaction-mode pooling breaks prepared statements and transaction-local settings stay safe only within a transaction.
+Production is PostgreSQL, e.g. Fly Managed Postgres or Neon, with two connection strings: the owner (`MIGRATION_DATABASE_URL`) and `easyshot_app` (`DATABASE_URL`). Once per database, as the owner: `CREATE ROLE easyshot_app LOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT PASSWORD '...'` (Neon: the `*_owner` role can create it; Fly MPG: the provided owner user). `fly.toml` runs `easyshot-server migrate up` as the release command, so migrations apply as the owner before new machines start; the app itself never needs the owner URL. Use the pooled endpoint for `DATABASE_URL` only if it is a session pooler: transaction-mode pooling breaks prepared statements and transaction-local settings stay safe only within a transaction.
 
 The machine can scale to zero: startup only parses config. Create the bucket with `fly storage create` (Tigris); it sets `BUCKET_NAME`, `AWS_REGION=auto`, `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, which the server uses as-is (presigned URLs are virtual-hosted style, region `auto`). Do not set `S3_FORCE_PATH_STYLE`. Secrets: `DATABASE_URL`, `MIGRATION_DATABASE_URL`, `CRON_SECRET`, `PUBLIC_BASE_URL`, `WEB_SECRET` (synced from GitHub secrets by `.github/workflows/deploy-server.yml`). `TRUSTED_PROXY_HOPS=1` makes client addresses come from Fly's proxy. Trigger `POST /v1/internal/expire` from an external scheduler, since a scaled-to-zero machine cannot run its own timer. Live streams are per instance with a 20 s cross-instance resync, so more than one machine works without extra infrastructure.
 
@@ -101,7 +101,7 @@ Moving existing data off Turso is a one-off export/import of `users`, `sessions`
 
 | Var | Default | Notes |
 |---|---|---|
-| `DATABASE_URL` | required | app role (`shotglass_app`), `postgres://` |
+| `DATABASE_URL` | required | app role (`easyshot_app`), `postgres://` |
 | `MIGRATION_DATABASE_URL` | unset | owner role; used by `migrate`, and at startup when `RUN_MIGRATIONS=true` |
 | `RUN_MIGRATIONS` | `false` | apply migrations at startup (needs `MIGRATION_DATABASE_URL`) |
 | `DB_MAX_CONNECTIONS` | `5` | per pool (sqlx and Toasty each); lazy, 5 s acquire timeout |
@@ -137,16 +137,16 @@ Lambda serves the JSON API only (no web pages, no live streams).
 ```sh
 cargo install cargo-lambda
 cargo lambda build --release --features lambda --arm64
-cargo lambda deploy shotglass-server --enable-function-url   # or put behind API Gateway HTTP API
+cargo lambda deploy easyshot-server --enable-function-url   # or put behind API Gateway HTTP API
 ```
 
-Set the env vars above on the function and run migrations separately (`shotglass-server migrate up` with the owner URL). Grant the execution role `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` on `arn:aws:s3:::BUCKET/*` and `s3:ListBucket` on the bucket (HEAD of a missing key returns 404 rather than 403 only with ListBucket). Presigned URLs are signed with the role's credentials, so they expire with the role session. If you use an API Gateway stage path, set `AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH=true`. Use a Postgres reachable from Lambda (RDS Proxy in session mode / Neon; keep `DB_MAX_CONNECTIONS` small). Argon2id uses ~19 MiB per hash, so give the function at least 512 MB.
+Set the env vars above on the function and run migrations separately (`easyshot-server migrate up` with the owner URL). Grant the execution role `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` on `arn:aws:s3:::BUCKET/*` and `s3:ListBucket` on the bucket (HEAD of a missing key returns 404 rather than 403 only with ListBucket). Presigned URLs are signed with the role's credentials, so they expire with the role session. If you use an API Gateway stage path, set `AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH=true`. Use a Postgres reachable from Lambda (RDS Proxy in session mode / Neon; keep `DB_MAX_CONNECTIONS` small). Argon2id uses ~19 MiB per hash, so give the function at least 512 MB.
 
 ## Container
 
 ```sh
-docker build -t shotglass-server .
-docker run --env-file .env -p 8080:8080 shotglass-server
+docker build -t easyshot-server .
+docker run --env-file .env -p 8080:8080 easyshot-server
 ```
 
 ## Expiry

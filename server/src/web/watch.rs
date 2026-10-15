@@ -118,7 +118,7 @@ pub async fn watch(cx: &Cx) -> Result<impl View> {
         ("og:type", "video.other".to_string()),
         ("og:title", v.title.clone()),
         ("og:url", url.clone()),
-        ("og:site_name", "Shotglass".to_string()),
+        ("og:site_name", "Easyshot".to_string()),
         ("twitter:title", v.title.clone()),
     ];
     if public && v.thumbnail_key.is_some() {
@@ -288,7 +288,7 @@ pub async fn player_region(
     Ok(view! {
         <section id="player-region" class="player-region">
             if ready {
-                <shotglass-player id="player" class="player">
+                <easyshot-player id="player" class="player">
                     <video
                         id="video"
                         controls=""
@@ -313,7 +313,7 @@ pub async fn player_region(
                         comments: comments,
                         reactions: reactions
                     )
-                </shotglass-player>
+                </easyshot-player>
             } else {
                 <div class="processing">
                     <div class="spinner" aria-hidden="true"></div>
@@ -1160,7 +1160,7 @@ pub async fn oembed(cx: &Cx) -> Result<Response> {
     let mut body = serde_json::json!({
         "version": "1.0",
         "type": "video",
-        "provider_name": "Shotglass",
+        "provider_name": "Easyshot",
         "provider_url": base,
         "title": v.title,
         "author_name": author,
