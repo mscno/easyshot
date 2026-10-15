@@ -37,6 +37,10 @@ pub struct Video {
     pub updated_at: i64,
     pub ready_at: Option<i64>,
     pub expires_at: i64,
+    /// Bytes the app reports as uploaded while still recording (`POST …/progress`).
+    pub uploaded_bytes: i64,
+    /// When the app reported that recording stopped; `None` while still recording.
+    pub recording_ended_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, toasty::Model)]
@@ -47,6 +51,8 @@ pub struct Comment {
     #[index]
     pub item_id: String,
     pub workspace_id: Option<String>,
+    /// The item owner, so changes reach their library (see `migrations/0006_…`).
+    pub owner_id: Option<String>,
     /// Set for signed-in members; `None` for guests.
     pub user_id: Option<String>,
     pub author_name: String,
@@ -63,6 +69,7 @@ pub struct Reaction {
     #[index]
     pub item_id: String,
     pub workspace_id: Option<String>,
+    pub owner_id: Option<String>,
     pub user_id: Option<String>,
     pub emoji: String,
     pub timestamp_ms: Option<i64>,
@@ -79,6 +86,7 @@ pub struct ItemView {
     pub workspace_id: Option<String>,
     pub viewer_hash: String,
     pub first_seen: i64,
+    pub owner_id: Option<String>,
 }
 
 pub fn models() -> toasty::ModelSet {

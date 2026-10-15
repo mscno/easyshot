@@ -30,11 +30,10 @@ use super::layout::{Meta, ago, clock, plural, shell};
 use super::{Member, WebResult, csp, fingerprint, limit, member, scope_of, state};
 use crate::repo::{self, now_ms};
 use crate::state::AppState;
-use crate::video::live::{Change, Subscription};
+use crate::video::live::{Change, Hub, StreamSlot, Subscription, next_ping, try_ping};
 use crate::video::model::{Comment, Reaction, Video};
 use crate::video::scope::{Access, Scope, Visibility};
 use crate::video::service::{self, Author, MEDIA_URL_TTL, SHORT_URL_TTL};
-use tokio::sync::broadcast;
 
 path_param!(pub slug);
 
@@ -155,7 +154,7 @@ pub async fn watch(cx: &Cx) -> Result<impl View> {
         shell(
             meta: meta,
             signed_in: signed_in,
-            <div class="watch" data-init=(live_expr.as_str())>
+            <div id="watch" class="watch" data-init=(live_expr.as_str())>
                 <div class="watch-main">
                     player_region(
                         video: v.clone(),
@@ -318,7 +317,7 @@ pub async fn player_region(
             } else {
                 <div class="processing">
                     <div class="spinner" aria-hidden="true"></div>
-                    <p><strong>"Still uploading…"</strong></p>
+                    <p><strong>(upload_status(&v))</strong></p>
                     <p class="muted">
                         "This page updates by itself when the recording is ready."
                     </p>
@@ -326,6 +325,17 @@ pub async fn player_region(
             }
         </section>
     })
+}
+
+/// What a pending recording is doing, from the app's progress reports.
+pub fn upload_status(v: &Video) -> String {
+    let mb = |b: i64| format!("{:.1} MB", b as f64 / 1_048_576.0);
+    match (v.recording_ended_at, v.uploaded_bytes) {
+        (None, 0) => "Recording live…".into(),
+        (None, b) => format!("Recording live… {} uploaded", mb(b)),
+        (Some(_), 0) => "Finishing…".into(),
+        (Some(_), b) => format!("Finishing… {} uploaded", mb(b)),
+    }
 }
 
 /// Comment and reaction positions along the timeline; buttons seek the player.
@@ -922,8 +932,12 @@ struct Live {
     cx: Cx,
     st: AppState,
     scope: Scope,
+    /// The session the stream was opened with; when it ends, the page signs out.
+    session_id: Option<uuid::Uuid>,
     video: Video,
     sub: Subscription,
+    session: Option<Subscription>,
+    _slot: StreamSlot,
     queue: std::collections::VecDeque<Event>,
     gone: bool,
     opened: Instant,
@@ -950,16 +964,52 @@ impl Dirty {
 }
 
 impl Live {
+    /// Re-authorize, then re-render the dirty regions from the database.
     async fn render(&mut self, mut d: Dirty) -> Result<()> {
+        // The viewer is re-read on every render: a revoked session or a password change
+        // applies on the next patch, not on the next page load.
+        let m = member(&self.cx).await?;
+        if self.session_id.is_some() && m.as_ref().map(|m| m.session_id) != self.session_id {
+            let next = format!("/v/{}", self.video.slug);
+            return self.end_with(super::signed_out_patch(&next));
+        }
+        self.scope = scope_of(&m);
         let st = &self.st;
         let Some(fresh) = service::resolve_share_link(st, &self.scope, &self.video.slug)
             .await
             .web()?
-            .filter(|v| v.id == self.video.id && self.scope.access(v, true) != Access::Denied)
+            .filter(|v| v.id == self.video.id)
         else {
-            return self.gone().await;
+            return self.unavailable().await;
         };
-        if fresh.status != self.video.status || fresh.transcript_key != self.video.transcript_key {
+        let cookie = unlock_jar(&self.cx).get(&service::unlock_cookie_name(&fresh));
+        let unlocked = service::check_unlock(st, &fresh, cookie.as_ref().map(|c| c.value()));
+        match self.scope.access(&fresh, unlocked) {
+            Access::Allowed => {}
+            Access::Denied => return self.unavailable().await,
+            Access::NeedsPassword => {
+                let cx = &self.cx;
+                let slug = fresh.slug.clone();
+                let html = view! {
+                    cx =>
+                    <div id="watch" class="watch-locked">
+                        password_gate(slug: slug, error: None)
+                    </div>
+                }
+                .single()
+                .await?
+                .render(cx);
+                return self.end_with(PatchElements::new(html));
+            }
+        }
+        let old = &self.video;
+        if fresh.status != old.status
+            || fresh.transcript_key != old.transcript_key
+            || fresh.thumbnail_key != old.thumbnail_key
+            || (fresh.status != "ready"
+                && (fresh.uploaded_bytes != old.uploaded_bytes
+                    || fresh.recording_ended_at != old.recording_ended_at))
+        {
             d.player = true;
         }
         self.video = fresh;
@@ -1036,20 +1086,32 @@ impl Live {
         Ok(())
     }
 
-    async fn gone(&mut self) -> Result<()> {
+    /// Queue a final patch and end the stream.
+    fn end_with(&mut self, patch: PatchElements) -> Result<()> {
         self.gone = true;
+        self.queue.push_back(patch.into());
+        Ok(())
+    }
+
+    /// Deleted, made private or expired: replace the page with a notice.
+    async fn unavailable(&mut self) -> Result<()> {
         let cx = &self.cx;
         let html = view! {
             cx =>
-            <p id="live-notice" class="notice error" role="status">
-                "This recording is no longer available."
-            </p>
+            <div id="watch" class="watch-gone">
+                <section class="card narrow">
+                    <h1>"Recording unavailable"</h1>
+                    <p class="muted" role="status">
+                        "This recording was deleted, made private, or has expired."
+                    </p>
+                    <a class="button" href="/">"Easyshot home"</a>
+                </section>
+            </div>
         }
         .single()
         .await?
         .render(cx);
-        self.queue.push_back(PatchElements::new(html).into());
-        Ok(())
+        self.end_with(PatchElements::new(html))
     }
 
     async fn next(mut self) -> Option<(Result<Event>, Live)> {
@@ -1061,35 +1123,22 @@ impl Live {
                 return None;
             }
             // Changes arrive through Postgres NOTIFY from every instance; a burst (several
-            // views, a comment plus its reaction) coalesces into one render.
-            let mut next = self.sub.rx.recv().await;
+            // views, a comment plus its reaction, progress ticks) coalesces into one render.
+            let mut ping = next_ping(&mut self.sub, self.session.as_mut()).await;
+            ping.as_ref()?;
             let mut dirty = Dirty::default();
-            loop {
-                match next {
-                    Ok(Change::Comments) => dirty.comments = true,
-                    Ok(Change::Reactions) => dirty.reactions = true,
-                    Ok(Change::Video | Change::Views) => dirty.head = true,
-                    Ok(Change::Screenshots) => {}
-                    Ok(Change::Gone) => {
-                        if let Err(e) = self.gone().await {
-                            return Some((Err(e), self));
-                        }
-                        break;
-                    }
-                    Ok(Change::Resync) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                        dirty = Dirty::all()
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return None,
+            while let Some(p) = ping {
+                match p.change {
+                    Change::Comments => dirty.comments = true,
+                    Change::Reactions => dirty.reactions = true,
+                    Change::Video | Change::Views => dirty.head = true,
+                    // Gone, a session change or a resync: re-check access and render it all.
+                    Change::Gone | Change::Session | Change::Resync => dirty = Dirty::all(),
+                    _ => {}
                 }
-                next = match self.sub.rx.try_recv() {
-                    Ok(c) => Ok(c),
-                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                        Err(broadcast::error::RecvError::Lagged(n))
-                    }
-                    Err(_) => break,
-                };
+                ping = try_ping(&mut self.sub, self.session.as_mut());
             }
-            if self.gone || !(dirty.head || dirty.player || dirty.comments || dirty.reactions) {
+            if !(dirty.head || dirty.player || dirty.comments || dirty.reactions) {
                 continue;
             }
             if let Err(e) = self.render(dirty).await {
@@ -1107,13 +1156,21 @@ pub async fn live(cx: &Cx) -> Result<Sse<impl Stream<Item = Result<Event>> + Sen
         .ok()
         .and_then(|q| q.since)
         .unwrap_or(0);
+    let slot = super::admit_stream(cx, &w.member)?;
     let sub = st.live.subscribe(&w.video.id);
+    let session = w
+        .member
+        .as_ref()
+        .map(|m| st.live.subscribe(&Hub::session_topic(&m.session_id.to_string())));
     let mut live = Live {
         cx: cx.clone(),
         st,
         scope: w.scope,
+        session_id: w.member.as_ref().map(|m| m.session_id),
         video: w.video,
         sub,
+        session,
+        _slot: slot,
         queue: Default::default(),
         gone: false,
         opened: Instant::now(),

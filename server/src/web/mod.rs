@@ -5,7 +5,9 @@
 
 pub mod account;
 pub mod assets;
+pub mod auth;
 pub mod layout;
+pub mod settings;
 pub mod watch;
 
 use std::time::Duration;
@@ -26,10 +28,13 @@ use topcoat::{
 };
 use uuid::Uuid;
 
+use topcoat::datastar::PatchElements;
+
 use crate::auth::SESSION_TTL_DAYS;
 use crate::error::AppError;
 use crate::repo::{self, now_ms};
 use crate::state::AppState;
+use crate::video::live::StreamSlot;
 use crate::video::scope::Scope;
 
 /// Build the public router: web pages plus the mounted JSON API.
@@ -52,11 +57,31 @@ pub fn router(state: AppState) -> Router {
         .route(TowerRoute::new(Method::GET, "/healthz", api))
         .route(assets::serve_static)
         .page(account::landing)
-        .page(account::login_page)
-        .route(account::login_submit)
-        .route(account::login_verify)
-        .route(account::logout)
+        .page(auth::signup_page)
+        .route(auth::signup_submit)
+        .page(auth::verify_page)
+        .route(auth::verify_submit)
+        .route(auth::verify_resend)
+        .page(auth::login_page)
+        .route(auth::login_submit)
+        .page(auth::code_page)
+        .route(auth::code_submit)
+        .page(auth::forgot_page)
+        .route(auth::forgot_submit)
+        .route(auth::reset_submit)
+        .route(auth::logout)
+        .route(settings::account)
+        .route(settings::verify_send)
+        .route(settings::verify)
+        .route(settings::change_password)
+        .route(settings::revoke_session)
+        .route(settings::revoke_others)
+        .route(settings::create_token)
+        .route(settings::revoke_token)
+        .route(settings::delete_account)
+        .route(settings::live)
         .page(account::library)
+        .route(account::library_live)
         .route(account::item_rename)
         .route(account::item_visibility)
         .route(account::item_delete)
@@ -84,6 +109,9 @@ pub fn state(cx: &Cx) -> &AppState {
 pub struct Member {
     pub user_id: Uuid,
     pub email: String,
+    /// The `sessions` row behind the cookie (not the token).
+    pub session_id: Uuid,
+    pub email_verified: bool,
 }
 
 impl Member {
@@ -103,14 +131,122 @@ pub async fn member(cx: &Cx) -> Result<Option<Member>> {
         return Ok(None);
     };
     let st = state(cx);
-    let row = repo::find_session(&st.db, &hex(&hash[..]), now_ms())
+    let now = now_ms();
+    let Some(r) = repo::find_session(&st.db, &hex(&hash[..]), now)
+        .await
+        .map_err(AppError::from)
+        .web()?
+    else {
+        return Ok(None);
+    };
+    // "Last used" on the account page; written at most every few minutes per session.
+    if r.last_used_at.is_none_or(|t| now - t > 5 * 60_000) {
+        repo::touch_session(&st.db, r.credential_id, now)
+            .await
+            .map_err(AppError::from)
+            .web()?;
+    }
+    Ok(Some(Member {
+        user_id: r.user_id,
+        email: r.email,
+        session_id: r.credential_id,
+        email_verified: r.email_verified,
+    }))
+}
+
+/// Replace any session on this browser with a fresh one for `user_id` (new token, new
+/// row), so a token planted before sign-in never becomes authenticated.
+pub async fn start_session(cx: &Cx, user_id: Uuid) -> Result<()> {
+    let st = state(cx);
+    if let Some(old) = session::stop(cx).await? {
+        repo::delete_session_by_hash(&st.db, &hex(&old[..]))
+            .await
+            .map_err(AppError::from)
+            .web()?;
+    }
+    let s = session::start(cx).await?;
+    let now = now_ms();
+    let expires = s
+        .expires_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(now);
+    let device = browser_name(cx);
+    repo::insert_session(
+        &st.db,
+        user_id,
+        &hex(&s.token_hash[..]),
+        Some(&device),
+        now,
+        expires,
+    )
+    .await
+    .map_err(AppError::from)
+    .web()?;
+    repo::touch_user(&st.db, user_id, now)
         .await
         .map_err(AppError::from)
         .web()?;
-    Ok(row.map(|r| Member {
-        user_id: r.user_id,
-        email: r.email,
-    }))
+    Ok(())
+}
+
+/// A short label for the sessions list: "Safari on macOS", "Chrome on Windows", …
+pub fn browser_name(cx: &Cx) -> String {
+    let (_, ua) = fingerprint(cx);
+    let browser = [
+        ("Edg/", "Edge"),
+        ("Firefox/", "Firefox"),
+        ("Chrome/", "Chrome"),
+        ("Safari/", "Safari"),
+    ]
+    .iter()
+    .find(|(k, _)| ua.contains(k))
+    .map(|(_, n)| *n)
+    .unwrap_or("Browser");
+    let os = [
+        ("iPhone", "iOS"),
+        ("iPad", "iPadOS"),
+        ("Android", "Android"),
+        ("Mac OS X", "macOS"),
+        ("Windows", "Windows"),
+        ("Linux", "Linux"),
+    ]
+    .iter()
+    .find(|(k, _)| ua.contains(k))
+    .map(|(_, n)| *n);
+    match os {
+        Some(os) => format!("{browser} on {os}"),
+        None => browser.to_string(),
+    }
+}
+
+/// Live streams one session may hold open at once (tabs × pages).
+pub const MAX_STREAMS_PER_SESSION: usize = 12;
+/// Anonymous viewers are counted per client address instead.
+pub const MAX_STREAMS_PER_ADDRESS: usize = 24;
+
+/// Reserve a live-stream slot for this viewer, or answer 429.
+pub fn admit_stream(cx: &Cx, member: &Option<Member>) -> Result<StreamSlot> {
+    let (key, max) = match member {
+        Some(m) => (format!("s:{}", m.session_id), MAX_STREAMS_PER_SESSION),
+        None => (format!("ip:{}", fingerprint(cx).0), MAX_STREAMS_PER_ADDRESS),
+    };
+    state(cx)
+        .live
+        .admit(&key, max)
+        .ok_or_else(|| too_many_requests(5).into())
+}
+
+/// The patch that sends a page whose session ended to sign-in. `next` must be a local path
+/// we built (it is placed inside a Datastar expression).
+pub fn signed_out_patch(next: &str) -> PatchElements {
+    let next: String = next
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_'))
+        .collect();
+    PatchElements::new(format!(
+        "<div id=\"live-redirect\" hidden data-init=\"window.location.assign('/login?next={next}')\"></div>"
+    ))
 }
 
 pub fn scope_of(member: &Option<Member>) -> Scope {

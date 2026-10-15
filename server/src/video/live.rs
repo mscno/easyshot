@@ -1,12 +1,15 @@
 //! Live updates for open pages, across every server instance.
 //!
-//! Database triggers (`migrations/0005_live_notify.sql`) `NOTIFY easyshot_live` with ids and
-//! kinds only. Each process holds one `LISTEN` connection, started when the first page
-//! subscribes, and fans notifications out to per-topic broadcast channels. A topic is an
-//! item id (the watch page) or [`Hub::user_topic`] (pages listing one owner's items).
+//! Database triggers (`migrations/0005_live_notify.sql`, `0006_…`) `NOTIFY easyshot_live`
+//! with ids and kinds only. Each process holds one `LISTEN` connection, started when the
+//! first page subscribes, and fans notifications out to per-topic broadcast channels.
 //! Streams re-read what changed under their own RLS context, so payloads never carry
 //! content or grant access. After every (re)connect the hub sends [`Change::Resync`] to all
 //! topics, covering anything missed while the connection was down.
+//!
+//! Topics: an item id (the watch page), [`Hub::user_topic`] (pages listing or managing one
+//! owner's things: library, account) and [`Hub::session_topic`] (every stream opened with
+//! that session, so revoking it signs those pages out at once).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +25,7 @@ pub const CHANNEL: &str = "easyshot_live";
 pub enum Change {
     Comments,
     Reactions,
-    /// Upload finished, title/privacy changed: re-render the header/player.
+    /// Upload progress or completion, title/privacy changed: re-render the header/player.
     Video,
     /// A new unique view: re-render the counts.
     Views,
@@ -30,11 +33,36 @@ pub enum Change {
     Gone,
     /// Owner topics: one of the owner's screenshots changed.
     Screenshots,
+    /// Owner topics: a session was created, renamed or removed.
+    Sessions,
+    /// Owner topics: an API token was created or revoked.
+    Tokens,
+    /// Owner topics: the account itself (email, verification, password) changed.
+    Account,
+    /// Session topics: this session changed or was removed; re-check it.
+    Session,
     /// The LISTEN connection (re)started; re-render everything.
     Resync,
 }
 
-/// One trigger payload; see the migration.
+/// What a subscriber receives: the change and the id of the row it concerns (empty for
+/// [`Change::Resync`]), so list pages can re-render just that row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ping {
+    pub change: Change,
+    pub item: Arc<str>,
+}
+
+impl Ping {
+    pub fn new(change: Change, item: &str) -> Ping {
+        Ping {
+            change,
+            item: Arc::from(item),
+        }
+    }
+}
+
+/// One trigger payload; see the migrations.
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct Notice {
     pub t: String,
@@ -47,26 +75,31 @@ pub struct Notice {
 impl Notice {
     /// `(topic, change)` pairs this notice fans out to.
     pub fn routes(&self) -> Vec<(String, Change)> {
-        let item = match (self.t.as_str(), self.op.as_str()) {
-            ("video", "delete") => Some(Change::Gone),
-            ("video", _) => Some(Change::Video),
-            ("comments", _) => Some(Change::Comments),
-            ("reactions", _) => Some(Change::Reactions),
-            ("views", _) => Some(Change::Views),
-            _ => None,
+        let change = match (self.t.as_str(), self.op.as_str()) {
+            ("video", "delete") => Change::Gone,
+            ("video", _) => Change::Video,
+            ("comments", _) => Change::Comments,
+            ("reactions", _) => Change::Reactions,
+            ("views", _) => Change::Views,
+            ("screenshot", _) => Change::Screenshots,
+            ("session", _) => Change::Sessions,
+            ("token", _) => Change::Tokens,
+            ("user", _) => Change::Account,
+            _ => return Vec::new(),
         };
-        let mut out: Vec<(String, Change)> =
-            item.map(|c| (self.item.clone(), c)).into_iter().collect();
+        let mut out = Vec::new();
+        match change {
+            Change::Gone | Change::Video | Change::Comments | Change::Reactions | Change::Views => {
+                out.push((self.item.clone(), change))
+            }
+            Change::Sessions => out.push((Hub::session_topic(&self.item), Change::Session)),
+            _ => {}
+        }
         if let Some(owner) = &self.owner {
-            let c = if self.t == "screenshot" {
-                Change::Screenshots
-            } else {
-                Change::Video
-            };
-            out.push((Hub::user_topic(owner), c));
+            out.push((Hub::user_topic(owner), change));
         }
         if let Some(ws) = &self.ws {
-            out.push((format!("ws:{ws}"), item.unwrap_or(Change::Screenshots)));
+            out.push((format!("ws:{ws}"), change));
         }
         out
     }
@@ -76,7 +109,9 @@ impl Notice {
 const CAPACITY: usize = 64;
 
 pub struct Hub {
-    channels: Mutex<HashMap<String, broadcast::Sender<Change>>>,
+    channels: Mutex<HashMap<String, broadcast::Sender<Ping>>>,
+    /// Open streams per key (a session), see [`Hub::admit`].
+    open: Arc<Mutex<HashMap<String, usize>>>,
     /// Where to LISTEN (the app-role URL); `None` disables cross-process delivery.
     url: Option<String>,
     started: AtomicBool,
@@ -92,7 +127,7 @@ impl Default for Hub {
 pub struct Subscription {
     hub: Arc<Hub>,
     topic: String,
-    pub rx: broadcast::Receiver<Change>,
+    pub rx: broadcast::Receiver<Ping>,
 }
 
 impl Drop for Subscription {
@@ -107,10 +142,29 @@ impl Drop for Subscription {
     }
 }
 
+/// One admitted stream; see [`Hub::admit`].
+pub struct StreamSlot {
+    open: Arc<Mutex<HashMap<String, usize>>>,
+    key: String,
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let mut open = self.open.lock().unwrap();
+        if let Some(n) = open.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.key);
+            }
+        }
+    }
+}
+
 impl Hub {
     pub fn new(url: Option<String>) -> Hub {
         Hub {
             channels: Mutex::default(),
+            open: Arc::default(),
             url,
             started: AtomicBool::new(false),
         }
@@ -118,6 +172,25 @@ impl Hub {
 
     pub fn user_topic(user_id: &str) -> String {
         format!("user:{user_id}")
+    }
+
+    pub fn session_topic(session_id: &str) -> String {
+        format!("session:{session_id}")
+    }
+
+    /// Count one more open stream for `key`; `None` once `max` are open. The slot frees
+    /// when the returned guard drops (the stream ends or the client goes away).
+    pub fn admit(&self, key: &str, max: usize) -> Option<StreamSlot> {
+        let mut open = self.open.lock().unwrap();
+        let n = open.entry(key.to_string()).or_insert(0);
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(StreamSlot {
+            open: self.open.clone(),
+            key: key.to_string(),
+        })
     }
 
     /// Subscribe to a topic; the first subscription in the process starts the listener.
@@ -141,15 +214,16 @@ impl Hub {
         }
     }
 
-    pub fn publish(&self, topic: &str, change: Change) {
+    pub fn publish(&self, topic: &str, ping: Ping) {
         if let Some(tx) = self.channels.lock().unwrap().get(topic) {
-            let _ = tx.send(change);
+            let _ = tx.send(ping);
         }
     }
 
     fn publish_all(&self, change: Change) {
+        let ping = Ping::new(change, "");
         for tx in self.channels.lock().unwrap().values() {
-            let _ = tx.send(change);
+            let _ = tx.send(ping.clone());
         }
     }
 
@@ -157,7 +231,7 @@ impl Hub {
         match serde_json::from_str::<Notice>(payload) {
             Ok(n) => {
                 for (topic, change) in n.routes() {
-                    self.publish(&topic, change);
+                    self.publish(&topic, Ping::new(change, &n.item));
                 }
             }
             Err(e) => tracing::warn!(error = %e, "bad live notification"),
@@ -167,6 +241,33 @@ impl Hub {
     pub fn watched(&self) -> usize {
         self.channels.lock().unwrap().len()
     }
+}
+
+/// Receive the next ping from either subscription (`b` is optional: anonymous streams have
+/// no session topic). `Lagged` and `Closed` are reported as a resync / `None`.
+pub async fn next_ping(a: &mut Subscription, b: Option<&mut Subscription>) -> Option<Ping> {
+    let r = match b {
+        Some(b) => tokio::select! {
+            r = a.rx.recv() => r,
+            r = b.rx.recv() => r,
+        },
+        None => a.rx.recv().await,
+    };
+    match r {
+        Ok(p) => Some(p),
+        Err(broadcast::error::RecvError::Lagged(_)) => Some(Ping::new(Change::Resync, "")),
+        Err(broadcast::error::RecvError::Closed) => None,
+    }
+}
+
+/// A ping already queued on either subscription, without waiting.
+pub fn try_ping(a: &mut Subscription, b: Option<&mut Subscription>) -> Option<Ping> {
+    let take = |s: &mut Subscription| match s.rx.try_recv() {
+        Ok(p) => Some(p),
+        Err(broadcast::error::TryRecvError::Lagged(_)) => Some(Ping::new(Change::Resync, "")),
+        Err(_) => None,
+    };
+    take(a).or_else(|| b.and_then(take))
 }
 
 /// Hold a LISTEN session for the life of the process, reconnecting with backoff.
@@ -197,16 +298,20 @@ async fn listen(hub: Arc<Hub>, url: String) {
 mod tests {
     use super::*;
 
+    fn c(p: Ping) -> Change {
+        p.change
+    }
+
     #[tokio::test]
     async fn fan_out_and_cleanup() {
         let hub = Arc::new(Hub::default());
-        hub.publish("v", Change::Comments); // nobody listening: no channel
+        hub.publish("v", Ping::new(Change::Comments, "v")); // nobody listening: no channel
         assert_eq!(hub.watched(), 0);
         let mut a = hub.subscribe("v");
         let mut b = hub.subscribe("v");
-        hub.publish("v", Change::Reactions);
-        assert_eq!(a.rx.recv().await.unwrap(), Change::Reactions);
-        assert_eq!(b.rx.recv().await.unwrap(), Change::Reactions);
+        hub.publish("v", Ping::new(Change::Reactions, "v"));
+        assert_eq!(c(a.rx.recv().await.unwrap()), Change::Reactions);
+        assert_eq!(c(b.rx.recv().await.unwrap()), Change::Reactions);
         drop(a);
         assert_eq!(hub.watched(), 1);
         drop(b);
@@ -214,21 +319,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_notifications_to_item_and_owner_topics() {
+    async fn routes_notifications_to_item_owner_and_session_topics() {
         let hub = Arc::new(Hub::default());
         let mut item = hub.subscribe("v1");
         let mut owner = hub.subscribe(&Hub::user_topic("u1"));
+        let mut session = hub.subscribe(&Hub::session_topic("s1"));
         hub.dispatch(r#"{"t":"video","item":"v1","owner":"u1","ws":null,"op":"update"}"#);
-        assert_eq!(item.rx.recv().await.unwrap(), Change::Video);
-        assert_eq!(owner.rx.recv().await.unwrap(), Change::Video);
-        hub.dispatch(r#"{"t":"comments","item":"v1","owner":null,"ws":null,"op":"insert"}"#);
-        assert_eq!(item.rx.recv().await.unwrap(), Change::Comments);
+        assert_eq!(c(item.rx.recv().await.unwrap()), Change::Video);
+        let p = owner.rx.recv().await.unwrap();
+        assert_eq!((p.change, &*p.item), (Change::Video, "v1"));
+        hub.dispatch(r#"{"t":"comments","item":"v1","owner":"u1","ws":null,"op":"insert"}"#);
+        assert_eq!(c(item.rx.recv().await.unwrap()), Change::Comments);
+        assert_eq!(c(owner.rx.recv().await.unwrap()), Change::Comments);
         hub.dispatch(r#"{"t":"video","item":"v1","owner":"u1","ws":null,"op":"delete"}"#);
-        assert_eq!(item.rx.recv().await.unwrap(), Change::Gone);
+        assert_eq!(c(item.rx.recv().await.unwrap()), Change::Gone);
+        assert_eq!(c(owner.rx.recv().await.unwrap()), Change::Gone);
         hub.dispatch(r#"{"t":"screenshot","item":"s1","owner":"u1","ws":null,"op":"insert"}"#);
-        assert_eq!(owner.rx.recv().await.unwrap(), Change::Video);
-        assert_eq!(owner.rx.recv().await.unwrap(), Change::Screenshots);
+        assert_eq!(c(owner.rx.recv().await.unwrap()), Change::Screenshots);
+        hub.dispatch(r#"{"t":"session","item":"s1","owner":"u1","ws":null,"op":"delete"}"#);
+        assert_eq!(c(session.rx.recv().await.unwrap()), Change::Session);
+        assert_eq!(c(owner.rx.recv().await.unwrap()), Change::Sessions);
+        hub.dispatch(r#"{"t":"token","item":"t1","owner":"u1","ws":null,"op":"insert"}"#);
+        assert_eq!(c(owner.rx.recv().await.unwrap()), Change::Tokens);
         hub.dispatch("not json");
         assert!(item.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn admits_a_bounded_number_of_streams() {
+        let hub = Hub::default();
+        let a = hub.admit("s", 2).unwrap();
+        let _b = hub.admit("s", 2).unwrap();
+        assert!(hub.admit("s", 2).is_none());
+        drop(a);
+        assert!(hub.admit("s", 2).is_some());
     }
 }

@@ -180,7 +180,7 @@ impl App {
     async fn web_login(&self, email: &str) -> String {
         let r = self
             .form(
-                "/login",
+                "/login/code",
                 &[("email", email), ("next", "/library")],
                 None,
                 false,
@@ -191,7 +191,7 @@ impl App {
         let code = self.code_for(email).await;
         let r = self
             .form(
-                "/login/verify",
+                "/verify",
                 &[("email", email), ("code", &code), ("next", "/library")],
                 None,
                 false,
@@ -203,13 +203,18 @@ impl App {
     }
 
     async fn code_for(&self, email: &str) -> String {
+        self.mailed_code(email, "sign-in code").await
+    }
+
+    /// The latest 6-digit code mailed to `email` with `subject` in its subject line.
+    async fn mailed_code(&self, email: &str, subject: &str) -> String {
         for _ in 0..50 {
             if let Some(m) = self
                 .mail
                 .sent()
                 .into_iter()
                 .rev()
-                .find(|m| m.to == email && m.subject.contains("sign-in code"))
+                .find(|m| m.to == email && m.subject.contains(subject))
             {
                 return m
                     .text
@@ -326,8 +331,8 @@ async fn live_updates_cross_server_instances() {
     assert!(seen.contains("Renamed on A"), "{seen}");
     a.api("DELETE", &format!("/v1/videos/{id}"), Some(&token), None)
         .await;
-    let seen = read_until(&mut body, "no longer available", Duration::from_secs(5)).await;
-    assert!(seen.contains("no longer available"), "{seen}");
+    let seen = read_until(&mut body, "Recording unavailable", Duration::from_secs(5)).await;
+    assert!(seen.contains("Recording unavailable"), "{seen}");
     a.t.finish().await;
 }
 
@@ -381,7 +386,7 @@ async fn instant_link_upload_and_watch() {
     // The link works before the upload finishes.
     let page = app.get(&format!("/v/{slug}"), None).await;
     assert_eq!(page.status, StatusCode::OK);
-    assert!(page.body.contains("Still uploading"));
+    assert!(page.body.contains("Recording live"));
     assert_eq!(
         app.get(&format!("/v/{slug}/media"), None).await.status,
         StatusCode::NOT_FOUND
@@ -815,12 +820,12 @@ async fn sign_in_library_and_owner_actions() {
 
     // Unknown emails get the same answer and no mail.
     let r = app
-        .form("/login", &[("email", "nobody@example.com")], None, false)
+        .form("/login/code", &[("email", "nobody@example.com")], None, false)
         .await;
     assert!(r.body.contains("name=\"code\""));
     let bad = app
         .form(
-            "/login/verify",
+            "/verify",
             &[("email", "owner@example.com"), ("code", "000000")],
             None,
             false,
