@@ -1,36 +1,72 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-    <key>CFBundleName</key><string>Easyshot</string>
-    <key>CFBundleDisplayName</key><string>Easyshot</string>
-    <key>CFBundleIdentifier</key><string>no.paraply.easyshot</string>
-    <key>CFBundleExecutable</key><string>Easyshot</string>
-    <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>1.8.0</string>
-    <key>CFBundleVersion</key><string>14</string>
-    <key>LSMinimumSystemVersion</key><string>26.0</string>
-    <key>LSUIElement</key><true/>
-    <key>CFBundleURLTypes</key><array><dict>
-        <key>CFBundleURLName</key><string>no.paraply.easyshot.capture</string>
-        <key>CFBundleURLSchemes</key><array><string>easyshot</string></array>
-        <key>CFBundleTypeRole</key><string>Editor</string>
-
-</dict></array>
-    <key>NSPrincipalClass</key><string>NSApplication</string>
-    <key>NSHighResolutionCapable</key><true/>
-    <key>NSMicrophoneUsageDescription</key><string>Easyshot records your microphone when you enable voice recording.</string>
-    <key>NSSpeechRecognitionUsageDescription</key><string>Easyshot transcribes your voice on this Mac to add captions to recordings you share.</string>
-    <key>NSCameraUsageDescription</key><string>Easyshot adds your webcam to recordings when you enable the camera bubble.</string>
-    <key>NSScreenCaptureUsageDescription</key><string>Easyshot captures screenshots and recordings you choose, saving them locally.</string>
-    <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
-    <key>NSHumanReadableCopyright</key><string>Easyshot · 2026</string>
-
-    <key>SUFeedURL</key><string>https://github.com/mscno/shotglass/releases/latest/download/appcast.xml</string>
-    <key>SUPublicEDKey</key><string>JShYvnOt9ECJHGuzc9epe+OPd27vAJFRcp/FuoNJn6k=</string>
-    <key>SUEnableAutomaticChecks</key><true/>
-    <key>SUAutomaticallyUpdate</key><false/>
-    <key>SUSendProfileInfo</key><false/>
-    <key>SUVerifyUpdateBeforeExtraction</key><true/>
-    <key>SURequireSignedFeed</key><true/>
-</dict></plist>
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Easyshot</string>
+	<key>CFBundleExecutable</key>
+	<string>Easyshot</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>no.paraply.easyshot</string>
+	<key>CFBundleName</key>
+	<string>Easyshot</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2.0.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>no.paraply.easyshot.capture</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>easyshot</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>15</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Easyshot adds your webcam to recordings when you enable the camera bubble.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Easyshot · 2026</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Easyshot records your microphone when you enable voice recording.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Easyshot captures screenshots and recordings you choose, saving them locally.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Easyshot transcribes your voice on this Mac to add captions to recordings you share.</string>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/mscno/shotglass/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>JShYvnOt9ECJHGuzc9epe+OPd27vAJFRcp/FuoNJn6k=</string>
+	<key>SURequireSignedFeed</key>
+	<true/>
+	<key>SUSendProfileInfo</key>
+	<false/>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
+</dict>
+</plist>

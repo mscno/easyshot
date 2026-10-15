@@ -35,7 +35,33 @@ fn tls() -> DbResult<tokio_postgres_rustls::MakeRustlsConnect> {
 }
 
 fn config(url: &str) -> DbResult<Config> {
-    Config::from_str(url.trim()).map_err(|e| DbError::Other(format!("database url: {e}")))
+    Config::from_str(&libpq_tls_compat(url.trim()))
+        .map_err(|e| DbError::Other(format!("database url: {e}")))
+}
+
+/// tokio-postgres only parses `sslmode=disable|prefer|require` and rejects libpq's
+/// certificate parameters. Our TLS config always checks the chain and host name with the
+/// platform verifier, so `verify-ca`/`verify-full` become `require` and `sslrootcert`,
+/// `sslcert` and `sslkey` are dropped. The same URL then works for Toasty, which needs
+/// `sslmode=verify-full&sslrootcert=system` for managed providers such as PlanetScale.
+fn libpq_tls_compat(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let kept: Vec<String> = query
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .filter_map(|kv| match kv.split_once('=').map(|(k, v)| (k, v)) {
+            Some(("sslrootcert" | "sslcert" | "sslkey", _)) => None,
+            Some(("sslmode", "verify-ca" | "verify-full")) => Some("sslmode=require".to_string()),
+            _ => Some(kv.to_string()),
+        })
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
 }
 
 /// Open one connection. Notifications (and notices) go to `on_message`, if given; the
@@ -89,4 +115,33 @@ pub fn pg_err(e: tokio_postgres::Error) -> DbError {
         Some(d) => d.message().to_string(),
         None => e.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tls_url_tests {
+    use super::*;
+
+    #[test]
+    fn verify_modes_map_to_require_and_cert_params_drop() {
+        assert_eq!(
+            libpq_tls_compat("postgresql://u:p@h:5432/db?sslmode=verify-full&sslrootcert=system"),
+            "postgresql://u:p@h:5432/db?sslmode=require"
+        );
+        assert_eq!(
+            libpq_tls_compat("postgres://u@h/db?sslmode=verify-ca&application_name=x"),
+            "postgres://u@h/db?sslmode=require&application_name=x"
+        );
+        assert_eq!(
+            libpq_tls_compat("postgres://u@h/db?sslmode=disable"),
+            "postgres://u@h/db?sslmode=disable"
+        );
+        assert_eq!(
+            libpq_tls_compat("postgres://u@h/db?sslrootcert=/x.pem"),
+            "postgres://u@h/db"
+        );
+        assert_eq!(libpq_tls_compat("postgres://u@h/db"), "postgres://u@h/db");
+        let cfg =
+            config("postgresql://u:p@h:5432/db?sslmode=verify-full&sslrootcert=system").unwrap();
+        assert_eq!(cfg.get_ssl_mode(), SslMode::Require);
+    }
 }
