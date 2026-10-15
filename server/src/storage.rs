@@ -9,7 +9,7 @@ use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
 use aws_sdk_s3::presigning::PresigningConfig;
-use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
 use aws_sdk_s3::Client;
 
 use crate::config::Config;
@@ -49,6 +49,36 @@ pub trait ObjectStore: Send + Sync {
     ) -> StoreResult<String>;
     async fn head(&self, key: &str) -> StoreResult<Option<ObjectMeta>>;
     async fn delete_many(&self, keys: &[String]) -> StoreResult<()>;
+
+    /// Presigned GET with an explicit `Content-Disposition` (e.g. `attachment; filename=..`).
+    async fn presign_get_with(
+        &self,
+        key: &str,
+        ttl: Duration,
+        content_type: &str,
+        disposition: &str,
+    ) -> StoreResult<String>;
+    /// Small objects only (transcripts): `None` when missing, error when over `max` bytes.
+    async fn get_bytes(&self, key: &str, max: usize) -> StoreResult<Option<Vec<u8>>>;
+
+    // Multipart uploads: the client PUTs parts straight to presigned URLs while recording.
+    async fn create_multipart(&self, key: &str, content_type: &str) -> StoreResult<String>;
+    async fn presign_upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        ttl: Duration,
+    ) -> StoreResult<String>;
+    /// `parts` are `(part_number, etag)` in ascending order.
+    async fn complete_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[(i32, String)],
+    ) -> StoreResult<()>;
+    /// Idempotent: aborting an unknown or finished upload succeeds.
+    async fn abort_multipart(&self, key: &str, upload_id: &str) -> StoreResult<()>;
 }
 
 pub struct S3Store {
@@ -191,14 +221,155 @@ impl ObjectStore for S3Store {
         }
         Ok(())
     }
+
+    async fn presign_get_with(
+        &self,
+        key: &str,
+        ttl: Duration,
+        content_type: &str,
+        disposition: &str,
+    ) -> StoreResult<String> {
+        let req = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .response_content_type(content_type)
+            .response_content_disposition(disposition)
+            .presigned(PresigningConfig::expires_in(ttl).map_err(se)?)
+            .await
+            .map_err(se)?;
+        Ok(req.uri().to_string())
+    }
+
+    async fn get_bytes(&self, key: &str, max: usize) -> StoreResult<Option<Vec<u8>>> {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(o) => {
+                let too_big = || StoreError(format!("object larger than {max} bytes"));
+                if o.content_length().unwrap_or(0) as usize > max {
+                    return Err(too_big());
+                }
+                let bytes = o.body.collect().await.map_err(se)?.into_bytes();
+                if bytes.len() > max {
+                    return Err(too_big());
+                }
+                Ok(Some(bytes.to_vec()))
+            }
+            Err(e) => {
+                if e.as_service_error()
+                    .map(|s| s.is_no_such_key())
+                    .unwrap_or(false)
+                {
+                    Ok(None)
+                } else {
+                    Err(se(aws_sdk_s3::error::DisplayErrorContext(&e)))
+                }
+            }
+        }
+    }
+
+    async fn create_multipart(&self, key: &str, content_type: &str) -> StoreResult<String> {
+        let out = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_type(content_type)
+            .send()
+            .await
+            .map_err(|e| se(aws_sdk_s3::error::DisplayErrorContext(&e)))?;
+        out.upload_id()
+            .map(str::to_string)
+            .ok_or_else(|| StoreError("store returned no upload id".into()))
+    }
+
+    async fn presign_upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        ttl: Duration,
+    ) -> StoreResult<String> {
+        let req = self
+            .client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .presigned(PresigningConfig::expires_in(ttl).map_err(se)?)
+            .await
+            .map_err(se)?;
+        Ok(req.uri().to_string())
+    }
+
+    async fn complete_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[(i32, String)],
+    ) -> StoreResult<()> {
+        let parts = parts
+            .iter()
+            .map(|(n, tag)| CompletedPart::builder().part_number(*n).e_tag(tag).build())
+            .collect();
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| se(aws_sdk_s3::error::DisplayErrorContext(&e)))?;
+        Ok(())
+    }
+
+    async fn abort_multipart(&self, key: &str, upload_id: &str) -> StoreResult<()> {
+        match self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                if e.as_service_error().and_then(|s| s.code()) == Some("NoSuchUpload") {
+                    Ok(())
+                } else {
+                    Err(se(aws_sdk_s3::error::DisplayErrorContext(&e)))
+                }
+            }
+        }
+    }
 }
 
 /// In-memory fake used by tests.
 #[derive(Default)]
 pub struct MemoryStore {
     objects: Mutex<HashMap<String, ObjectMeta>>,
+    bytes: Mutex<HashMap<String, Vec<u8>>>,
+    uploads: Mutex<HashMap<String, MemUpload>>,
     fail_deletes: Mutex<bool>,
 }
+
+/// key, content type, part number -> (tag, size)
+type MemUpload = (String, String, HashMap<i32, (String, i64)>);
 
 impl MemoryStore {
     pub fn new() -> Self {
@@ -228,6 +399,29 @@ impl MemoryStore {
     }
     pub fn set_fail_deletes(&self, v: bool) {
         *self.fail_deletes.lock().unwrap() = v;
+    }
+    /// Simulate a client upload with content (readable through `get_bytes`).
+    pub fn put_bytes(&self, key: &str, bytes: &[u8], content_type: &str) {
+        self.put(key, bytes.len() as i64, content_type);
+        self.bytes
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), bytes.to_vec());
+    }
+    /// Simulate a client uploading one part; returns its ETag.
+    pub fn put_part(&self, upload_id: &str, part_number: i32, size: i64) -> String {
+        let tag = format!("\"tag-{upload_id}-{part_number}\"");
+        self.uploads
+            .lock()
+            .unwrap()
+            .get_mut(upload_id)
+            .expect("unknown upload")
+            .2
+            .insert(part_number, (tag.clone(), size));
+        tag
+    }
+    pub fn open_uploads(&self) -> usize {
+        self.uploads.lock().unwrap().len()
     }
 }
 
@@ -268,9 +462,81 @@ impl ObjectStore for MemoryStore {
             return Err(StoreError("simulated failure".into()));
         }
         let mut m = self.objects.lock().unwrap();
+        let mut b = self.bytes.lock().unwrap();
         for k in keys {
             m.remove(k);
+            b.remove(k);
         }
+        Ok(())
+    }
+    async fn presign_get_with(
+        &self,
+        key: &str,
+        ttl: Duration,
+        content_type: &str,
+        disposition: &str,
+    ) -> StoreResult<String> {
+        Ok(format!(
+            "https://store.test/get/{key}?ttl={}&response-content-type={}&response-content-disposition={}",
+            ttl.as_secs(),
+            content_type.replace('/', "%2F"),
+            disposition.split(';').next().unwrap_or("")
+        ))
+    }
+    async fn get_bytes(&self, key: &str, max: usize) -> StoreResult<Option<Vec<u8>>> {
+        match self.bytes.lock().unwrap().get(key) {
+            Some(b) if b.len() > max => Err(StoreError("too large".into())),
+            other => Ok(other.cloned()),
+        }
+    }
+    async fn create_multipart(&self, key: &str, content_type: &str) -> StoreResult<String> {
+        let id = format!("up-{}", uuid::Uuid::new_v4().simple());
+        self.uploads.lock().unwrap().insert(
+            id.clone(),
+            (key.to_string(), content_type.to_string(), HashMap::new()),
+        );
+        Ok(id)
+    }
+    async fn presign_upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        ttl: Duration,
+    ) -> StoreResult<String> {
+        Ok(format!(
+            "https://store.test/part/{key}?uploadId={upload_id}&partNumber={part_number}&ttl={}",
+            ttl.as_secs()
+        ))
+    }
+    async fn complete_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[(i32, String)],
+    ) -> StoreResult<()> {
+        let mut uploads = self.uploads.lock().unwrap();
+        let (k, ct, stored) = uploads
+            .get(upload_id)
+            .ok_or_else(|| StoreError("NoSuchUpload".into()))?;
+        if k != key || parts.is_empty() {
+            return Err(StoreError("InvalidPart".into()));
+        }
+        let mut size = 0;
+        for (n, tag) in parts {
+            match stored.get(n) {
+                Some((t, s)) if t == tag => size += s,
+                _ => return Err(StoreError(format!("InvalidPart {n}"))),
+            }
+        }
+        let ct = ct.clone();
+        uploads.remove(upload_id);
+        drop(uploads);
+        self.put(key, size, &ct);
+        Ok(())
+    }
+    async fn abort_multipart(&self, _key: &str, upload_id: &str) -> StoreResult<()> {
+        self.uploads.lock().unwrap().remove(upload_id);
         Ok(())
     }
 }

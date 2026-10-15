@@ -27,7 +27,20 @@ pub struct Config {
     /// Block creating uploads until the account's email is confirmed.
     pub require_email_verification: bool,
     pub auth_code_ttl_minutes: i64,
+    /// Days a shared video stays available.
+    pub video_retention_days: i64,
+    /// Largest accepted recording, in bytes.
+    pub max_video_bytes: i64,
+    /// Key for password-unlock cookies and viewer hashes. Random per process when unset, so
+    /// unlocks and same-day view dedupe reset on restart.
+    pub web_secret: Option<String>,
+    /// Reverse-proxy hops in front of the server that set `X-Forwarded-For` (1 on Fly.io).
+    pub trusted_proxy_hops: usize,
+    /// Where the landing page sends people to get the Mac app.
+    pub download_url: String,
 }
+
+pub const DEFAULT_DOWNLOAD_URL: &str = "https://github.com/mscno/shotglass/releases/latest";
 
 fn parse_bool(s: &str) -> Option<bool> {
     match s.trim().to_ascii_lowercase().as_str() {
@@ -110,6 +123,11 @@ impl Config {
                 get("LETTERMINT_API_TOKEN").is_some(),
             )?,
             auth_code_ttl_minutes: number("AUTH_CODE_TTL_MINUTES", 10)?,
+            video_retention_days: number("VIDEO_RETENTION_DAYS", 90)?,
+            max_video_bytes: number("MAX_VIDEO_BYTES", 5 * 1024 * 1024 * 1024)?,
+            web_secret: get("WEB_SECRET"),
+            trusted_proxy_hops: non_negative("TRUSTED_PROXY_HOPS", 0)? as usize,
+            download_url: get("DOWNLOAD_URL").unwrap_or_else(|| DEFAULT_DOWNLOAD_URL.into()),
         })
         .and_then(|c| {
             if c.lettermint_api_token.is_some() && c.mail_from.is_none() {
@@ -148,6 +166,11 @@ impl Config {
             mail_from: None,
             require_email_verification: false,
             auth_code_ttl_minutes: 10,
+            video_retention_days: 90,
+            max_video_bytes: 5 * 1024 * 1024 * 1024,
+            web_secret: Some("test-web-secret".into()),
+            trusted_proxy_hops: 0,
+            download_url: DEFAULT_DOWNLOAD_URL.into(),
         }
     }
 }

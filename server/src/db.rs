@@ -103,6 +103,12 @@ macro_rules! vals {
 pub struct Row(Vec<Value>);
 
 impl Row {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
     fn value(&self, i: usize) -> DbResult<&Value> {
         self.0
             .get(i)
@@ -334,6 +340,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0002_auth_codes",
         include_str!("../migrations/0002_auth_codes.sql"),
     ),
+    ("0003_videos", include_str!("../migrations/0003_videos.sql")),
 ];
 
 /// Split a migration file on `;`, dropping `--` comment lines and blanks.

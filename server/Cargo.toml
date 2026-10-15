@@ -42,6 +42,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 thiserror = "2"
 lambda_http = { version = "1", optional = true }
+# Web presence: Topcoat SSR host + Datastar; Toasty models for the video domain.
+topcoat = { version = "0.10", default-features = false, features = ["router", "serve", "view", "cookie", "session", "datastar", "tower", "compression"] }
+toasty = { version = "0.11", default-features = false }
+toasty-core = "0.11"
+toasty-sql = "0.11"
+http = "1"
+bytes = "1"
+futures-util = "0.3"
+hmac = "0.12"
+html-escape = "0.2"
 
 [dev-dependencies]
 http-body-util = "0.1"
