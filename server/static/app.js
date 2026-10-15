@@ -127,6 +127,33 @@ rocket('easyshot-player', {
     observer.observe(host, { attributes: true, attributeFilter: ['data-poster', 'data-captions'] })
     cleanup(() => observer.disconnect())
 
+    // A long recording may outlive its storage signature. Re-enter the authorized
+    // same-origin media route after an expiry/network error, preserving playback position.
+    let playing = false
+    let position = 0
+    let refreshedAt = -Infinity
+    let restore = null
+    const onPlay = () => { playing = true }
+    const onPause = () => { if (!video.error) playing = false }
+    const remember = () => { if (!video.error) position = video.currentTime }
+    const onError = () => {
+      if (![2, 4].includes(video.error?.code) || performance.now() - refreshedAt < 30000) return
+      refreshedAt = performance.now()
+      restore = { position, playing }
+      video.load()
+    }
+    const onMetadata = () => {
+      if (!restore) return
+      const saved = restore
+      restore = null
+      video.currentTime = Math.min(saved.position, video.duration || saved.position)
+      if (saved.playing) video.play().catch(() => {})
+    }
+    for (const [event, handler] of [['play', onPlay], ['pause', onPause], ['timeupdate', remember], ['error', onError], ['loadedmetadata', onMetadata]]) {
+      video.addEventListener(event, handler)
+      cleanup(() => video.removeEventListener(event, handler))
+    }
+
     video.addEventListener('timeupdate', publish)
     video.addEventListener('seeked', publish)
     document.addEventListener('click', onClick)

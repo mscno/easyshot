@@ -40,7 +40,7 @@ pub const COMPLETE_BODY_LIMIT: usize = MAX_PARTS as usize * 160 + 64 * 1024;
 pub const PART_URL_TTL: Duration = Duration::from_secs(3600);
 pub const ASSET_PUT_TTL: Duration = Duration::from_secs(600);
 /// Media URLs on the watch page; long enough for a long video to keep seeking.
-pub const MEDIA_URL_TTL: Duration = Duration::from_secs(6 * 3600);
+pub const MEDIA_URL_TTL: Duration = Duration::from_secs(5 * 60);
 pub const SHORT_URL_TTL: Duration = Duration::from_secs(600);
 pub const MAX_THUMBNAIL_BYTES: i64 = 2 * 1024 * 1024;
 pub const MAX_TRANSCRIPT_BYTES: i64 = 1024 * 1024;
@@ -136,13 +136,12 @@ async fn lock_uploads(tx: &mut dyn toasty::Executor, user_id: &str) -> AppResult
     Ok(())
 }
 
-/// Unfinished uploads that still count against the account (the expire job aborts older
-/// ones, and their parts can no longer be requested).
-async fn pending_uploads(tx: &mut dyn toasty::Executor, user_id: &str, now: i64) -> AppResult<i64> {
+/// Unfinished uploads count until completion or purge actually releases their storage.
+async fn pending_uploads(tx: &mut dyn toasty::Executor, user_id: &str) -> AppResult<i64> {
     Ok(query_in(
         tx,
-        "SELECT COUNT(*) FROM videos WHERE user_id = $1 AND status = 'pending' AND created_at >= $2",
-        &vals![user_id, now - STALE_PENDING_MS],
+        "SELECT COUNT(*) FROM videos WHERE user_id = $1 AND status = 'pending'",
+        &vals![user_id],
     )
     .await?
     .first()
@@ -198,7 +197,7 @@ pub async fn create(st: &AppState, scope: &Scope, input: NewVideo) -> AppResult<
     let mut db = st.orm().await?;
     // Refuse early, before creating a multipart upload; re-checked under the lock below.
     let mut tx = begin(&mut db, &scope.context()).await?;
-    let pending = pending_uploads(&mut tx, &user, now).await?;
+    let pending = pending_uploads(&mut tx, &user).await?;
     tx.commit().await.map_err(orm_err)?;
     if pending >= cap {
         return Err(AppError::TooManyPendingUploads);
@@ -215,7 +214,7 @@ pub async fn create(st: &AppState, scope: &Scope, input: NewVideo) -> AppResult<
             // Count and insert under the account's upload lock: concurrent creates cannot
             // both see room for one more.
             lock_uploads(&mut tx, &user).await?;
-            if pending_uploads(&mut tx, &user, now).await? >= cap {
+            if pending_uploads(&mut tx, &user).await? >= cap {
                 return Err(AppError::TooManyPendingUploads);
             }
             let created = toasty::create!(Video {
@@ -398,8 +397,8 @@ async fn reserve_parts(
         "SELECT COALESCE(SUM(p.byte_size) FILTER (WHERE p.video_id = $2), 0)::BIGINT, \
                 COALESCE(SUM(p.byte_size), 0)::BIGINT \
          FROM upload_parts p JOIN videos v ON v.id = p.video_id \
-         WHERE p.user_id = $1 AND v.status = 'pending' AND v.created_at >= $3",
-        &vals![v.user_id.as_str(), v.id.as_str(), now - STALE_PENDING_MS],
+         WHERE p.user_id = $1 AND v.status = 'pending'",
+        &vals![v.user_id.as_str(), v.id.as_str()],
     )
     .await?;
     let (video, account) = match sums.first() {

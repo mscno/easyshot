@@ -308,7 +308,7 @@ async fn pending_uploads_are_capped_per_account_even_when_concurrent() {
     );
     let (stale, _, _) = app.pending(&token).await;
 
-    // An abandoned upload older than a day no longer counts (the expire job aborts it),
+    // An abandoned upload counts until deletion actually releases its storage,
     // and its parts can no longer be requested.
     app.t
         .owner
@@ -318,9 +318,19 @@ async fn pending_uploads_are_capped_per_account_even_when_concurrent() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        app.create(&token).await.status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        app.api("DELETE", &format!("/v1/videos/{stale}"), &token, None)
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
     assert_eq!(app.create(&token).await.status, StatusCode::CREATED);
     let r = app.presign(&token, &stale, &[(1, 10)]).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.body);
     app.t.finish().await;
 }
 

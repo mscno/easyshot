@@ -711,7 +711,7 @@ pub async fn media(cx: &Cx) -> Result<Response> {
         .await
         .map_err(|e| crate::error::AppError::Storage(e.0))
         .web()?;
-    found(&url, "private, max-age=3600")
+    found(&url, "private, no-store")
 }
 
 #[route(GET "/v/{slug}/download")]
