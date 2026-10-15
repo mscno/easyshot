@@ -51,6 +51,16 @@ printf -- '-- %s\n' "$usage_name" > "$f"
 echo "created $f"
 '''
 
+[tasks."db:bootstrap"]
+description = "Production: create or rotate the easyshot_app role and migrate (MIGRATION_DATABASE_URL + APP_DATABASE_PASSWORD, or esec .env.production)"
+dir = "{{config_root}}/server"
+run = "bash scripts/run-production-db.sh bootstrap"
+
+[tasks."db:verify"]
+description = "Production: check the app role cannot bypass RLS, migrations are applied and policies are FORCE'd"
+dir = "{{config_root}}/server"
+run = "bash scripts/run-production-db.sh verify"
+
 [tasks."db:seed"]
 description = "Seed two confirmed dev accounts (safe to rerun)"
 dir = "{{config_root}}/server"

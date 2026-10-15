@@ -1,0 +1,59 @@
+name: Server CI
+on:
+  pull_request:
+    paths: ['server/**', 'mise.toml', '.github/workflows/server-ci.yml']
+  push:
+    branches-ignore: [master]
+    paths: ['server/**', 'mise.toml', '.github/workflows/server-ci.yml']
+  # Deploys call this first (deploy-server.yml).
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/easyshot_test?sslmode=disable
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v2
+        with:
+          install: false
+      - name: Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt && rustup default 1.99.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/topcoat
+            ~/.cargo/bin/cargo-topcoat
+            server/target
+          key: server-${{ runner.os }}-${{ hashFiles('server/Cargo.lock') }}
+          restore-keys: server-${{ runner.os }}-
+      - name: Topcoat CLI
+        run: command -v topcoat || cargo install topcoat-cli --version 0.10.0 --locked
+      - name: Format
+        working-directory: server
+        run: cargo fmt --check && topcoat fmt --check src tests
+      - name: Clippy
+        working-directory: server
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test database
+        run: mise run db:test:reset
+      - name: Tests
+        working-directory: server
+        run: cargo test --locked

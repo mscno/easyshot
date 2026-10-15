@@ -7,15 +7,15 @@ Media bytes never pass through the server: clients PUT straight to presigned URL
 ## Architecture
 
 - **One binary, one HTTP host.** Topcoat (0.10) serves every request. The JSON API is an axum `Router` (`src/routes`) mounted unchanged through `TowerRoute` at `/v1/{*rest}`, `/s/{slug}` and `/healthz`; web pages are Topcoat handlers in `src/web`. The `lambda` feature still builds the API-only axum router for AWS Lambda; the web pages need the container (Fly) deploy.
-- **Data access.** Users, sessions, auth codes, API tokens and screenshots stay in the sqlx repository layer (`src/repo.rs`, `src/db.rs`); porting them to Toasty would not change behaviour. The video domain (`videos`, `item_comments`, `item_reactions`, `item_views`) uses Toasty 0.11 models (`src/video/model.rs`) over Toasty's PostgreSQL driver. Both pools connect as the app role.
-- **Schema ownership.** `migrations/*.sql` owns every table, including those Toasty maps; Toasty never creates or alters schema. Files are embedded at build time (`build.rs`), applied in name order as the owner role inside one transaction each, under an advisory lock, and recorded in `_migrations`. New migrations: `mise run db:new -- name` (timestamped).
+- **Data access: one library, one pool.** Toasty 0.11 is the only database library. The video domain (`videos`, `item_comments`, `item_reactions`, `item_views`) uses Toasty models (`src/video/model.rs`); users, sessions, auth codes, API tokens and screenshots use raw SQL through the same Toasty pool (`toasty::sql` behind `db::Db`, `src/repo.rs`), because that layer leans on `ON CONFLICT` upserts, aggregates, `RETURNING` and multi-table purges that read more clearly as SQL. Toasty binds typed parameters, so `Db` inlines `NULL` arguments as literals and Postgres types them from context. The pool connects as the app role and opens four connections at startup, so the first request does not pay for TCP, TLS and authentication. Two single `tokio-postgres` connections (Toasty's own driver dependency, `src/pg.rs`) do what a pool cannot: migrations as the owner (`batch_execute` for multi-statement files) and the live-update `LISTEN` session.
+- **Schema ownership.** `migrations/*.sql` owns every table, including those Toasty maps; Toasty never creates or alters schema. Files are embedded at build time (`build.rs`), applied in name order as the owner role inside one transaction each, under an advisory lock, and recorded in `_migrations`. New migrations: `mise run db:new -- name` (next `000N_` number).
 - **Team-ready, without teams.** Every video-domain table has a nullable `workspace_id`; conversation tables reference a generic `item_id` and `videos` has a `kind`, so videos can later merge with screenshots into one `items` table with child assets; `visibility` is an application enum (`link`, `password`, `private`) stored without a CHECK constraint so it can gain `workspace`; all access decisions go through one scope helper (`src/video/scope.rs`).
-- **Live updates.** Each watch page holds one Datastar SSE stream (`/v/{slug}/live`). Writes publish a change to an in-process hub; the stream re-renders the affected region and patches it by id. A 20 s resync covers changes made on other instances and keeps view counts fresh; streams close while the tab is hidden.
+- **Live updates, across instances.** Each watch page holds one Datastar SSE stream (`/v/{slug}/live`). Triggers (`migrations/0005_live_notify.sql`) on `videos`, `item_comments`, `item_reactions`, `item_views` and `screenshots` send `NOTIFY easyshot_live` with ids and kinds only (`{t, item, owner, ws, op}`), never content. Each process holds one `LISTEN` connection, opened when the first page subscribes, and fans notifications out by topic: an item id, or `user:{id}` for pages listing one owner's items (`src/video/live.rs`). Streams re-read what changed under the viewer's own RLS context and patch it by id; bursts coalesce into one render. Every listener (re)connect sends a resync to all open streams, and reconnects back off from 250 ms to 30 s. A write on one machine reaches a viewer on another in about 20 ms locally (`tests/web.rs`, `live_updates_cross_server_instances`). There is no polling; a 15 s SSE keep-alive holds proxies open, and streams close while the tab is hidden.
 - **Browser runtime.** One self-hosted bundle, `static/datastar-rocket-1.0.4.js` (Datastar v1.0.4 + Rocket beta.2, MIT, `static/DATASTAR-LICENSE.md`, sha256 `c723fb309157a555609df273e4693dcc4e193e68e6d7477f3285b955288e1e7b`), loaded once by the layout and imported by `static/app.js` from the same URL. Topcoat's own reactive runtime is not enabled. `<easyshot-player>` is a light-DOM Rocket component over a native `<video controls>`, which also works without JavaScript. Forms are native posts that Datastar enhances (form encoding, retries off). Assets are compiled into the binary and cached immutably.
 
 ## Database roles and row-level security
 
-Migrations run as the table owner (`MIGRATION_DATABASE_URL`, or `--database-url`). The server connects as `easyshot_app` (`DATABASE_URL`), created by migration `0004_rls_app_role` with `NOSUPERUSER NOBYPASSRLS`. In production, create the role beforehand with its own password; the migration then only grants. A superuser or `BYPASSRLS` connection defeats RLS.
+Migrations run as the table owner (`MIGRATION_DATABASE_URL`, or `--database-url`). The server connects as `easyshot_app` (`DATABASE_URL`), created by migration `0004_rls_app_role` with `NOSUPERUSER NOBYPASSRLS` and the development password `easyshot_app` when it does not exist yet (local and test databases only). In production `mise run db:bootstrap` creates the role with its own password first, so the migration only grants (see Deploy). A superuser or `BYPASSRLS` connection defeats RLS.
 
 `screenshots`, `videos` and the `item_*` tables have `FORCE`d policies keyed on transaction-local settings, set with `set_config(..., true)` as the first statement of every transaction:
 
@@ -27,7 +27,7 @@ Migrations run as the table owner (`MIGRATION_DATABASE_URL`, or `--database-url`
 | `app.share_item_id` | with the matching slug: read and insert that item's comments, reactions and views |
 | `app.rls_bypass = 'maintenance'` | everything; retention and account purge only (`Context::maintenance`) |
 
-sqlx code applies a `db::Context` per statement (`Db::scoped`); Toasty work runs inside `orm::begin`, which opens a Toasty transaction and runs the `set_config` through `toasty::sql` on that connection. Without a context, owner-scoped tables read as empty. `users`, `sessions`, `auth_codes`, `api_tokens` and `login_attempts` have no policy on purpose: they are read before a principal is known and every query filters by an explicit user id, email or token hash. `tests/rls.rs` runs unfiltered SQL as the app role to show the database itself denies cross-owner, cross-workspace and out-of-share reads and writes, including inside Toasty transactions.
+Raw SQL applies a `db::Context` per statement (`Db::scoped` runs each statement in a Toasty transaction whose first statement is the `set_config`); model work runs inside `orm::begin`, which does the same for a multi-statement Toasty transaction. Without a context, owner-scoped tables read as empty. `users`, `sessions`, `auth_codes`, `api_tokens` and `login_attempts` have no policy on purpose: they are read before a principal is known and every query filters by an explicit user id, email or token hash. `tests/rls.rs` runs unfiltered SQL as the app role to show the database itself denies cross-owner, cross-workspace and out-of-share reads and writes, including inside Toasty transactions.
 
 ## Local setup
 
@@ -48,12 +48,14 @@ Tests run against `TEST_DATABASE_URL` (default `easyshot_test` on :5432), one th
 ```sh
 mise run server:test                       # or: cd server && cargo test
 cargo clippy --all-targets -- -D warnings
-cargo fmt --check && topcoat fmt --check src/web/*.rs   # cargo install topcoat-cli
+cargo fmt --check && topcoat fmt --check src tests   # cargo install topcoat-cli --version 0.10.0
 ```
+
+CI (`.github/workflows/server-ci.yml`) runs the same checks against a `postgres:18` service container on every server change, and the deploy workflow runs it before deploying.
 
 Whole stack in containers: `docker compose --profile postgres --profile app up --build`.
 
-The binary's own commands: `easyshot-server [serve]`, `migrate up|status|reset --yes`, `seed` (owner URL via `--database-url` or `MIGRATION_DATABASE_URL`).
+The binary's own commands: `easyshot-server [serve]`, `migrate up|status|reset --yes`, `seed`, `db bootstrap|verify` (owner URL via `--database-url` or `MIGRATION_DATABASE_URL`).
 
 ## Web pages
 
@@ -70,7 +72,7 @@ The binary's own commands: `easyshot-server [serve]`, `migrate up|status|reset -
 | `/login`, `POST /login`, `POST /login/verify`, `POST /logout` | Email-code sign-in for existing accounts (accounts are created in the app); the session is a `__Host-sg_session` cookie whose token hash is stored in `sessions` |
 | `/library` | The owner's videos: rename, visibility (link / password / only me), send to an email address (Lettermint, 20 per hour), delete |
 
-Security: Topcoat's origin policy rejects cross-site state-changing browser requests; the CSP allows scripts and styles only from `'self'` (plus `'unsafe-eval'`, which Datastar needs to compile `data-*` expressions), media and images from `https:` (and a plain-HTTP dev store); comment, reaction, unlock and sign-in posts are rate limited per client address or user; password unlocks are an HMAC cookie bound to the current password hash; views are counted once per viewer per UTC day using a keyed hash of day, address and user agent.
+Security: Topcoat's origin policy rejects cross-site state-changing browser requests; the CSP allows scripts and styles only from `'self'`, plus `'unsafe-eval'` (accepted deliberately: Datastar compiles each `data-*` expression with `Function`, and has no build-time compilation mode; every expression is server-authored, user data only ever appears as escaped text or attribute values, and inline `<script>` stays blocked), media and images from `https:` (and a plain-HTTP dev store); comment, reaction, unlock and sign-in posts are rate limited per client address or user; password unlocks are an HMAC cookie bound to the current password hash; views are counted once per viewer per UTC day using a keyed hash of day, address and user agent.
 
 ## Video upload API
 
@@ -91,11 +93,24 @@ Every part except the last must be at least 5 MiB (S3 rule). Upload parts while 
 
 ## Deploy (Fly.io + PostgreSQL)
 
-Production is PostgreSQL, e.g. Fly Managed Postgres or Neon, with two connection strings: the owner (`MIGRATION_DATABASE_URL`) and `easyshot_app` (`DATABASE_URL`). Once per database, as the owner: `CREATE ROLE easyshot_app LOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT PASSWORD '...'` (Neon: the `*_owner` role can create it; Fly MPG: the provided owner user). `fly.toml` runs `easyshot-server migrate up` as the release command, so migrations apply as the owner before new machines start; the app itself never needs the owner URL. Use the pooled endpoint for `DATABASE_URL` only if it is a session pooler: transaction-mode pooling breaks prepared statements and transaction-local settings stay safe only within a transaction.
+Production is PostgreSQL, e.g. Fly Managed Postgres or Neon, with two connection strings: the owner (`MIGRATION_DATABASE_URL`) and `easyshot_app` (`DATABASE_URL`). TLS follows `sslmode` (`require` verifies the server certificate against the platform roots; use `disable` only on a private network).
 
-The machine can scale to zero: startup only parses config. Create the bucket with `fly storage create` (Tigris); it sets `BUCKET_NAME`, `AWS_REGION=auto`, `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, which the server uses as-is (presigned URLs are virtual-hosted style, region `auto`). Do not set `S3_FORCE_PATH_STYLE`. Secrets: `DATABASE_URL`, `MIGRATION_DATABASE_URL`, `CRON_SECRET`, `PUBLIC_BASE_URL`, `WEB_SECRET` (synced from GitHub secrets by `.github/workflows/deploy-server.yml`). `TRUSTED_PROXY_HOPS=1` makes client addresses come from Fly's proxy. Trigger `POST /v1/internal/expire` from an external scheduler, since a scaled-to-zero machine cannot run its own timer. Live streams are per instance with a 20 s cross-instance resync, so more than one machine works without extra infrastructure.
+Once per database, and again to rotate the password:
 
-Moving existing data off Turso is a one-off export/import of `users`, `sessions`, `api_tokens`, `auth_codes` and `screenshots` (same columns) before switching `DATABASE_URL`.
+```sh
+MIGRATION_DATABASE_URL=postgres://owner:...@host/db?sslmode=require \
+APP_DATABASE_PASSWORD="$(openssl rand -base64 32)" mise run db:bootstrap
+# creates or rotates easyshot_app (LOGIN NOSUPERUSER NOBYPASSRLS), grants CONNECT, migrates
+MIGRATION_DATABASE_URL=... DATABASE_URL=postgres://easyshot_app:...@host/db?sslmode=require mise run db:verify
+# ok/FAIL per check: app role is not a superuser, cannot bypass RLS, owns no tables, does not
+# use the development password; all migrations applied; every owner-scoped table FORCEs RLS
+```
+
+Without the variables, both tasks load the encrypted `.env.production` at the repository root with `esec` (`server/scripts/run-production-db.sh`). Neon: the `*_owner` role can create the app role; Fly MPG: the provided owner user. Set `DATABASE_URL` to the app role with the new password. `fly.toml` runs `easyshot-server migrate up` as the release command, so migrations apply as the owner before new machines start; the app itself never needs the owner URL. Use the pooled endpoint for `DATABASE_URL` only if it is a session pooler: transaction-mode pooling breaks prepared statements and transaction-local settings stay safe only within a transaction.
+
+The machine can scale to zero: startup parses config and opens the warm pool (four connections, a few milliseconds). Create the bucket with `fly storage create` (Tigris); it sets `BUCKET_NAME`, `AWS_REGION=auto`, `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, which the server uses as-is (presigned URLs are virtual-hosted style, region `auto`). Do not set `S3_FORCE_PATH_STYLE`. Secrets: `DATABASE_URL`, `MIGRATION_DATABASE_URL`, `CRON_SECRET`, `PUBLIC_BASE_URL`, `WEB_SECRET` (synced from GitHub secrets by `.github/workflows/deploy-server.yml`). `TRUSTED_PROXY_HOPS=1` makes client addresses come from Fly's proxy. Trigger `POST /v1/internal/expire` from an external scheduler, since a scaled-to-zero machine cannot run its own timer. Live updates travel through Postgres `LISTEN/NOTIFY`, so any number of machines stay in step without extra infrastructure; `DATABASE_URL` must reach Postgres directly or through a session-mode pooler, since `LISTEN` does not survive transaction pooling.
+
+There is no migration from the earlier Turso/libSQL backend: production starts fresh on PostgreSQL. Shotglass Cloud links expired after 30 days anyway; existing users sign up again.
 
 ## Environment variables
 
@@ -104,7 +119,7 @@ Moving existing data off Turso is a one-off export/import of `users`, `sessions`
 | `DATABASE_URL` | required | app role (`easyshot_app`), `postgres://` |
 | `MIGRATION_DATABASE_URL` | unset | owner role; used by `migrate`, and at startup when `RUN_MIGRATIONS=true` |
 | `RUN_MIGRATIONS` | `false` | apply migrations at startup (needs `MIGRATION_DATABASE_URL`) |
-| `DB_MAX_CONNECTIONS` | `5` | per pool (sqlx and Toasty each); lazy, 5 s acquire timeout |
+| `DB_MAX_CONNECTIONS` | `5` | the one Toasty pool; up to four open at startup, 5 s acquire timeout. Plus one `LISTEN` connection per machine once a live page is open |
 | `S3_BUCKET` | required | falls back to `BUCKET_NAME` |
 | `BIND_ADDR` | `0.0.0.0:8080` | ignored on Lambda |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | used for share links, oEmbed and Open Graph URLs |

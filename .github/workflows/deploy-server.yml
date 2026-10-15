@@ -5,8 +5,13 @@ on:
     paths: ['server/**', '.github/workflows/deploy-server.yml']
   workflow_dispatch:
 concurrency: deploy-server
+permissions:
+  contents: read
 jobs:
+  test:
+    uses: ./.github/workflows/server-ci.yml
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     defaults:
       run:

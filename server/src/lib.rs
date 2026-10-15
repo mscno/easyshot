@@ -5,6 +5,7 @@ pub mod error;
 pub mod mailer;
 pub mod orm;
 pub mod pg;
+pub mod prod;
 pub mod repo;
 pub mod routes;
 pub mod seed;

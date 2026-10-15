@@ -1,6 +1,6 @@
-//! `easyshot-server [serve]` runs the web app and API; `migrate up|status|reset --yes` and
-//! `seed` manage the database as the owner role (`--database-url` or
-//! `MIGRATION_DATABASE_URL`).
+//! `easyshot-server [serve]` runs the web app and API; `migrate up|status|reset --yes`,
+//! `seed` and `db bootstrap|verify` (see `prod`) manage the database as the owner role
+//! (`--database-url` or `MIGRATION_DATABASE_URL`).
 
 use easyshot_server::config::Config;
 use easyshot_server::{AppState, db};
@@ -67,7 +67,31 @@ async fn main() -> Result<(), BoxErr> {
             println!("{summary}");
             Ok(())
         }
-        _ => Err("usage: easyshot-server [serve] | migrate up|status|reset --yes | seed".into()),
+        ["db", "bootstrap"] => {
+            let password = std::env::var("APP_DATABASE_PASSWORD")
+                .map_err(|_| "set APP_DATABASE_PASSWORD (the new easyshot_app password)")?;
+            for line in easyshot_server::prod::bootstrap(&owner_url()?, &password).await? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        ["db", "verify"] => {
+            let app_url = std::env::var("DATABASE_URL")
+                .map_err(|_| "set DATABASE_URL (the app-role URL the server uses)")?;
+            let checks = easyshot_server::prod::verify(&owner_url()?, &app_url).await?;
+            for (what, ok) in &checks {
+                println!("{} {what}", if *ok { "ok  " } else { "FAIL" });
+            }
+            if checks.iter().all(|(_, ok)| *ok) {
+                Ok(())
+            } else {
+                Err("database verification failed".into())
+            }
+        }
+        _ => Err(
+            "usage: easyshot-server [serve] | migrate up|status|reset --yes | seed | db bootstrap|verify"
+                .into(),
+        ),
     }
 }
 

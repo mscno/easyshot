@@ -324,3 +324,29 @@ async fn maintenance_bypass_reaches_every_owner() {
     assert_eq!(ids(&m, "SELECT id FROM videos").await, ["va", "vb"]);
     t.finish().await;
 }
+
+#[tokio::test]
+async fn production_verify_reports_the_rls_posture() {
+    let t = common::database().await;
+    let checks = easyshot_server::prod::verify(&t.owner_url, &t.app_url)
+        .await
+        .unwrap();
+    let failed: Vec<_> = checks
+        .iter()
+        .filter(|(_, ok)| !ok)
+        .map(|(w, _)| w.as_str())
+        .collect();
+    // The test cluster uses the development password on purpose; everything else holds.
+    assert_eq!(
+        failed,
+        ["app role does not use the development password"],
+        "{checks:?}"
+    );
+    assert!(checks.iter().any(|(w, ok)| w.starts_with("videos:") && *ok));
+    // Pointing the "app" URL at the owner (a superuser) fails the role checks.
+    let checks = easyshot_server::prod::verify(&t.owner_url, &t.owner_url)
+        .await
+        .unwrap();
+    assert!(checks.iter().any(|(w, ok)| w.contains("bypass") && !ok));
+    t.finish().await;
+}
