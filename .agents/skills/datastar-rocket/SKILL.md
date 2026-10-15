@@ -1,38 +1,45 @@
 ---
 name: datastar-rocket
-description: Evaluate, build, or review reusable browser widgets using Datastar Rocket in Billit's Rust/Topcoat web UI. Use for explicit Rocket work or complex custom elements with local state, lifecycle, or third-party widget integration; ordinary pages and forms use the datastar skill.
+description: Build, extend or review Datastar Rocket custom elements (easyshot-* tags such as <easyshot-player>) in Easyshot's Topcoat web UI. Use for encapsulated browser widgets with local state, lifecycle or media/third-party integration; ordinary pages and forms use the datastar skill.
 ---
 
-# Datastar Rocket widgets
+# Rocket components in Easyshot
 
-Use Rocket selectively when a feature needs an encapsulated browser widget. Follow `AGENTS.md` when present and the existing [Datastar web skill](../datastar/SKILL.md) for Rust handlers, templates, forms, SSE, and domain boundaries.
+Rocket ships inside the single runtime `server/static/datastar-rocket-1.0.4.js` (Datastar v1.0.4 + Rocket beta.2, MIT). Components live in `server/static/app.js`, which imports `rocket` from that exact URL; the layout loads both. Datastar Rocket is unrelated to the Rust Rocket web framework. Follow the [datastar skill](../datastar/SKILL.md) for handlers, forms, patches and live streams.
 
-## Decide whether it helps
+## The existing component
 
-Plausible uses are an editor wrapper, interactive chart, or a repeated compound input whose browser behavior has become difficult to maintain in templates. Explain the concrete reduction in duplicated behavior or lifecycle code before introducing a component. Ordinary CRUD, authentication forms, disclosures, and pagination generally have simpler native/template implementations.
+`<easyshot-player>` (light DOM, no render function) wraps the server-rendered native `<video controls>` (which is also the no-JavaScript fallback). It:
 
-Imported from Softbody Studio and reviewed for Billit on 2026-10-03. Earlier notes originated in the Go starter's Pro v1.0.3 bundle. Current upstream distributes a separate `datastar-rocket.js` that includes Datastar; Rocket does not by itself require the historical Pro asset. No browser asset is installed by this skill. Preserve the selected asset's actual license. Rocket's APIs and distribution can change between releases; inspect the actual module exports before using examples. Datastar Rocket browser widgets are unrelated to the Rust Rocket web framework.
+- publishes playback time into `[data-player-time]` inputs and `[data-player-clock]` text (comment and reaction forms send the timestamp natively);
+- seeks on clicks of `[data-seek-ms]` (comments, markers, transcript lines) and on the marker strip;
+- builds the transcript list (`[data-transcript]`) from the WebVTT `<track>` and highlights the current line;
+- registers every listener with `cleanup`.
 
-## Use the selected runtime
+Read it before writing a new component; keep the same style.
 
-Pin and self-host the combined `datastar-rocket.js` and matching declarations. Check actual exports before adopting examples. Load that module once through Topcoat's layout and import from the same URL; do not also load a core/Pro copy. Disable Topcoat's reactive/shard runtime on these pages. See [Billit architecture](../../../docs/rust-architecture.md).
+## Decide whether a component helps
 
-Read [Component integration](references/integration.md) for lifecycle, forms, events, and morph boundaries. Use [Datastar Pro](../datastar-pro/SKILL.md) for Pro attributes/actions. Check the actual module exports and [Rocket reference](https://data-star.dev/reference/rocket) for version-specific APIs.
+Good fits: the player, a future timeline/annotation layer on the watch page, a waveform, an upload progress meter driven by live patches. Poor fits: forms, disclosures, lists, pagination, anything the server can render. Explain the concrete lifecycle or duplication a component removes before adding one.
 
-## Keep a narrow component contract
+## Contract first
 
-Write down the host tag and ID, input values, output events, DOM owner, form submission value, and fallback before implementation. Use `billit-` tags and test two instances on one page. Money and ledger ID props are exact strings, never the numeric codec. Operation widgets distinguish accepted/pending from finalized success and refresh after reconnect without reissuing commands.
+Write down before implementing:
 
-The Rust application service remains authoritative for persisted state, tenancy, validation, permissions, audit, and jobs. A component may propose an edit; the surrounding page submits it using native form encoding and the existing SSE/plain-form response path. It may not declare success before the server confirms it. Browser state and codec normalization do not enforce domain invariants.
+- Tag (`easyshot-` prefix) and host id; DOM mode (`light` when it should share `app.css`).
+- Inputs: server-rendered attributes/props (non-sensitive), and which live patches may change them.
+- Outputs: DOM `CustomEvent` names and `detail` shapes, or named native inputs the component fills (preferred, so form encoding and the no-JS path keep working).
+- Who owns which DOM: the server owns the host and everything outside the component's private subtree.
+- The no-JavaScript fallback.
 
-Have the Rust template engine render the host and server-controlled values. Choose a stable patch boundary around the widget and verify that the chosen morph actually updates its public inputs without discarding an active editor or selection. Avoid globally ignoring morphs: permission changes and server corrections still need to reach the UI.
+The server stays authoritative for everything persisted (titles, comments, visibility). A component may propose an edit; the surrounding native form submits it.
 
-## Verify before claiming integration works
+## Morphs and live patches
 
-- Follow [AGENTS.md](../../../AGENTS.md) for focused integration checks and periodic green checkpoints; full gates are not required at every commit.
-- With the selected runtime, exercise two instances, input changes from SSE, repeated patches, removal/reinsertion, cancellation, and cleanup. Check the console for missing exports, duplicate registrations, expression failures, and CSP violations.
-- Verify keyboard access, accessible labels, retained focus, native form values, validation failure, and a useful no-JavaScript fallback where the page requires it.
-- Verify existing non-Rocket Datastar actions still function with the selected bundle. HTTP tests alone cannot validate a custom element's lifecycle or rendered DOM.
-- State whether verification covered documentation, syntax, mocked code, or a real browser/runtime. Missing runtime access limits runtime validation, not the ability to write the design or skill.
+The watch page is patched live over SSE. Keep the host's id and structure stable so morphs update its inputs without recreating it (a recreated `<video>` would restart playback). Patch regions around the component rather than through it; use `data-ignore-morph` only for a genuinely client-owned subtree and never to block server-owned content or access changes. Test: initial mount, prop changes from a live patch, repeated patches, removal and reinsertion, two instances on one page.
 
-Historical examples came from Pro v1.0.3. The upstream combined Rocket distribution was reviewed on 2026-10-03; qualify the actual Billit pin in a browser before claiming runtime integration.
+## Verify
+
+`mise run server:test` cannot prove a component works. Use a real browser (Playwright was used before): console free of missing exports, duplicate registrations, expression or CSP errors; keyboard access and labels; focus retained across patches; native form values correct with and without Datastar; cleanup on removal. State what you verified.
+
+Lifecycle, props, events and form details: [component integration](references/integration.md). API reference: [Rocket](https://data-star.dev/reference/rocket); check the bundle's actual exports before using newer APIs.

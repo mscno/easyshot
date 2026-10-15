@@ -1,3 +1,3 @@
 interface:
-  display_name: "Datastar Rocket"
-  short_description: "Design Datastar Rocket widgets for Rust web apps"
+  display_name: "Easyshot Rocket"
+  short_description: "Design easyshot-* Datastar Rocket components"

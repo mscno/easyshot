@@ -1,10 +1,10 @@
 # Component integration
 
-Read this when designing or implementing a Rocket widget. The recommendations below adapt browser component boundaries to this repository; recheck the selected runtime release before relying on version-specific APIs.
+Read this when designing or implementing a Rocket component for Easyshot. Rocket is beta (beta.2 in the pinned bundle); recheck exports and behavior against `server/static/datastar-rocket-1.0.4.js` before relying on version-specific APIs.
 
 ## Rocket API orientation
 
-Import `rocket` from the exact runtime URL used by the layout (Billit selects the combined `datastar-rocket.js`; inspect the actual served URL); register a hyphenated tag. Public `props` use codecs. Use `$$` for instance state, `$$name` in markup, and `action(name, fn)` for local actions. Global `$` is shared page state.
+Import `rocket` from the exact runtime URL the layout loads (`/static/datastar-rocket-1.0.4.js`, see `server/src/web/assets.rs`); register an `easyshot-` tag in `server/static/app.js`. Public `props` use codecs. Use `$$` for instance state, `$$name` in markup, and `action(name, fn)` for local actions. Global `$` is shared page state.
 
 | Hook | Responsibility |
 | --- | --- |
@@ -14,7 +14,7 @@ Import `rocket` from the exact runtime URL used by the layout (Billit selects th
 | `observeProps` | React to public prop changes |
 | `cleanup(fn)` in setup context | Register release of timers, subscriptions and resources on disconnect |
 
-Use string codecs for Billit amounts and ledger IDs, and keep financial validation on the server. Props are not local signals. `renderOnPropChange` defaults to enabled; disable selectively for imperative widgets with explicit synchronization. Default DOM mode is open shadow; `light` shares page styling. Consult the reference for codecs, slots, host accessors, scoping, and conditional/loop syntax. [Rocket API](https://data-star.dev/reference/rocket).
+Use string codecs for ids and timestamps that must round-trip exactly; keep validation on the server. Props are not local signals. `renderOnPropChange` defaults to enabled; disable selectively for imperative widgets with explicit synchronization. Default DOM mode is open shadow; `light` shares page styling. Consult the reference for codecs, slots, host accessors, scoping, and conditional/loop syntax. [Rocket API](https://data-star.dev/reference/rocket).
 
 ## Choose ownership explicitly
 
@@ -22,7 +22,7 @@ Prefer a server-rendered host whose attributes describe a small view model. Keep
 
 | Situation in this app | Suggested design decision |
 | --- | --- |
-| Existing form with a richer input | Keep the form, named submission control, action, and handler; enhance the input |
+| Existing form with a richer input | Keep the form, named submission control, action, and handler; enhance the input (as the player fills `timestamp_ms`) |
 | Repeated third-party chart/editor | Let the widget own its internal DOM and library instance |
 | Server updates a read-only chart | Send a bounded view model; compare a normal server-rendered SVG first |
 | Editable widget receives server updates | Define when server values replace a draft and how conflicts are shown |
@@ -53,10 +53,9 @@ For an event-to-form adapter, inspect the actual request body in a browser: chan
 ## Source and local reading map
 
 - [Rocket reference](https://data-star.dev/reference/rocket): exact API for the available version.
-- [Datastar Pro](https://data-star.dev/pro): commercial terms when selecting a Pro runtime.
-- [Datastar web skill](../../datastar/SKILL.md): request encoding, server rendering, signal and SSE rules already used here.
-- The application's asset server and layout: runtime/module URLs and loading.
-- Rust handlers, response helpers, and templates: native form enhancement and patch boundaries.
-- Security/session middleware: CSP, CSRF/cross-origin protections, and authentication.
+- [Datastar skill](../../datastar/SKILL.md): request encoding, server rendering, live streams.
+- `server/static/app.js`: existing components and page behaviors; `server/src/web/layout.rs`: module loading.
+- `server/src/web/watch.rs`: the regions around `<easyshot-player>` and its markup contract.
+- `server/src/web/mod.rs`: CSP (`script-src 'self' 'unsafe-eval'`, no inline scripts) and security headers.
 
-These lifecycle notes were inherited from the source Pro v1.0.3 documentation. Billit selects the current combined Datastar/Rocket distribution and must verify API behavior against its own pin. No runtime asset has been copied into this project. Test each new component in a browser against the actual chosen runtime; installation alone does not verify a widget.
+No Datastar Pro bundle is installed; Rocket comes from the combined MIT bundle. Test each new component in a browser against that bundle; loading the file is not verification.

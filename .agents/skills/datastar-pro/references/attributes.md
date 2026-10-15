@@ -1,6 +1,6 @@
-# Attribute patterns from the source Pro v1.0.3 bundle
+# Pro attribute patterns (orientation only)
 
-Examples are small patterns to adapt to the feature, not a reason to add all plugins to a page. These notes describe the Go starter's v1.0.3 bundle, which is not installed by copying this skill. Check the actual local runtime; consult the [upstream reference](https://data-star.dev/reference/attributes#pro-attributes) when extending these examples.
+**Not installed in Easyshot.** These notes describe a Datastar Pro v1.0.3 bundle examined in another project. Easyshot's bundle (Datastar v1.0.4 + Rocket beta.2) does not include them. If a licensed Pro bundle is ever installed, re-check each behavior against it and the [upstream reference](https://data-star.dev/reference/attributes#pro-attributes). Examples are small patterns, not a reason to add plugins to a page.
 
 ## Validation and media
 
@@ -31,13 +31,13 @@ Use `performance.now()` for elapsed time instead of counting frames. Keep frame 
 
 ```html
 <div data-signals:prefs__ifmissing="{compact: false}"
-     data-persist:billit-preferences="{include: /^prefs\.compact$/}">
+     data-persist:easyshot-prefs-v1="{include: /^prefs\.compact$/}">
 </div>
 ```
 
 The suffix chooses the storage key; `__session` selects sessionStorage instead of localStorage. Prefer a dedicated, versioned application key when the schema evolves. The value is a filter object with regexes, not the data to save. Avoid bare `data-persist`, which can capture unrelated page signals.
 
-In this bundle, initialization merges the whole stored object before the filter is applied to subsequent writes. A narrower filter therefore does not sanitize an old storage entry. Use a new key or clear/migrate it when reducing the persisted schema. Stored values are untrusted and can outlive the current login. Handle unavailable storage gracefully for required user flows; preferences must not become an authentication dependency.
+In the v1.0.3 bundle, initialization merges the whole stored object before the filter is applied to subsequent writes. A narrower filter therefore does not sanitize an old storage entry. Use a new key or clear/migrate it when reducing the persisted schema. Stored values are untrusted and can outlive the current login. Handle unavailable storage gracefully for required user flows; preferences must not become an authentication dependency.
 
 ## Query strings and history
 
@@ -54,7 +54,7 @@ Default changes replace history. `__history` pushes entries and listens to popst
 Removing a parameter through history does not necessarily reset the corresponding signal: the source v1.0.3 restore path only writes keys present in the URL. Test back/forward with missing/default filters and implement the intended reset or choose ordinary server navigation.
 
 ```html
-<div data-replace-url="'/projects?q=' + encodeURIComponent($query)"></div>
+<div data-replace-url="'/library?q=' + encodeURIComponent($query)"></div>
 ```
 
 `data-replace-url` evaluates an expression and calls history replacement. It neither fetches nor navigates. Choose one owner for URL changes, preserve required parameters, and use ordinary links for resource navigation. Keep requested URLs same-origin and handler-chosen.
@@ -63,7 +63,7 @@ Removing a parameter through history does not necessarily reset the correspondin
 
 ```html
 <section tabindex="-1" data-scroll-into-view__instant__vnearest></section>
-<article data-view-transition="'project-card'"></article>
+<article data-view-transition="'library-item'"></article>
 ```
 
 `data-scroll-into-view` takes no key or expression. It executes when applied, so unchanged attributes retained by a morph are not a promise to scroll again. `__smooth`, `__instant`, and `__auto` choose motion; horizontal/vertical alignment modifiers and `__focus` refine the behavior. Focus only when the user action merits it. Test actual tabindex behavior: the plugin may add a tabindex itself.
