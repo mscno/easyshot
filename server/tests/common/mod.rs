@@ -1,99 +1,134 @@
-//! Backends for the video/web suites: a fresh libSQL file always, plus a throwaway Postgres
-//! schema when `DATABASE_URL` is a postgres URL. Call `finish` to remove the temp file or schema.
+//! PostgreSQL test databases: one throwaway schema per test inside `TEST_DATABASE_URL`
+//! (default: the local `shotglass_test` on port 5433), migrated as the owner. Tests get an
+//! owner handle for setup and inspection (a superuser bypasses RLS) and an app-role handle
+//! plus URL for the code under test (`shotglass_app`, NOBYPASSRLS, search_path = schema).
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::str::FromStr;
 
 use shotglass_server::config::Config;
-use shotglass_server::db::Db;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{Executor, PgPool};
+use shotglass_server::db::{self, Db};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{ConnectOptions, Connection, Executor, PgConnection};
+use tokio::sync::OnceCell;
 
-pub enum Cleanup {
-    File(PathBuf),
-    Pg { admin: PgPool, schema: String },
+pub const DEFAULT_TEST_URL: &str =
+    "postgres://postgres:postgres@localhost:5433/shotglass_test?sslmode=disable";
+pub const APP_ROLE: &str = "shotglass_app";
+
+pub fn test_url() -> String {
+    std::env::var("TEST_DATABASE_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| DEFAULT_TEST_URL.into())
+}
+
+/// Create the test database and the cluster-wide app role once per process.
+async fn prepare() {
+    static READY: OnceCell<()> = OnceCell::const_new();
+    READY
+        .get_or_init(|| async {
+            let url = test_url();
+            let opts = PgConnectOptions::from_str(&url).expect("TEST_DATABASE_URL");
+            let name = opts.get_database().unwrap_or("shotglass_test").to_string();
+            let mut admin = opts
+                .clone()
+                .database("postgres")
+                .connect()
+                .await
+                .expect("connect to the test cluster (is Postgres on :5433 running?)");
+            let exists: Option<i32> =
+                sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
+                    .bind(&name)
+                    .fetch_optional(&mut admin)
+                    .await
+                    .unwrap();
+            if exists.is_none() {
+                let _ = admin.execute(format!("CREATE DATABASE {name}").as_str()).await;
+            }
+            // Same statement as migration 0004; created here once so parallel per-test
+            // migrations never race on the cluster-wide role.
+            let _ = admin
+                .execute(
+                    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'shotglass_app') THEN \
+                     CREATE ROLE shotglass_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT \
+                     PASSWORD 'shotglass_app'; END IF; END $$",
+                )
+                .await;
+        })
+        .await;
 }
 
 pub struct TestDb {
-    pub db: Db,
-    pub url: String,
-    cleanup: Option<Cleanup>,
+    /// Owner/superuser handle in the test schema: setup and inspection, bypasses RLS.
+    pub owner: Db,
+    /// App-role handle in the test schema: what the server uses; RLS applies.
+    pub app: Db,
+    /// App-role URL (with search_path) for components that open their own pool (Toasty).
+    pub app_url: String,
+    pub schema: String,
 }
 
 impl TestDb {
-    /// Remove the temp file or drop the schema.
-    pub async fn finish(mut self) {
-        match self.cleanup.take() {
-            Some(Cleanup::File(p)) => {
-                let _ = std::fs::remove_file(&p);
-            }
-            Some(Cleanup::Pg { admin, schema }) => {
-                let _ = admin
-                    .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
-                    .await;
-            }
-            None => {}
-        }
+    /// Server config pointing at the app role in this schema.
+    pub fn config(&self) -> Config {
+        Config::for_tests(&self.app_url)
+    }
+
+    /// Drop the schema.
+    pub async fn finish(self) {
+        self.app.pool().close().await;
+        let _ = self
+            .owner
+            .pool()
+            .execute(format!("DROP SCHEMA {} CASCADE", self.schema).as_str())
+            .await;
+        self.owner.pool().close().await;
     }
 }
 
-pub async fn libsql() -> TestDb {
-    let path = std::env::temp_dir().join(format!("shotglass-web-{}.db", uuid::Uuid::new_v4()));
-    let url = format!("file:{}", path.display());
-    let db = Db::connect(&Config::for_tests(&url)).unwrap();
-    db.migrate().await.unwrap();
-    TestDb {
-        db,
-        url,
-        cleanup: Some(Cleanup::File(path)),
-    }
-}
-
-pub async fn postgres() -> Option<TestDb> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
-        return None;
-    }
+pub async fn database() -> TestDb {
+    prepare().await;
+    let url = test_url();
     let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .expect("connect");
-    admin
-        .execute(format!("CREATE SCHEMA {schema}").as_str())
-        .await
-        .unwrap();
-    let s = schema.clone();
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .after_connect(move |conn, _| {
-            let s = s.clone();
-            Box::pin(async move {
-                conn.execute(format!("SET search_path TO {s}").as_str())
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect(&url)
-        .await
-        .unwrap();
-    let db = Db::Pg(pool);
-    db.migrate().await.unwrap();
-    Some(TestDb {
-        db,
-        url,
-        cleanup: Some(Cleanup::Pg { admin, schema }),
-    })
-}
-
-/// libSQL always; Postgres too when configured.
-pub async fn databases() -> Vec<TestDb> {
-    let mut v = vec![libsql().await];
-    match postgres().await {
-        Some(pg) => v.push(pg),
-        None => eprintln!("DATABASE_URL is not postgres; skipping postgres run"),
+    let opts = PgConnectOptions::from_str(&url).unwrap();
+    {
+        let mut conn = PgConnection::connect_with(&opts).await.unwrap();
+        conn.execute(format!("CREATE SCHEMA {schema}").as_str())
+            .await
+            .unwrap();
+        conn.execute(format!("SET search_path TO {schema}").as_str())
+            .await
+            .unwrap();
+        db::migrate_conn(&mut conn).await.expect("migrations");
+        conn.close().await.unwrap();
     }
-    v
+    let owner = PgPoolOptions::new()
+        .max_connections(3)
+        .connect_with(opts.clone().options([("search_path", schema.as_str())]))
+        .await
+        .unwrap();
+    let app_opts = opts
+        .clone()
+        .username(APP_ROLE)
+        .password(APP_ROLE)
+        .options([("search_path", schema.as_str())]);
+    let app = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(app_opts)
+        .await
+        .unwrap();
+    let host = opts.get_host().to_string();
+    let port = opts.get_port();
+    let dbname = opts.get_database().unwrap_or("shotglass_test");
+    let app_url = format!(
+        "postgres://{APP_ROLE}:{APP_ROLE}@{host}:{port}/{dbname}?sslmode=disable&options=-csearch_path%3D{schema}"
+    );
+    TestDb {
+        owner: Db::from_pool(owner),
+        app: Db::from_pool(app),
+        app_url,
+        schema,
+    }
 }

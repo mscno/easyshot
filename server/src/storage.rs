@@ -558,9 +558,12 @@ mod tests {
     /// (Env vars are process-global, so everything env-dependent lives in this one test.)
     #[tokio::test]
     async fn presigned_urls_for_tigris_style_config() {
-        std::env::set_var("AWS_ACCESS_KEY_ID", "tid_test");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "tsec_test");
-        std::env::set_var("AWS_ENDPOINT_URL_S3", "https://fly.storage.tigris.dev");
+        // SAFETY: the only test in this binary that touches these variables.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "tid_test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "tsec_test");
+            std::env::set_var("AWS_ENDPOINT_URL_S3", "https://fly.storage.tigris.dev");
+        }
 
         let store = S3Store::from_config(&cfg(None, false)).await;
         let put = store
@@ -594,6 +597,7 @@ mod tests {
             get.starts_with("http://127.0.0.1:9000/my-bucket/k?"),
             "{get}"
         );
-        std::env::remove_var("AWS_ENDPOINT_URL_S3");
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("AWS_ENDPOINT_URL_S3") };
     }
 }

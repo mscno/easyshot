@@ -193,7 +193,7 @@ pub async fn complete(
         repo::delete_screenshot(&st.db, id, user.id).await?;
         return Err(AppError::SizeMismatch);
     }
-    repo::mark_ready(&st.db, id, now_ms()).await?;
+    repo::mark_ready(&st.db, id, user.id, now_ms()).await?;
     Ok(Json(to_json(&st, &row).await?))
 }
 

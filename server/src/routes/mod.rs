@@ -14,6 +14,7 @@ pub mod internal;
 pub mod screenshots;
 pub mod share;
 pub mod tokens;
+pub mod videos;
 
 pub const JSON_BODY_LIMIT: usize = 64 * 1024;
 
@@ -64,6 +65,17 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(screenshots::delete),
         )
         .route("/screenshots/{id}/complete", post(screenshots::complete))
+        .route("/videos", post(videos::create).get(videos::list))
+        .route(
+            "/videos/{id}",
+            get(videos::get)
+                .patch(videos::update)
+                .delete(videos::delete),
+        )
+        .route("/videos/{id}/parts", post(videos::parts))
+        .route("/videos/{id}/complete", post(videos::complete))
+        .route("/videos/{id}/thumbnail", post(videos::thumbnail))
+        .route("/videos/{id}/transcript", post(videos::transcript))
         .route("/internal/expire", post(internal::expire))
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT));
 

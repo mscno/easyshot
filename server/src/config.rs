@@ -2,8 +2,10 @@
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// App-role connection (`shotglass_app`, NOSUPERUSER NOBYPASSRLS).
     pub database_url: String,
-    pub database_auth_token: Option<String>,
+    /// Owner-role connection for migrations; `RUN_MIGRATIONS` and `migrate` need it.
+    pub migration_database_url: Option<String>,
     pub bind_addr: String,
     pub public_base_url: String,
     pub s3_bucket: String,
@@ -89,7 +91,7 @@ impl Config {
             }
         };
         Ok(Config {
-            database_auth_token: get("DATABASE_AUTH_TOKEN"),
+            migration_database_url: get("MIGRATION_DATABASE_URL"),
             database_url: get("DATABASE_URL").ok_or("DATABASE_URL is required")?,
             bind_addr: get("BIND_ADDR").unwrap_or_else(|| "0.0.0.0:8080".into()),
             public_base_url: get("PUBLIC_BASE_URL")
@@ -109,7 +111,7 @@ impl Config {
             inactive_user_days: non_negative("INACTIVE_USER_DAYS", 90)?,
             max_upload_bytes: number("MAX_UPLOAD_BYTES", 26_214_400)?,
             allow_signups: boolean("ALLOW_SIGNUPS", true)?,
-            run_migrations: boolean("RUN_MIGRATIONS", true)?,
+            run_migrations: boolean("RUN_MIGRATIONS", false)?,
             db_max_connections: number("DB_MAX_CONNECTIONS", 5)? as u32,
             lettermint_api_token: get("LETTERMINT_API_TOKEN"),
             lettermint_api_url: get("LETTERMINT_API_URL")
@@ -146,7 +148,7 @@ impl Config {
     pub fn for_tests(database_url: &str) -> Self {
         Config {
             database_url: database_url.into(),
-            database_auth_token: None,
+            migration_database_url: None,
             bind_addr: "127.0.0.1:0".into(),
             public_base_url: "http://localhost:8080".into(),
             s3_bucket: "test".into(),
@@ -198,10 +200,10 @@ mod tests {
         assert_eq!(c.bind_addr, "0.0.0.0:8080");
         assert_eq!(c.retention_days, 30);
         assert_eq!(c.inactive_user_days, 90);
-        assert!(c.database_auth_token.is_none());
+        assert!(c.migration_database_url.is_none());
         assert_eq!(c.s3_region, "us-east-1");
         assert_eq!(c.max_upload_bytes, 26_214_400);
-        assert!(c.allow_signups && c.run_migrations && !c.s3_force_path_style);
+        assert!(c.allow_signups && !c.run_migrations && !c.s3_force_path_style);
         assert_eq!(c.db_max_connections, 5);
         assert!(c.cron_secret.is_none());
     }
@@ -227,8 +229,8 @@ mod tests {
     #[test]
     fn fly_tigris_fallbacks_and_inactive_days() {
         let c = Config::from_lookup(lookup(&[
-            ("DATABASE_URL", "libsql://x.turso.io"),
-            ("DATABASE_AUTH_TOKEN", "tok"),
+            ("DATABASE_URL", "postgres://shotglass_app@db/x"),
+            ("MIGRATION_DATABASE_URL", "postgres://owner@db/x"),
             ("BUCKET_NAME", "tigris-bucket"),
             ("AWS_REGION", "auto"),
             ("INACTIVE_USER_DAYS", "0"),
@@ -236,7 +238,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.s3_bucket, "tigris-bucket");
         assert_eq!(c.s3_region, "auto");
-        assert_eq!(c.database_auth_token.as_deref(), Some("tok"));
+        assert_eq!(c.migration_database_url.as_deref(), Some("postgres://owner@db/x"));
         assert_eq!(c.inactive_user_days, 0);
         let c = Config::from_lookup(lookup(&[
             ("DATABASE_URL", "x"),

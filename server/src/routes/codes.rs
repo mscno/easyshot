@@ -73,7 +73,7 @@ async fn issue_and_send(
 }
 
 /// Validates a submitted code and spends it. Every failure is the same `InvalidCode`.
-async fn check_code(
+pub async fn check_code(
     st: &AppState,
     user_id: Uuid,
     purpose: CodePurpose,

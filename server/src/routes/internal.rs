@@ -75,6 +75,7 @@ async fn purge_inactive_users(
                 }
                 delete_rows_and_objects(st, &rows).await?;
             }
+            crate::video::service::purge_user(st, user).await?;
             repo::delete_user_records(&st.db, user).await?;
             purged += 1;
         }
@@ -120,6 +121,22 @@ pub async fn expire(State(st): State<AppState>, headers: HeaderMap) -> AppResult
         }
     }
 
+    let (mut expired_videos, mut aborted_uploads) = (0usize, 0usize);
+    if !more {
+        loop {
+            if Instant::now() >= deadline {
+                more = true;
+                break;
+            }
+            let (e, a) = crate::video::service::purge_batch(&st, now, BATCH as usize).await?;
+            expired_videos += e;
+            aborted_uploads += a;
+            if ((e + a) as i64) < BATCH {
+                break;
+            }
+        }
+    }
+
     let mut purged_users = 0;
     let days = st.config.inactive_user_days;
     if days > 0 && !more {
@@ -137,6 +154,8 @@ pub async fn expire(State(st): State<AppState>, headers: HeaderMap) -> AppResult
         purged_pending,
         purged_users,
         purged_sessions,
+        expired_videos,
+        aborted_uploads,
         more,
         "expire job finished"
     );
@@ -145,6 +164,8 @@ pub async fn expire(State(st): State<AppState>, headers: HeaderMap) -> AppResult
         "purged_pending": purged_pending,
         "purged_sessions": purged_sessions,
         "purged_users": purged_users,
+        "expired_videos": expired_videos,
+        "aborted_uploads": aborted_uploads,
         "more": more,
     })))
 }

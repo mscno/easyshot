@@ -1,15 +1,18 @@
-//! Portable database layer over Postgres (sqlx) and SQLite/libSQL/Turso (libsql).
+//! PostgreSQL access for the repository layer (sqlx), plus the migration runner.
 //!
-//! All SQL in the app is written once, in a dialect both engines accept, with `?1, ?2, ...`
-//! placeholders. The Postgres backend rewrites `?N` to `$N`. Values are `NULL`, 64-bit
-//! integers or text; ids are UUID strings, timestamps are epoch milliseconds, booleans 0/1.
+//! Values are `NULL`, 64-bit integers or text; ids are UUID strings, timestamps epoch
+//! milliseconds, booleans 0/1. Placeholders are `$1, $2, ...`.
+//!
+//! Two roles: migrations run as the table owner (`MIGRATION_DATABASE_URL`); the server
+//! connects as `shotglass_app`, which is `NOSUPERUSER NOBYPASSRLS`, so row-level security
+//! applies. A plain [`Db`] carries no tenant context and therefore sees no rows of
+//! owner-scoped tables; use [`Db::scoped`] for those (see [`Context`]).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::postgres::{PgPoolOptions, PgRow, PgTypeInfo};
-use sqlx::{Column, Row as _, TypeInfo, ValueRef};
-use tokio::sync::OnceCell;
+use sqlx::postgres::{PgConnection, PgPoolOptions, PgRow, PgTypeInfo};
+use sqlx::{Column, Connection, Row as _, TypeInfo, ValueRef};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -29,18 +32,6 @@ impl From<sqlx::Error> for DbError {
         match &e {
             sqlx::Error::Database(d) if d.is_unique_violation() => DbError::UniqueViolation,
             _ => DbError::Other(e.to_string()),
-        }
-    }
-}
-
-impl From<libsql::Error> for DbError {
-    fn from(e: libsql::Error) -> Self {
-        let msg = e.to_string();
-        if msg.contains("UNIQUE constraint failed") || msg.contains("PRIMARY KEY constraint failed")
-        {
-            DbError::UniqueViolation
-        } else {
-            DbError::Other(msg)
         }
     }
 }
@@ -141,42 +132,77 @@ impl Row {
     }
 }
 
-/// Rewrite `?N` placeholders (outside single-quoted literals) to Postgres `$N`.
-pub fn rewrite_placeholders(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut in_str = false;
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' => {
-                in_str = !in_str;
-                out.push(c);
-            }
-            '?' if !in_str && chars.peek().is_some_and(|d| d.is_ascii_digit()) => out.push('$'),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// `?{start},?{start+1},...` for `n` placeholders, for building `IN (...)` lists.
+/// `${start},${start+1},...` for `n` placeholders, for building `IN (...)` lists.
 pub fn placeholders(start: usize, n: usize) -> String {
     (start..start + n)
-        .map(|i| format!("?{i}"))
+        .map(|i| format!("${i}"))
         .collect::<Vec<_>>()
         .join(",")
 }
 
-pub struct LibsqlDb {
-    url: String,
-    auth_token: Option<String>,
-    conn: OnceCell<libsql::Connection>,
+/// Row-level-security context, applied with `set_config(..., true)` at the start of each
+/// transaction. Unset values are empty strings, which no policy matches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Context {
+    /// `app.user_id`: the signed-in principal; owner policies match it.
+    pub user_id: Option<String>,
+    /// `app.workspace_id`: reserved for team workspaces.
+    pub workspace_id: Option<String>,
+    /// `app.share_slug`: the one share link being resolved (read-only access to that item).
+    pub share_slug: Option<String>,
+    /// `app.share_item_id`: the resolved item; viewers may read and add conversation rows.
+    pub share_item_id: Option<String>,
+    /// `app.rls_bypass = 'maintenance'`: retention jobs only (`Context::maintenance`).
+    pub bypass: Option<&'static str>,
 }
 
+impl Context {
+    pub fn user(id: Uuid) -> Context {
+        Context {
+            user_id: Some(id.to_string()),
+            ..Context::default()
+        }
+    }
+
+    /// RLS BYPASS PATH: retention and account purge across all owners. Only the expire
+    /// job and account purge use it.
+    pub fn maintenance() -> Context {
+        Context {
+            bypass: Some("maintenance"),
+            ..Context::default()
+        }
+    }
+
+    /// The statement that installs this context; one round trip.
+    pub const SQL: &'static str = "SELECT set_config('app.user_id', $1, true), \
+         set_config('app.workspace_id', $2, true), set_config('app.share_slug', $3, true), \
+         set_config('app.share_item_id', $4, true), set_config('app.rls_bypass', $5, true)";
+
+    pub fn params(&self) -> [String; 5] {
+        [
+            self.user_id.clone().unwrap_or_default(),
+            self.workspace_id.clone().unwrap_or_default(),
+            self.share_slug.clone().unwrap_or_default(),
+            self.share_item_id.clone().unwrap_or_default(),
+            self.bypass.unwrap_or_default().to_string(),
+        ]
+    }
+
+    pub async fn apply(&self, conn: &mut PgConnection) -> DbResult<()> {
+        let mut q = sqlx::query(Self::SQL);
+        for p in self.params() {
+            q = q.bind(p);
+        }
+        q.execute(conn).await?;
+        Ok(())
+    }
+}
+
+/// The app-role pool, optionally bound to an RLS [`Context`].
 #[derive(Clone)]
-pub enum Db {
-    Pg(sqlx::PgPool),
-    Libsql(Arc<LibsqlDb>),
+pub struct Db {
+    pool: sqlx::PgPool,
+    context: Option<Arc<Context>>,
 }
 
 /// An argument that binds as a NULL of unspecified type (OID 0), so Postgres infers the type
@@ -219,145 +245,7 @@ fn pg_row(row: &PgRow) -> DbResult<Row> {
     Ok(Row(out))
 }
 
-impl Db {
-    /// Cheap and lazy: no network I/O or file access happens until the first query.
-    pub fn connect(cfg: &Config) -> DbResult<Db> {
-        let url = cfg.database_url.trim();
-        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            let pool = PgPoolOptions::new()
-                .max_connections(cfg.db_max_connections)
-                .acquire_timeout(Duration::from_secs(5))
-                .connect_lazy(url)?;
-            Ok(Db::Pg(pool))
-        } else if ["libsql://", "https://", "http://", "file:"]
-            .iter()
-            .any(|p| url.starts_with(p))
-        {
-            Ok(Db::Libsql(Arc::new(LibsqlDb {
-                url: url.to_string(),
-                auth_token: cfg.database_auth_token.clone(),
-                conn: OnceCell::new(),
-            })))
-        } else {
-            Err(DbError::Other(
-                "DATABASE_URL must start with postgres://, postgresql://, libsql://, https://, http:// or file:"
-                    .into(),
-            ))
-        }
-    }
-
-    pub fn backend(&self) -> &'static str {
-        match self {
-            Db::Pg(_) => "postgres",
-            Db::Libsql(_) => "libsql",
-        }
-    }
-
-    pub async fn execute(&self, sql: &str, params: &[Value]) -> DbResult<u64> {
-        match self {
-            Db::Pg(pool) => {
-                let sql = rewrite_placeholders(sql);
-                let r = pg_bind(sqlx::query(&sql), params).execute(pool).await?;
-                Ok(r.rows_affected())
-            }
-            Db::Libsql(l) => Ok(l.conn().await?.execute(sql, lq_params(params)).await?),
-        }
-    }
-
-    pub async fn query(&self, sql: &str, params: &[Value]) -> DbResult<Vec<Row>> {
-        match self {
-            Db::Pg(pool) => {
-                let sql = rewrite_placeholders(sql);
-                let rows = pg_bind(sqlx::query(&sql), params).fetch_all(pool).await?;
-                rows.iter().map(pg_row).collect()
-            }
-            Db::Libsql(l) => {
-                let mut rows = l.conn().await?.query(sql, lq_params(params)).await?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    let mut cols = Vec::with_capacity(row.column_count() as usize);
-                    for i in 0..row.column_count() {
-                        cols.push(match row.get_value(i)? {
-                            libsql::Value::Null => Value::Null,
-                            libsql::Value::Integer(n) => Value::Int(n),
-                            libsql::Value::Real(f) => Value::Int(f as i64),
-                            libsql::Value::Text(s) => Value::Text(s),
-                            libsql::Value::Blob(_) => {
-                                return Err(DbError::Other("unexpected blob column".into()))
-                            }
-                        });
-                    }
-                    out.push(Row(cols));
-                }
-                Ok(out)
-            }
-        }
-    }
-
-    pub async fn query_opt(&self, sql: &str, params: &[Value]) -> DbResult<Option<Row>> {
-        Ok(self.query(sql, params).await?.into_iter().next())
-    }
-
-    pub async fn query_one(&self, sql: &str, params: &[Value]) -> DbResult<Row> {
-        self.query_opt(sql, params)
-            .await?
-            .ok_or_else(|| DbError::Other("expected one row, got none".into()))
-    }
-
-    /// Apply pending migrations (embedded, portable SQL; tracked in `_migrations`).
-    pub async fn migrate(&self) -> DbResult<()> {
-        self.execute(
-            "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)",
-            &[],
-        )
-        .await?;
-        let applied: Vec<String> = self
-            .query("SELECT name FROM _migrations", &[])
-            .await?
-            .iter()
-            .map(|r| r.text(0))
-            .collect::<DbResult<_>>()?;
-        for (name, sql) in MIGRATIONS {
-            if applied.iter().any(|a| a == name) {
-                continue;
-            }
-            for stmt in split_statements(sql) {
-                self.execute(&stmt, &[]).await?;
-            }
-            self.execute(
-                "INSERT INTO _migrations (name, applied_at) VALUES (?1, ?2)",
-                &vals![*name, chrono::Utc::now().timestamp_millis()],
-            )
-            .await?;
-        }
-        Ok(())
-    }
-}
-
-pub const MIGRATIONS: &[(&str, &str)] = &[
-    ("0001_init", include_str!("../migrations/0001_init.sql")),
-    (
-        "0002_auth_codes",
-        include_str!("../migrations/0002_auth_codes.sql"),
-    ),
-    ("0003_videos", include_str!("../migrations/0003_videos.sql")),
-];
-
-/// Split a migration file on `;`, dropping `--` comment lines and blanks.
-pub fn split_statements(sql: &str) -> Vec<String> {
-    let cleaned: String = sql
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("--"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    cleaned
-        .split(';')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-fn pg_bind<'q>(
+fn bind<'q>(
     mut q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     params: &'q [Value],
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
@@ -376,43 +264,181 @@ fn pg_bind<'q>(
     q
 }
 
-fn lq_params(params: &[Value]) -> Vec<libsql::Value> {
-    params
-        .iter()
-        .map(|p| match p {
-            Value::Null => libsql::Value::Null,
-            Value::Int(n) => libsql::Value::Integer(*n),
-            Value::Text(s) => libsql::Value::Text(s.clone()),
-        })
-        .collect()
+impl Db {
+    /// Lazy app-role pool: no network I/O happens until the first query.
+    pub fn connect(cfg: &Config) -> DbResult<Db> {
+        let url = cfg.database_url.trim();
+        if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+            return Err(DbError::Other(
+                "DATABASE_URL must start with postgres:// or postgresql://".into(),
+            ));
+        }
+        let pool = PgPoolOptions::new()
+            .max_connections(cfg.db_max_connections)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_lazy(url)?;
+        Ok(Db::from_pool(pool))
+    }
+
+    pub fn from_pool(pool: sqlx::PgPool) -> Db {
+        Db {
+            pool,
+            context: None,
+        }
+    }
+
+    pub fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
+    }
+
+    /// The same pool, running every statement in a transaction that first applies `ctx`.
+    pub fn scoped(&self, ctx: Context) -> Db {
+        Db {
+            pool: self.pool.clone(),
+            context: Some(Arc::new(ctx)),
+        }
+    }
+
+    pub async fn execute(&self, sql: &str, params: &[Value]) -> DbResult<u64> {
+        match &self.context {
+            None => Ok(bind(sqlx::query(sql), params)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()),
+            Some(ctx) => {
+                let mut tx = self.pool.begin().await?;
+                ctx.apply(&mut tx).await?;
+                let n = bind(sqlx::query(sql), params)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                tx.commit().await?;
+                Ok(n)
+            }
+        }
+    }
+
+    pub async fn query(&self, sql: &str, params: &[Value]) -> DbResult<Vec<Row>> {
+        let rows = match &self.context {
+            None => bind(sqlx::query(sql), params).fetch_all(&self.pool).await?,
+            Some(ctx) => {
+                let mut tx = self.pool.begin().await?;
+                ctx.apply(&mut tx).await?;
+                let rows = bind(sqlx::query(sql), params).fetch_all(&mut *tx).await?;
+                tx.commit().await?;
+                rows
+            }
+        };
+        rows.iter().map(pg_row).collect()
+    }
+
+    pub async fn query_opt(&self, sql: &str, params: &[Value]) -> DbResult<Option<Row>> {
+        Ok(self.query(sql, params).await?.into_iter().next())
+    }
+
+    pub async fn query_one(&self, sql: &str, params: &[Value]) -> DbResult<Row> {
+        self.query_opt(sql, params)
+            .await?
+            .ok_or_else(|| DbError::Other("expected one row, got none".into()))
+    }
 }
 
-impl LibsqlDb {
-    /// One connection, created on first use and shared by all requests. Remote (Turso/sqld)
-    /// connections are stateless HTTP clients, so sharing one avoids reconnect churn.
-    async fn conn(&self) -> DbResult<&libsql::Connection> {
-        self.conn
-            .get_or_try_init(|| async {
-                let u = &self.url;
-                let db = if let Some(rest) = u.strip_prefix("file:") {
-                    // `file:rel.db`, `file:///abs.db` and `file::memory:`.
-                    let path = rest.strip_prefix("//").unwrap_or(rest).to_string();
-                    libsql::Builder::new_local(path).build().await?
-                } else {
-                    let url = u.replacen("libsql://", "https://", 1);
-                    libsql::Builder::new_remote(url, self.auth_token.clone().unwrap_or_default())
-                        .build()
-                        .await?
-                };
-                let conn = db.connect()?;
-                if u.starts_with("file:") {
-                    let _ = conn.busy_timeout(Duration::from_secs(5));
-                }
-                Ok::<_, libsql::Error>(conn)
-            })
-            .await
-            .map_err(Into::into)
+// ---------- migrations (owner role) ----------
+
+include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
+
+/// Serializes concurrent migration runs (deploy release command vs. local tasks).
+const MIGRATION_LOCK: i64 = 0x5347_4d49_4752; // "SGMIGR"
+
+async fn owner_conn(url: &str) -> DbResult<PgConnection> {
+    Ok(PgConnection::connect(url).await?)
+}
+
+async fn applied(conn: &mut PgConnection) -> DbResult<Vec<String>> {
+    let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('_migrations')::text")
+        .fetch_one(&mut *conn)
+        .await?;
+    if exists.is_none() {
+        sqlx::raw_sql("CREATE TABLE _migrations (name TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)")
+            .execute(&mut *conn)
+            .await?;
     }
+    Ok(sqlx::query_scalar("SELECT name FROM _migrations ORDER BY name")
+        .fetch_all(&mut *conn)
+        .await?)
+}
+
+/// Apply pending migrations as the table owner. Each file runs in its own transaction.
+pub async fn migrate(owner_url: &str) -> DbResult<Vec<&'static str>> {
+    let mut conn = owner_conn(owner_url).await?;
+    migrate_conn(&mut conn).await
+}
+
+pub async fn migrate_conn(conn: &mut PgConnection) -> DbResult<Vec<&'static str>> {
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_LOCK)
+        .execute(&mut *conn)
+        .await?;
+    let result = async {
+        let done = applied(conn).await?;
+        let mut ran = Vec::new();
+        for (name, sql) in MIGRATIONS {
+            if done.iter().any(|d| d == name) {
+                continue;
+            }
+            let mut tx = conn.begin().await?;
+            sqlx::raw_sql(sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| DbError::Other(format!("migration {name}: {e}")))?;
+            sqlx::query("INSERT INTO _migrations (name, applied_at) VALUES ($1, $2)")
+                .bind(*name)
+                .bind(chrono::Utc::now().timestamp_millis())
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            ran.push(*name);
+        }
+        Ok(ran)
+    }
+    .await;
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATION_LOCK)
+        .execute(&mut *conn)
+        .await;
+    result
+}
+
+/// `(name, applied)` for every embedded migration.
+pub async fn status(owner_url: &str) -> DbResult<Vec<(&'static str, bool)>> {
+    let mut conn = owner_conn(owner_url).await?;
+    let done = applied(&mut conn).await?;
+    Ok(MIGRATIONS
+        .iter()
+        .map(|(n, _)| (*n, done.iter().any(|d| d == n)))
+        .collect())
+}
+
+/// Drop and recreate the `public` schema, then migrate. Refuses anything but a database
+/// whose name ends in `_dev` or `_test`.
+pub async fn reset(owner_url: &str) -> DbResult<Vec<&'static str>> {
+    let db = owner_url
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("");
+    if !(db.ends_with("_dev") || db.ends_with("_test")) {
+        return Err(DbError::Other(format!(
+            "refusing to reset database {db:?}: only *_dev or *_test databases"
+        )));
+    }
+    let mut conn = owner_conn(owner_url).await?;
+    sqlx::raw_sql("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;")
+        .execute(&mut conn)
+        .await?;
+    migrate_conn(&mut conn).await
 }
 
 #[cfg(test)]
@@ -420,32 +446,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rewrites_placeholders() {
-        assert_eq!(
-            rewrite_placeholders("SELECT * FROM t WHERE a = ?1 AND b = ?2 OR c = ?1"),
-            "SELECT * FROM t WHERE a = $1 AND b = $2 OR c = $1"
-        );
-        assert_eq!(
-            rewrite_placeholders("SELECT '?1 is literal', ?10"),
-            "SELECT '?1 is literal', $10"
-        );
-        assert_eq!(rewrite_placeholders("SELECT 1"), "SELECT 1");
-    }
-
-    #[test]
     fn builds_placeholder_lists() {
-        assert_eq!(placeholders(1, 3), "?1,?2,?3");
-        assert_eq!(placeholders(2, 2), "?2,?3");
+        assert_eq!(placeholders(1, 3), "$1,$2,$3");
+        assert_eq!(placeholders(2, 2), "$2,$3");
         assert_eq!(placeholders(1, 0), "");
     }
 
     #[test]
-    fn splits_migrations() {
-        let s = split_statements("-- c\nCREATE TABLE a (x INT);\n\nCREATE INDEX i ON a (x);\n");
-        assert_eq!(s, vec!["CREATE TABLE a (x INT)", "CREATE INDEX i ON a (x)"]);
-        for (_, sql) in MIGRATIONS {
-            assert!(!split_statements(sql).is_empty());
-        }
+    fn migrations_are_embedded_in_order() {
+        assert!(MIGRATIONS.len() >= 4);
+        assert!(MIGRATIONS.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(MIGRATIONS[0].0, "0001_init");
     }
 
     #[test]
@@ -456,32 +467,11 @@ mod tests {
         assert_eq!(Value::from("x"), Value::Text("x".into()));
     }
 
-    #[tokio::test]
-    async fn libsql_local_roundtrip_and_unique() {
-        let cfg = Config::for_tests("file::memory:");
-        let db = Db::connect(&cfg).unwrap();
-        db.migrate().await.unwrap();
-        db.migrate().await.unwrap(); // idempotent
-        let ins = "INSERT INTO login_attempts (id, email, ip, succeeded, created_at) VALUES (?1, ?2, ?3, ?4, ?5)";
-        db.execute(ins, &vals!["a", "e@x.y", None::<String>, true, 5i64])
-            .await
-            .unwrap();
-        let err = db
-            .execute(ins, &vals!["a", "e@x.y", "1.2.3.4", false, 6i64])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::UniqueViolation), "{err:?}");
-        let r = db
-            .query_one("SELECT id, ip, succeeded FROM login_attempts", &[])
-            .await
-            .unwrap();
-        assert_eq!(r.text(0).unwrap(), "a");
-        assert_eq!(r.opt_text(1).unwrap(), None);
-        assert_eq!(r.i64(2).unwrap(), 1);
-        assert!(db
-            .query_opt("SELECT id FROM login_attempts WHERE id = ?1", &vals!["zz"])
-            .await
-            .unwrap()
-            .is_none());
+    #[test]
+    fn context_params() {
+        let u = Uuid::nil();
+        assert_eq!(Context::user(u).params()[0], u.to_string());
+        assert_eq!(Context::default().params(), <[String; 5]>::default());
+        assert_eq!(Context::maintenance().params()[4], "maintenance");
     }
 }
