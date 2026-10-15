@@ -46,18 +46,6 @@ struct PinnedImage: View {
     }
 }
 
-struct RecordingControls: View {
-    @ObservedObject var controller: AppController
-    var body: some View {
-        HStack(spacing: 12) {
-            Circle().fill(.red).frame(width: 7,height: 7)
-            Text(controller.timeString).font(.system(size: 14,weight: .medium,design: .monospaced))
-            Spacer()
-            Button { Task { await controller.stopRecording() } } label: { Label("Stop",systemImage: "stop.fill").font(.system(size: 12,weight: .semibold)) }.buttonStyle(.glassProminent).tint(.red)
-        }.padding(14).glassEffect(.regular,in: Capsule()).preferredColorScheme(.dark)
-    }
-}
-
 struct ScrollingControls: View {
     @ObservedObject var controller: AppController
     var body: some View {

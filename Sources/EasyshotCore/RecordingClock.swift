@@ -42,6 +42,14 @@ public struct PauseClock: Sendable {
         }
         return t-removed
     }
+    /// Like `outputTime`, but an instant inside a cut maps to where the recording resumes.
+    public func clampedOutputTime(_ t: Double) -> Double {
+        var removed = 0.0
+        for cut in cuts {
+            if t >= cut.end { removed += cut.end-cut.start } else if t >= cut.start { return cut.start-removed } else { break }
+        }
+        return t-removed
+    }
     /// Total paused time removed so far.
     public var removed: Double { cuts.reduce(0) { $0+$1.end-$1.start } }
 }

@@ -36,6 +36,7 @@ struct CaptureRequest {
     @Published var busy = false
     @Published var recording = false
     @Published var recordingSeconds = 0
+    @Published var recordingPaused = false
     @Published var scrollFrames = 0
     @Published var scrollNotice = "Scroll the content, then add another frame."
     @Published var autoScrolling = false
@@ -560,9 +561,11 @@ struct CaptureRequest {
             guard #available(macOS 15.0, *) else { throw ShotError.message("Microphone capture requires macOS 15 or later.") }
             if !(await AVCaptureDevice.requestAccess(for: .audio)) { throw ShotError.message("Microphone access was denied. Enable it in System Settings or turn off microphone capture.") }
         }
-        let (filter,config) = try engine.configuration(for: target,recording: true)
+        var (filter,config) = try engine.configuration(for: target,recording: true)
+        filter = engine.recordingFilter(for: target,default: filter,configuration: config)
         let p = Preferences.shared
-        let folder = try p.saveToDisk ? p.captureFolder() : store.support.appendingPathComponent("Captures")
+        // A GIF recording keeps its intermediate MP4 in internal history; only the GIF is delivered.
+        let folder = try p.saveToDisk && !p.recordAsGIF ? p.captureFolder() : store.support.appendingPathComponent("Captures")
         try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
         let url = folder.appendingPathComponent(CaptureFiles.filename(extension: "mp4"))
         let recorder = Recorder()
@@ -589,22 +592,22 @@ struct CaptureRequest {
         } catch { effects?.stop(); throw error }
         recordingEffects = effects
         self.recorder = recorder; recordURL = url; recordSize = CGSize(width: config.width,height: config.height)
-        recording = true; recordingSeconds = 0; status = "Recording…"
+        recording = true; recordingSeconds = 0; recordingPaused = false; status = "Recording…"
         recordTimer = Timer.scheduledTimer(withTimeInterval: 1,repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }; self.recordingSeconds += 1
+                guard let self,!self.recordingPaused else { return }; self.recordingSeconds += 1
             }
         }
         let screen = NSScreen.pointerScreen
-        let panel = NSPanel(contentRect: CGRect(x: screen.visibleFrame.midX-120,y: screen.visibleFrame.minY+25,width: 240,height: 56),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
+        let panel = NSPanel(contentRect: CGRect(x: screen.visibleFrame.midX-150,y: screen.visibleFrame.minY+25,width: 300,height: 56),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
         panel.level = .floating; panel.isOpaque = false; panel.backgroundColor = .clear
         panel.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary]
-        panel.contentView = NSHostingView(rootView: RecordingControls(controller: self)); panel.orderFrontRegardless(); recordPanel = panel
+        panel.contentView = NSHostingView(rootView: RecordingPill(controller: self)); panel.orderFrontRegardless(); recordPanel = panel
     }
     var timeString: String { String(format: "%02d:%02d",recordingSeconds/60,recordingSeconds%60) }
     func stopRecording() async {
         guard recording,let recorder else { return }
-        recording = false; busy = true; recordTimer?.invalidate(); recordPanel?.orderOut(nil)
+        recording = false; recordingPaused = false; busy = true; recordTimer?.invalidate(); recordPanel?.orderOut(nil)
         do {
             try await recorder.stop()
             recordingEffects?.stop()
@@ -613,7 +616,7 @@ struct CaptureRequest {
                     do { try await VideoTools.mixAudio(url) } catch { store.error = error.localizedDescription }
                 }
                 let clip = Clip(path: url.path,kind: "Recording",width: Int(recordSize.width),height: Int(recordSize.height))
-                store.add(clip); if Preferences.shared.copyToClipboard { store.copy(clip) }; showPreview(clip)
+                await deliverRecording(clip)
                 status = "Recording saved\(Preferences.shared.copyToClipboard ? " and copied" : "")"
             }
         } catch { recordingEffects?.stop(); fail(error) }

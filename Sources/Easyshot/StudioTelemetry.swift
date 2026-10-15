@@ -88,11 +88,16 @@ final class CursorTelemetry: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Stops sampling and writes the sidecar. Times become relative to the first frame.
-    func finish(video: URL) throws {
+    /// Stops sampling and writes the sidecar. Times become relative to the first frame; paused spans
+    /// are removed with the same cuts as the video (`retime` returns nil inside a pause, `clamp` its resume point).
+    func finish(video: URL,retime: (Double) -> Double? = { $0 },clamp: (Double) -> Double = { $0 }) throws {
         timer?.cancel(); timer = nil
         lock.lock(); var track = self.track; let origin = self.origin; lock.unlock()
         guard let origin else { return }
+        track.samples = track.samples.compactMap { s in retime(s.t).map { var s = s; s.t = $0; return s } }
+        track.clicks = track.clicks.compactMap { c in retime(c.t).map { var c = c; c.t = $0; return c } }
+        track.keys = track.keys.compactMap(retime)
+        track.shapeChanges = track.shapeChanges.map { var c = $0; c.t = clamp(c.t); return c }
         track.samples = track.samples.map { var s = $0; s.t = (s.t-origin)*1000; s.t = s.t.rounded()/1000; return s }
         if let firstInside = track.samples.firstIndex(where: { $0.t >= 0 }), firstInside > 0 {
             track.samples.removeFirst(firstInside-1); track.samples[0].t = 0

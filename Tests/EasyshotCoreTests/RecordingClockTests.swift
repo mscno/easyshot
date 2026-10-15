@@ -25,6 +25,8 @@ final class RecordingClockTests: XCTestCase {
         XCTAssertEqual(clock.outputTime(0.5)!, 0.5, accuracy: 0.0001)
         XCTAssertNil(clock.outputTime(2))
         XCTAssertEqual(clock.outputTime(3.5)!, 1.5, accuracy: 0.0001)
+        XCTAssertEqual(clock.clampedOutputTime(2), 1.0, accuracy: 0.0001)
+        XCTAssertEqual(clock.clampedOutputTime(3.5), 1.5, accuracy: 0.0001)
     }
     func testTimesNeverGoBackwards() {
         var clock = PauseClock(frameDuration: 1/30)
