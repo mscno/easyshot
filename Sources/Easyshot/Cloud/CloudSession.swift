@@ -13,6 +13,9 @@ import EasyshotCore
     @Published var error: String?
     private var token: String?
     private var loadedFor: String?
+    /// Bumped whenever the server or the signed-in identity changes. A sign-in that started under an older
+    /// generation is discarded, so a token is only ever stored for, and sent to, the server that issued it.
+    private var generation = 0
     private let preferences = Preferences.shared
 
     var baseURL: URL? { Preferences.validatedServerURL(preferences.cloudBaseURL) }
@@ -22,34 +25,54 @@ import EasyshotCore
     private var account: String { baseURL?.absoluteString ?? "" }
     private func loadIfNeeded() {
         guard loadedFor != account else { return }
-        loadedFor = account
+        loadedFor = account; generation += 1
         token = CloudKeychain.read(account)
         user = UserDefaults.standard.data(forKey: "cloudUser:\(account)").flatMap { try? JSONDecoder().decode(CloudUser.self,from: $0) }
     }
     /// A server change must not send the old server's token to the new one.
     func serverChanged() { loadedFor = nil; loadIfNeeded(); objectWillChange.send() }
 
-    func signIn(email: String,password: String,register: Bool) async {
-        guard let url = baseURL else { error = "Enter a valid server address (https://…)."; return }
+    /// Where a request started: the server, its Keychain account and the generation at that moment.
+    private struct Origin { var url: URL; var account: String; var generation: Int }
+    private func origin() -> Origin? {
+        loadIfNeeded()
+        guard let url = baseURL else { error = "Enter a valid server address (https://…)."; return nil }
+        return Origin(url: url,account: account,generation: generation)
+    }
+    /// Signs in with a password, or creates the account. Returns true when the server emailed a code to
+    /// confirm the address instead (new or unconfirmed accounts); `signIn(email:code:)` finishes it.
+    @discardableResult func signIn(email: String,password: String,register: Bool) async -> Bool {
+        guard let origin = origin() else { return false }
         let address = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard address.contains("@"),!password.isEmpty else { error = "Enter your email and password."; return }
+        guard address.contains("@"),!password.isEmpty else { error = "Enter your email and password."; return false }
         busy = true; error = nil; defer { busy = false }
         do {
-            let result = try await CloudClient(baseURL: url).authenticate(register: register,email: address,password: password,deviceName: Host.current().localizedName ?? "Mac")
-            finish(result)
-        } catch { self.error = error.localizedDescription }
+            switch try await CloudClient(baseURL: origin.url).authenticate(register: register,email: address,password: password,deviceName: Host.current().localizedName ?? "Mac") {
+            case .signedIn(let result): finish(result,from: origin); return false
+            case .verificationRequired: return true
+            }
+        } catch { self.error = error.localizedDescription; return false }
     }
-    private func finish(_ result: CloudClient.AuthResult) {
-        CloudKeychain.write(result.token,account: account)
-        UserDefaults.standard.set(try? JSONEncoder().encode(result.user),forKey: "cloudUser:\(account)")
-        token = result.token; user = result.user; loadedFor = account
+    private func finish(_ result: CloudClient.AuthResult,from origin: Origin) {
+        loadIfNeeded()
+        guard origin.generation == generation,origin.account == account else {
+            // The server changed or the user signed out while this was in flight; the token is only valid
+            // at `origin`, and nobody asked for it any more.
+            let client = CloudClient(baseURL: origin.url,token: result.token)
+            Task { await client.logout() }
+            return
+        }
+        CloudKeychain.write(result.token,account: origin.account)
+        UserDefaults.standard.set(try? JSONEncoder().encode(result.user),forKey: "cloudUser:\(origin.account)")
+        token = result.token; user = result.user
     }
     /// Runs a server call that doesn't sign in, surfacing the server's message. Returns success.
-    @discardableResult private func attempt(_ work: (CloudClient) async throws -> Void) async -> Bool {
-        guard let url = baseURL else { error = "Enter a valid server address (https://…)."; return false }
+    @discardableResult private func attempt(_ work: (CloudClient,Origin) async throws -> Void) async -> Bool {
+        guard let origin = origin() else { return false }
+        let token = token
         busy = true; error = nil; defer { busy = false }
-        do { try await work(CloudClient(baseURL: url,token: token)); return true }
-        catch CloudError.notSignedIn where token != nil { sessionExpired(); return false }
+        do { try await work(CloudClient(baseURL: origin.url,token: token),origin); return true }
+        catch CloudError.notSignedIn where token != nil { expire(origin); return false }
         catch { self.error = error.localizedDescription; return false }
     }
     private func validEmail(_ email: String) -> String? {
@@ -60,19 +83,19 @@ import EasyshotCore
     /// Emails a 6-digit code for sign-in (`reset: false`) or a password reset.
     func requestCode(email: String,reset: Bool) async -> Bool {
         guard let address = validEmail(email) else { return false }
-        return await attempt { try await $0.requestCode(email: address,reset: reset) }
+        return await attempt { client,_ in try await client.requestCode(email: address,reset: reset) }
     }
     func signIn(email: String,code: String) async {
         guard let address = validEmail(email) else { return }
-        await attempt { self.finish(try await $0.signIn(email: address,code: code.trimmingCharacters(in: .whitespaces))) }
+        await attempt { client,origin in self.finish(try await client.signIn(email: address,code: code.trimmingCharacters(in: .whitespaces)),from: origin) }
     }
     func resetPassword(email: String,code: String,newPassword: String) async -> Bool {
         guard let address = validEmail(email) else { return false }
-        return await attempt { try await $0.resetPassword(email: address,code: code.trimmingCharacters(in: .whitespaces),newPassword: newPassword) }
+        return await attempt { client,_ in try await client.resetPassword(email: address,code: code.trimmingCharacters(in: .whitespaces),newPassword: newPassword) }
     }
-    func sendVerification() async -> Bool { await attempt { try await $0.sendVerification() } }
+    func sendVerification() async -> Bool { await attempt { client,_ in try await client.sendVerification() } }
     func confirmEmail(code: String) async -> Bool {
-        let ok = await attempt { try await $0.confirmEmail(code: code.trimmingCharacters(in: .whitespaces)) }
+        let ok = await attempt { client,_ in try await client.confirmEmail(code: code.trimmingCharacters(in: .whitespaces)) }
         if ok,var current = user {
             current.emailVerified = true; user = current
             UserDefaults.standard.set(try? JSONEncoder().encode(current),forKey: "cloudUser:\(account)")
@@ -92,24 +115,30 @@ import EasyshotCore
         Task { await client?.logout() }
         CloudKeychain.delete(account)
         UserDefaults.standard.removeObject(forKey: "cloudUser:\(account)")
-        token = nil; user = nil
+        token = nil; user = nil; generation += 1
     }
     /// The server rejected our token (expired or revoked).
     func sessionExpired() {
         CloudKeychain.delete(account); UserDefaults.standard.removeObject(forKey: "cloudUser:\(account)")
-        token = nil; user = nil; error = "Your session expired. Sign in again."
+        token = nil; user = nil; error = "Your session expired. Sign in again."; generation += 1
+    }
+    /// A rejection from `origin` only clears that server's credentials, and only if they are still current.
+    private func expire(_ origin: Origin) {
+        loadIfNeeded()
+        if origin.generation == generation { sessionExpired() }
     }
 
     /// Reserve → PUT to storage → confirm. Returns the confirmed screenshot with its share link.
     func upload(_ image: UploadableImage) async throws -> CloudScreenshot {
         guard let client else { throw CloudError.notSignedIn }
+        let origin = Origin(url: client.baseURL,account: client.baseURL.absoluteString,generation: generation)
         do {
             let created = try await client.create(contentType: image.contentType,byteSize: image.data.count,width: image.width,height: image.height,filename: image.filename)
             try await client.put(image.data,to: created)
             var done = try await client.complete(created.screenshot.id)
             if done.shareURL.isEmpty { done.shareURL = created.screenshot.shareURL }
             return done
-        } catch CloudError.notSignedIn { sessionExpired(); throw CloudError.notSignedIn }
+        } catch CloudError.notSignedIn { expire(origin); throw CloudError.notSignedIn }
     }
 }
 

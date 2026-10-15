@@ -9,7 +9,10 @@ enum CloudDiagnostics {
         guard let url = Preferences.validatedServerURL(base) else { print("FAIL: invalid server URL"); return 1 }
         do {
             let email = "cloud-test-\(UUID().uuidString.prefix(8).lowercased())@example.com"
-            let auth = try await CloudClient(baseURL: url).authenticate(register: true,email: email,password: "correct horse battery staple",deviceName: "cloud-test")
+            guard case .signedIn(let auth) = try await CloudClient(baseURL: url).authenticate(register: true,email: email,password: "correct horse battery staple",deviceName: "cloud-test") else {
+                print("FAIL: this server confirms new accounts by email; run --cloud-test against a server without mail configured")
+                return 1
+            }
             check(auth.user.email == email,"register returns the new user")
             let client = CloudClient(baseURL: url,token: auth.token)
             check((try await client.me()).email == email,"session token authenticates /v1/me")

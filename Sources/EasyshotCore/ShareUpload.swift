@@ -62,6 +62,15 @@ public struct Backoff: Sendable {
     /// Network failures and server-side errors are worth retrying; client errors (other than an expired
     /// presigned URL, 403, and throttling, 429) are not.
     public static func retryable(status: Int) -> Bool { status == 0 || status == 403 || status == 408 || status == 429 || status >= 500 }
+    /// Transport failures that a later attempt can fix; cancellation, bad URLs and TLS trust failures cannot.
+    public static func transient(_ code: URLError.Code) -> Bool {
+        switch code {
+        case .cancelled,.badURL,.unsupportedURL,.userAuthenticationRequired,.userCancelledAuthentication,.serverCertificateUntrusted,
+             .serverCertificateHasBadDate,.serverCertificateNotYetValid,.serverCertificateHasUnknownRoot,.clientCertificateRejected,
+             .clientCertificateRequired,.appTransportSecurityRequiresSecureConnection,.fileDoesNotExist,.noPermissionsToReadFile: return false
+        default: return true
+        }
+    }
 }
 
 /// WebVTT captions from timed phrases.

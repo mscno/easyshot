@@ -48,6 +48,9 @@ final class ShareUploadTests: XCTestCase {
         XCTAssertEqual(b.delay(attempt: 2,unit: 1),2.4,accuracy: 1e-9)
         XCTAssertTrue(Backoff.retryable(status: 0)); XCTAssertTrue(Backoff.retryable(status: 503)); XCTAssertTrue(Backoff.retryable(status: 403))
         XCTAssertFalse(Backoff.retryable(status: 400)); XCTAssertFalse(Backoff.retryable(status: 404))
+        XCTAssertTrue(Backoff.retryable(status: 429))
+        XCTAssertTrue(Backoff.transient(.timedOut)); XCTAssertTrue(Backoff.transient(.networkConnectionLost)); XCTAssertTrue(Backoff.transient(.notConnectedToInternet))
+        XCTAssertFalse(Backoff.transient(.cancelled)); XCTAssertFalse(Backoff.transient(.serverCertificateUntrusted)); XCTAssertFalse(Backoff.transient(.badURL))
     }
     func testVTTFormatting() {
         XCTAssertEqual(WebVTT.timestamp(3725.4567),"01:02:05.457")

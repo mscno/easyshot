@@ -11,13 +11,24 @@ struct CloudScreenshot: Identifiable, Equatable {
 }
 
 enum CloudError: LocalizedError {
-    case notSignedIn, server(String), invalidResponse, uploadFailed(Int)
+    /// `server` keeps the HTTP status and the API's error code so callers can tell a busy server from a refusal.
+    case notSignedIn, server(status: Int,code: String?,message: String), invalidResponse, uploadFailed(Int)
     var errorDescription: String? {
         switch self {
         case .notSignedIn: return "Sign in to Easyshot Cloud to upload screenshots."
-        case .server(let message): return message
+        case .server(_,_,let message): return message
         case .invalidResponse: return "The Easyshot server sent an unexpected response."
         case .uploadFailed(let status): return "Upload to storage failed (HTTP \(status))."
+        }
+    }
+    /// The HTTP status for retry decisions: 0 for transient transport failures, nil when retrying cannot help.
+    static func retryStatus(_ error: Error) -> Int? {
+        switch error {
+        case CloudError.uploadFailed(let status): return status
+        // Storage answers 403 for an expired presigned URL, but the API's 403 is a refusal.
+        case CloudError.server(let status,_,_): return status == 403 ? nil : status
+        case let error as URLError: return Backoff.transient(error.code) ? 0 : nil
+        default: return nil
         }
     }
 }
@@ -38,11 +49,13 @@ struct CloudClient {
     }
     struct Created { var screenshot: CloudScreenshot; var uploadURL: URL; var headers: [String: String]; var method: String }
     struct AuthResult { var token: String; var user: CloudUser }
+    /// Accounts are usable only once their address is confirmed; until then the server mails a code instead of a session.
+    enum AuthOutcome { case signedIn(AuthResult),verificationRequired }
 
     static let decoder: JSONDecoder = { let d = JSONDecoder(); d.keyDecodingStrategy = .convertFromSnakeCase; return d }()
 
     private static let failureDecoder = JSONDecoder()
-    private struct Failure: Decodable { struct Inner: Decodable { var message: String }; var error: Inner }
+    private struct Failure: Decodable { struct Inner: Decodable { var code: String?; var message: String }; var error: Inner }
 
     func makeRequest(_ method: String,_ path: String,query: [URLQueryItem] = [],body: Data? = nil,authorized: Bool = true) throws -> URLRequest {
         var components = URLComponents(url: baseURL.appendingPathComponent(path),resolvingAgainstBaseURL: false)!
@@ -63,7 +76,8 @@ struct CloudClient {
         guard let http = response as? HTTPURLResponse else { throw CloudError.invalidResponse }
         if http.statusCode == 401 && authorized { throw CloudError.notSignedIn }
         guard (200..<300).contains(http.statusCode) else {
-            throw CloudError.server((try? Self.failureDecoder.decode(Failure.self,from: data))?.error.message ?? "Server error (HTTP \(http.statusCode)).")
+            let failure = try? Self.failureDecoder.decode(Failure.self,from: data)
+            throw CloudError.server(status: http.statusCode,code: failure?.error.code,message: failure?.error.message ?? "Server error (HTTP \(http.statusCode)).")
         }
         return data
     }
@@ -76,13 +90,17 @@ struct CloudClient {
         return CloudScreenshot(id: wire.id,slug: wire.slug,shareURL: wire.shareUrl,contentType: wire.contentType,byteSize: wire.byteSize,width: wire.width,height: wire.height,filename: wire.filename,createdAt: created,expiresAt: expires,imageURL: wire.imageUrl ?? "")
     }
 
-    func authenticate(register: Bool,email: String,password: String,deviceName: String) async throws -> AuthResult {
+    func authenticate(register: Bool,email: String,password: String,deviceName: String) async throws -> AuthOutcome {
         struct Body: Encodable { var email: String; var password: String; var deviceName: String }
-        struct Reply: Decodable { var token: String; var user: CloudUser }
+        struct Reply: Decodable { var token: String?; var user: CloudUser?; var verificationRequired: Bool? }
         let body = try Self.encoder.encode(Body(email: email,password: password,deviceName: deviceName))
-        let data = try await send(makeRequest("POST","v1/auth/\(register ? "register" : "login")",body: body,authorized: false),authorized: false)
+        let data: Data
+        do { data = try await send(makeRequest("POST","v1/auth/\(register ? "register" : "login")",body: body,authorized: false),authorized: false) }
+        catch CloudError.server(403,"EMAIL_NOT_VERIFIED",_) { return .verificationRequired }
         let reply = try Self.decoder.decode(Reply.self,from: data)
-        return AuthResult(token: reply.token,user: reply.user)
+        if let token = reply.token,let user = reply.user { return .signedIn(AuthResult(token: token,user: user)) }
+        guard reply.verificationRequired == true else { throw CloudError.invalidResponse }
+        return .verificationRequired
     }
     private static let deviceName = Host.current().localizedName ?? "Mac"
     private func post<B: Encodable>(_ path: String,_ body: B,authorized: Bool = false) async throws -> Data {

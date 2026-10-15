@@ -4,7 +4,8 @@ import EasyshotCore
 
 /// Sign in (password or emailed code) / create account / reset password / confirm email / sign out.
 struct CloudAccountForm: View {
-    private enum Mode { case password, code, reset }
+    /// `confirm` finishes a new or unconfirmed account with the code the server emailed.
+    private enum Mode { case password, code, reset, confirm }
     @ObservedObject var cloud = CloudSession.shared
     @ObservedObject var preferences = Preferences.shared
     @State private var mode = Mode.password
@@ -45,11 +46,11 @@ struct CloudAccountForm: View {
         switch mode {
         case .password:
             SecureField("Password",text: $password).textContentType(.password)
-                .onSubmit { Task { await cloud.signIn(email: email,password: password,register: false) } }
+                .onSubmit { passwordSignIn(register: false) }
             HStack {
-                Button("Sign In") { Task { await cloud.signIn(email: email,password: password,register: false) } }
+                Button("Sign In") { passwordSignIn(register: false) }
                     .buttonStyle(.glassProminent).disabled(cloud.busy)
-                Button("Create Account") { Task { await cloud.signIn(email: email,password: password,register: true) } }.disabled(cloud.busy)
+                Button("Create Account") { passwordSignIn(register: true) }.disabled(cloud.busy)
                 if cloud.busy { ProgressView().controlSize(.small) }
             }
             HStack {
@@ -58,6 +59,18 @@ struct CloudAccountForm: View {
             }.buttonStyle(.link).font(.caption)
         case .code:
             codeFields(sendTitle: "Email Me a Code",confirmTitle: "Sign In") { Task { await cloud.signIn(email: email,code: code) } }
+        case .confirm:
+            Text("Enter the code we emailed to \(email) to finish signing in. If this address already has an account, the code signs you in to it.")
+                .font(.caption).foregroundStyle(.secondary)
+            TextField("6-digit code from the email",text: $code).onSubmit { confirmAccount() }
+            HStack {
+                Button("Confirm",action: confirmAccount).buttonStyle(.glassProminent).disabled(cloud.busy || code.count < 6)
+                // Registering again mails a fresh code tied to this password; the server answers the same either way.
+                Button("Resend Code") { Task { if await cloud.signIn(email: email,password: password,register: true) { notice = "A new code is on its way." } } }
+                    .buttonStyle(.glass).disabled(cloud.busy)
+                Button("Back") { switchTo(.password) }.buttonStyle(.link)
+                if cloud.busy { ProgressView().controlSize(.small) }
+            }
         case .reset:
             codeFields(sendTitle: "Email Reset Code",confirmTitle: "Reset Password",newPassword: true) {
                 Task { if await cloud.resetPassword(email: email,code: code,newPassword: newPassword) { switchTo(.password); notice = "Password changed. Sign in with the new one." } }
@@ -65,11 +78,19 @@ struct CloudAccountForm: View {
         }
         status
         DisclosureGroup("Server",isExpanded: $showServer) {
+            // Locked while a request is in flight, so an answer can't be mistaken for the new server's.
             TextField("https://…",text: $preferences.cloudBaseURL).textFieldStyle(.roundedBorder)
-                .onSubmit { cloud.serverChanged() }
+                .onSubmit { cloud.serverChanged() }.disabled(cloud.busy)
             Text("Passwords need at least 10 characters. Screenshots are kept for 30 days.").font(.caption).foregroundStyle(.secondary)
         }.font(.callout)
     }
+    private func passwordSignIn(register: Bool) {
+        Task {
+            guard await cloud.signIn(email: email,password: password,register: register) else { return }
+            switchTo(.confirm); notice = "Check your email for a 6-digit code."
+        }
+    }
+    private func confirmAccount() { Task { await cloud.signIn(email: email,code: code) } }
     @ViewBuilder private func codeFields(sendTitle: String,confirmTitle: String,newPassword needsPassword: Bool = false,action: @escaping () -> Void) -> some View {
         if codeSent {
             TextField("6-digit code from the email",text: $code).onSubmit { if !needsPassword { action() } }

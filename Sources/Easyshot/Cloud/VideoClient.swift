@@ -6,7 +6,7 @@ struct CloudVideo: Codable,Equatable,Sendable {
     var id: String; var slug: String; var shareUrl: String; var title: String?; var status: String
     var visibility: String?; var byteSize: Int?; var durationMs: Int?; var width: Int?; var height: Int?
     var hasThumbnail: Bool?; var hasTranscript: Bool?
-    struct Limits: Codable,Equatable,Sendable { var minPartBytes: Int; var maxBytes: Int?; var maxPartBatch: Int; var partUrlTtlSeconds: Int? }
+    struct Limits: Codable,Equatable,Sendable { var minPartBytes: Int; var maxBytes: Int?; var maxPartBatch: Int; var partUrlTtlSeconds: Int?; var maxParts: Int? }
     var upload: Limits?
 }
 
@@ -21,11 +21,14 @@ extension CloudClient {
         return try Self.decoder.decode(CloudVideo.self,from: await send(makeRequest("POST","v1/videos",body: Self.encoder.encode(Body(title: title)))))
     }
     func video(_ id: String) async throws -> CloudVideo { try Self.decoder.decode(CloudVideo.self,from: await send(makeRequest("GET","v1/videos/\(id)"))) }
-    /// Presigned UploadPart URLs, keyed by part number.
-    func presignParts(_ id: String,numbers: [Int]) async throws -> [Int: URL] {
-        struct Body: Encodable { var partNumbers: [Int] }
+    /// Presigned UploadPart URLs, keyed by part number. Each part's exact size is signed into its URL,
+    /// and the server reserves those bytes against the video's and the account's allowance.
+    func presignParts(_ id: String,parts: [(number: Int,size: Int)]) async throws -> [Int: URL] {
+        struct Part: Encodable { var partNumber: Int; var size: Int }
+        struct Body: Encodable { var parts: [Part] }
         struct Reply: Decodable { struct Part: Decodable { var partNumber: Int; var url: String }; var parts: [Part] }
-        let reply = try Self.decoder.decode(Reply.self,from: await send(makeRequest("POST","v1/videos/\(id)/parts",body: Self.encoder.encode(Body(partNumbers: numbers)))))
+        let body = Body(parts: parts.map { Part(partNumber: $0.number,size: $0.size) })
+        let reply = try Self.decoder.decode(Reply.self,from: await send(makeRequest("POST","v1/videos/\(id)/parts",body: Self.encoder.encode(body))))
         var out: [Int: URL] = [:]
         for part in reply.parts { guard let url = URL(string: part.url) else { throw CloudError.invalidResponse }; out[part.partNumber] = url }
         return out
@@ -37,17 +40,29 @@ extension CloudClient {
         var request = try makeRequest("POST","v1/videos/\(id)/complete",body: Self.encoder.encode(body)); request.timeoutInterval = 120
         return try Self.decoder.decode(CloudVideo.self,from: await send(request))
     }
-    /// `kind` is `thumbnail` (JPEG) or `transcript` (WebVTT): reserve, then PUT the bytes to storage.
+    /// `kind` is `thumbnail` (JPEG) or `transcript` (WebVTT): reserve, PUT the bytes to storage, then
+    /// publish. The server announces the asset to open pages only after it has seen the stored object.
     func uploadAsset(_ id: String,kind: String,data: Data) async throws {
         struct Body: Encodable { var byteSize: Int }
         struct Reply: Decodable { var upload: PresignedPut }
-        let reply = try Self.decoder.decode(Reply.self,from: await send(makeRequest("POST","v1/videos/\(id)/\(kind)",body: Self.encoder.encode(Body(byteSize: data.count)))))
-        guard let url = URL(string: reply.upload.url) else { throw CloudError.invalidResponse }
-        var request = URLRequest(url: url,timeoutInterval: 60); request.httpMethod = reply.upload.method
-        for (name,value) in reply.upload.headers { request.setValue(value,forHTTPHeaderField: name) }
-        let (_,response) = try await session.upload(for: request,from: data)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(status) else { throw CloudError.uploadFailed(status) }
+        let backoff = Backoff()
+        for attempt in 0... {
+            do {
+                let reply = try Self.decoder.decode(Reply.self,from: await send(makeRequest("POST","v1/videos/\(id)/\(kind)",body: Self.encoder.encode(Body(byteSize: data.count)))))
+                guard let url = URL(string: reply.upload.url) else { throw CloudError.invalidResponse }
+                var request = URLRequest(url: url,timeoutInterval: 60); request.httpMethod = reply.upload.method
+                for (name,value) in reply.upload.headers { request.setValue(value,forHTTPHeaderField: name) }
+                let (_,response) = try await session.upload(for: request,from: data)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(status) else { throw CloudError.uploadFailed(status) }
+                do { _ = try await send(makeRequest("POST","v1/videos/\(id)/\(kind)/complete")) }
+                catch CloudError.server(let status,_,_) where status == 404 || status == 405 {} // servers before publish-on-complete
+                return
+            } catch {
+                guard attempt < 3,let status = CloudError.retryStatus(error),Backoff.retryable(status: status) else { throw error }
+                try await Task.sleep(for: .seconds(backoff.delay(attempt: attempt,unit: .random(in: 0...1))))
+            }
+        }
     }
     func updateVideo(_ id: String,title: String) async throws -> CloudVideo {
         struct Body: Encodable { var title: String }
@@ -62,7 +77,7 @@ extension CloudClient {
         let (_,response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 404 || status == 405 { return false }
-        guard (200..<300).contains(status) else { throw CloudError.server("Progress report failed (HTTP \(status)).") }
+        guard (200..<300).contains(status) else { throw CloudError.server(status: status,code: nil,message: "Progress report failed (HTTP \(status)).") }
         return true
     }
     func deleteVideo(_ id: String) async throws { _ = try await send(makeRequest("DELETE","v1/videos/\(id)")) }

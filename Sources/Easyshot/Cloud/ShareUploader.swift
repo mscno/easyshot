@@ -8,6 +8,8 @@ final class SegmentSpool: @unchecked Sendable {
     private let lock = NSLock()
     private var handle: FileHandle?
     private var written = 0
+    /// A failed write leaves the file's length unknown, so every later append and the upload must fail too.
+    private var broken: Error?
     /// Called with the new total after each append, on the writer's queue.
     var onAppend: (@Sendable (Int) -> Void)?
     init(url: URL) throws {
@@ -21,12 +23,17 @@ final class SegmentSpool: @unchecked Sendable {
     }
     func append(_ data: Data) throws {
         lock.lock()
-        do { try handle?.write(contentsOf: data) } catch { lock.unlock(); throw error }
+        do {
+            if let broken { throw broken }
+            guard let handle else { throw ShotError.message("The recording file is already closed.") }
+            try handle.write(contentsOf: data)
+        } catch { broken = broken ?? error; lock.unlock(); throw error }
         written += data.count; let total = written
         lock.unlock()
         onAppend?(total)
     }
     var total: Int { lock.lock(); defer { lock.unlock() }; return written }
+    var failure: Error? { lock.lock(); defer { lock.unlock() }; return broken }
     func close() { lock.lock(); try? handle?.close(); handle = nil; lock.unlock() }
     func read(_ range: Range<Int>) throws -> Data {
         guard !range.isEmpty else { return Data() }
@@ -54,6 +61,8 @@ actor ShareUploader {
     private var waiters: [CheckedContinuation<[(number: Int,etag: String)],Error>] = []
     private let backoff = Backoff()
     static let maxInFlight = 3,attemptsAfterStop = 6,urlLifetime: TimeInterval = 15*60
+    /// Presigned URLs are reused for at most this long; the server may sign shorter ones.
+    private var urlLifetime = ShareUploader.urlLifetime
     /// Bytes stored on the server so far, for progress.
     private(set) var uploadedBytes = 0
     private(set) var retries = 0
@@ -74,6 +83,7 @@ actor ShareUploader {
     }
     func onProgress(_ handler: @escaping @Sendable (Int) -> Void) { progress = handler }
     func attach(videoID: String,minimumPartBytes: Int?,urlLifetime: Int?) {
+        if let urlLifetime,urlLifetime > 120 { self.urlLifetime = min(Self.urlLifetime,TimeInterval(urlLifetime)) }
         if planner.nextNumber == 1 {
             let minimum = max(PartPlanner.minimumPartSize,minimumPartBytes ?? 0)
             if let saved,saved.videoID == videoID,saved.partSize >= minimum {
@@ -131,7 +141,7 @@ actor ShareUploader {
         var attempt = 0,afterStop = 0
         while failure == nil,let id = videoID {
             do {
-                let url = try await presigned(part.number,video: id)
+                let url = try await presigned(part,video: id)
                 let data = try spool.read(part.range)
                 let etag = try await client.putPart(data,to: url)
                 ledger.record(part.number,etag: etag); uploadedBytes += data.count
@@ -139,8 +149,8 @@ actor ShareUploader {
                 progress?(uploadedBytes)
                 return
             } catch {
-                let status: Int
-                if case CloudError.uploadFailed(let code) = error { status = code } else if error is URLError { status = 0 } else { status = -1 }
+                // Presigning and storage PUTs share one classifier: busy or unreachable is retried, refusals are not.
+                let status = CloudError.retryStatus(error) ?? -1
                 if status == 403 { urls[part.number] = nil }
                 if finishing { afterStop += 1 }
                 guard status >= 0,Backoff.retryable(status: status),afterStop < Self.attemptsAfterStop else { fail(error); return }
@@ -150,14 +160,14 @@ actor ShareUploader {
             }
         }
     }
-    /// One request presigns this part and the next queued ones.
-    private func presigned(_ number: Int,video: String) async throws -> URL {
-        if let cached = urls[number],cached.expires > Date() { return cached.url }
-        let wanted = [number]+queue.prefix(19).map(\.number).filter { urls[$0] == nil }
-        let fresh = try await client.presignParts(video,numbers: wanted)
-        let expires = Date().addingTimeInterval(Self.urlLifetime-60)
+    /// One request presigns this part and the next queued ones, each signed for its exact size.
+    private func presigned(_ part: PartPlanner.Part,video: String) async throws -> URL {
+        if let cached = urls[part.number],cached.expires > Date() { return cached.url }
+        let wanted = [part]+queue.prefix(19).filter { urls[$0.number] == nil }
+        let fresh = try await client.presignParts(video,parts: wanted.map { ($0.number,$0.range.count) })
+        let expires = Date().addingTimeInterval(urlLifetime-60)
         for (n,url) in fresh { urls[n] = (url,expires) }
-        guard let url = fresh[number] else { throw CloudError.invalidResponse }
+        guard let url = fresh[part.number] else { throw CloudError.invalidResponse }
         return url
     }
 }

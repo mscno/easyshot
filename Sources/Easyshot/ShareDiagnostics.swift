@@ -130,6 +130,8 @@ enum ShareDiagnostics {
             check(uploaded == (try? Data(contentsOf: url)),"uploaded parts reassemble to the local file byte for byte")
             check(MockCloud.completedParts == PartPlanner.whole(size: size).count && MockCloud.partsSortedWithQuotedETags,"complete lists every part in order with quoted ETags")
             check(MockCloud.retriedPuts >= 1,"a failed part PUT is retried")
+            check(MockCloud.retriedPresigns == 1,"a 503 from the presign endpoint is retried, not fatal")
+            check(MockCloud.wrongSizePuts == 0,"every part PUT matches the size signed into its URL")
             check(MockCloud.hungPuts == 1,"a hung part PUT times out after the idle timeout and is retried")
             let reports = MockCloud.progress
             note("progress reports: \(reports.map { "\($0.bytes/1024/1024)MiB\($0.recording ? "" : " stopped")" }.joined(separator: ", "))")
@@ -156,6 +158,12 @@ enum ShareDiagnostics {
             await cancelled.cancel()
             check(MockCloud.deleted == 1,"cancel deletes the server video")
         } catch { check(false,"cancel: \(error.localizedDescription)") }
+        // A write the spool could not make poisons it: later segments must not land at shifted offsets.
+        if let spool = try? SegmentSpool(url: folder.appendingPathComponent("broken.mp4")) {
+            spool.close()
+            let refused = (try? spool.append(Data(count: 16))) == nil
+            check(refused && spool.failure != nil && (try? spool.append(Data(count: 16))) == nil && spool.total == 0,"a failed spool write is kept and fails every later append")
+        }
         print("\(failures == 0 ? "PASS" : "FAIL"): share test, \(failures) failure(s)")
         return failures == 0 ? 0 : 1
     }
@@ -333,10 +341,13 @@ final class MockCloud: URLProtocol,@unchecked Sendable {
     nonisolated(unsafe) private static var failNext: Set<Int> = []
     nonisolated(unsafe) private static var hangNext: Set<Int> = []
     nonisolated(unsafe) private static var progressReports: [(bytes: Int,recording: Bool)] = []
-    nonisolated(unsafe) static var retriedPuts = 0,hungPuts = 0,puts = 0,completedParts = 0,deleted = 0,partsSortedWithQuotedETags = false,minNonFinalPart = Int.max
+    /// Each part's presigned size; a PUT of any other length is refused, as S3 does for a signed Content-Length.
+    nonisolated(unsafe) private static var signed: [Int: Int] = [:]
+    nonisolated(unsafe) private static var failNextPresign = false
+    nonisolated(unsafe) static var retriedPresigns = 0,wrongSizePuts = 0,retriedPuts = 0,hungPuts = 0,puts = 0,completedParts = 0,deleted = 0,partsSortedWithQuotedETags = false,minNonFinalPart = Int.max
     static func reset(failFirstPutOf part: Int,hangFirstPutOf hang: Int) {
-        lock.lock(); parts = [:]; failNext = [part]; hangNext = [hang]; progressReports = []
-        retriedPuts = 0; hungPuts = 0; puts = 0; completedParts = 0; deleted = 0; partsSortedWithQuotedETags = false; minNonFinalPart = Int.max; lock.unlock()
+        lock.lock(); parts = [:]; failNext = [part]; hangNext = [hang]; progressReports = []; signed = [:]; failNextPresign = true
+        retriedPresigns = 0; wrongSizePuts = 0; retriedPuts = 0; hungPuts = 0; puts = 0; completedParts = 0; deleted = 0; partsSortedWithQuotedETags = false; minNonFinalPart = Int.max; lock.unlock()
     }
     /// Keeps only the `keeping` parts in storage, as after an interrupted upload, and resets counters.
     static func prepareRetry(keeping: Set<Int>) {
@@ -364,12 +375,13 @@ final class MockCloud: URLProtocol,@unchecked Sendable {
         client?.urlProtocol(self,didLoad: data); client?.urlProtocolDidFinishLoading(self)
     }
     static let video: [String: Any] = ["id": "vid1","slug": "abc123","share_url": "https://cloud.mock/v/abc123","title": "Share test","status": "pending",
-                                       "upload": ["min_part_bytes": 5*1024*1024,"max_part_batch": 100,"part_url_ttl_seconds": 900]]
+                                       "upload": ["min_part_bytes": 5*1024*1024,"max_part_batch": 100,"part_url_ttl_seconds": 900,"max_parts": 10_000]]
     override func startLoading() {
         let url = request.url!,path = url.path,method = request.httpMethod ?? "GET"
         if url.host == "storage.mock",method == "PUT",let n = Int(url.lastPathComponent) {
             let data = body()
             Self.lock.lock()
+            if Self.signed[n] != data.count { Self.wrongSizePuts += 1; Self.lock.unlock(); reply(403); return }
             let hang = Self.hangNext.remove(n) != nil
             let fail = !hang && Self.failNext.remove(n) != nil
             if hang { Self.hungPuts += 1 } else if fail { Self.retriedPuts += 1 } else { Self.parts[n] = data; Self.puts += 1 }
@@ -383,8 +395,15 @@ final class MockCloud: URLProtocol,@unchecked Sendable {
         switch (method,path) {
         case ("POST","/v1/videos"): reply(201,Self.video)
         case ("POST","/v1/videos/vid1/parts"):
-            let numbers = (try? JSONSerialization.jsonObject(with: body()) as? [String: Any])?["part_numbers"] as? [Int] ?? []
-            reply(200,["parts": numbers.map { ["part_number": $0,"method": "PUT","url": "https://storage.mock/part/\($0)"] },"expires_in": 900])
+            let parts = ((try? JSONSerialization.jsonObject(with: body()) as? [String: Any])?["parts"] as? [[String: Any]]) ?? []
+            Self.lock.lock()
+            let busy = Self.failNextPresign; Self.failNextPresign = false
+            if busy { Self.retriedPresigns += 1 }
+            for part in parts { if let n = part["part_number"] as? Int,let size = part["size"] as? Int { Self.signed[n] = size } }
+            Self.lock.unlock()
+            // One transient failure: the uploader must retry presigning like a storage PUT.
+            if busy { reply(503,["error": ["code": "UNAVAILABLE","message": "busy"]]); return }
+            reply(200,["parts": parts.compactMap { $0["part_number"] as? Int }.map { ["part_number": $0,"url": "https://storage.mock/part/\($0)","headers": ["content-length": String(Self.signed[$0] ?? 0)]] }])
         case ("POST","/v1/videos/vid1/complete"):
             let parts = ((try? JSONSerialization.jsonObject(with: body()) as? [String: Any])?["parts"] as? [[String: Any]]) ?? []
             let numbers = parts.compactMap { $0["part_number"] as? Int }
