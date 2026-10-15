@@ -17,7 +17,7 @@ Media bytes never pass through the server: clients PUT straight to presigned URL
 
 Migrations run as the table owner (`MIGRATION_DATABASE_URL`, or `--database-url`). The server connects as `easyshot_app` (`DATABASE_URL`), created by migration `0004_rls_app_role` with `NOSUPERUSER NOBYPASSRLS` and the development password `easyshot_app` when it does not exist yet (local and test databases only). In production `mise run db:bootstrap` creates the role with its own password first, so the migration only grants (see Deploy). A superuser or `BYPASSRLS` connection defeats RLS.
 
-`screenshots`, `videos` and the `item_*` tables have `FORCE`d policies keyed on transaction-local settings, set with `set_config(..., true)` as the first statement of every transaction:
+`screenshots`, `videos`, `upload_parts` (owner and maintenance only) and the `item_*` tables have `FORCE`d policies keyed on transaction-local settings, set with `set_config(..., true)` as the first statement of every transaction:
 
 | Setting | Grants |
 |---|---|
@@ -89,17 +89,19 @@ Auth as for screenshots (`Authorization: Bearer ...`; uploads need a confirmed e
 
 | Endpoint | Body | Result |
 |---|---|---|
-| `POST /v1/videos` | `{title?, content_type?}` (`video/mp4` default, `video/quicktime`, `video/webm`) | 201 video JSON with `share_url` and `upload: {min_part_bytes, max_bytes, max_part_batch, part_url_ttl_seconds}` |
-| `POST /v1/videos/{id}/parts` | `{part_numbers: [1, 2, ...]}` (≤ 100 per call, 1..=10000) | `{parts: [{part_number, method: "PUT", url}], expires_in}`; PUT the bytes and keep each `ETag` |
+| `POST /v1/videos` | `{title?, content_type?}` (`video/mp4` default, `video/quicktime`, `video/webm`) | 201 video JSON with `share_url` and `upload: {min_part_bytes, max_bytes, max_parts, max_part_batch, part_url_ttl_seconds}`. 429 `TOO_MANY_PENDING_UPLOADS` when the account already has `MAX_PENDING_UPLOADS` unfinished uploads (younger than 24 h) |
+| `POST /v1/videos/{id}/parts` | `{parts: [{part_number, size}, ...]}` (≤ 100 per call, part numbers 1..=10000, sizes 1..=5 GiB) | `{parts: [{part_number, method: "PUT", url, headers: {"content-length"}}], expires_in}`; PUT exactly `size` bytes (the length is signed into the URL) and keep each `ETag`. Sizes are reserved before signing and fixed per part (asking again with the same size is fine, another size is 400). 413 `TOO_LARGE` when the video's parts would exceed `MAX_VIDEO_BYTES` or the account's unfinished uploads `MAX_PENDING_UPLOAD_BYTES`; a refused batch reserves nothing |
 | `POST /v1/videos/{id}/progress` | `{uploaded_bytes, recording}` | 204. About once per second while recording; at most 4 per second per video (429 beyond). Counts must not decrease (400); `recording: false` records when recording stopped; ignored once the video is ready. Drives "Recording live… N MB uploaded" / "Finishing…" on every open page. |
-| `POST /v1/videos/{id}/complete` | `{parts: [{part_number, etag}], duration_ms?, width?, height?}` | video JSON (`status: ready`); idempotent |
-| `POST /v1/videos/{id}/thumbnail` | `{byte_size}` (JPEG, ≤ 2 MiB) | `{upload: {method, url, headers}}` |
-| `POST /v1/videos/{id}/transcript` | `{byte_size}` (WebVTT, ≤ 1 MiB) | `{upload: {method, url, headers}}` |
+| `POST /v1/videos/{id}/complete` | `{parts: [{part_number, etag}], duration_ms?, width?, height?}` (up to 10,000 parts; ETags optionally quoted, ≤ 64 of `[A-Za-z0-9_-]`) | video JSON (`status: ready`). Every part must have been requested (400 otherwise); the object must measure the reserved sizes of the listed parts. Idempotent: a retry after storage already assembled the object finishes the transition (200); an aborted or mismatching upload is 409 `NOT_UPLOADED` |
+| `POST /v1/videos/{id}/thumbnail` | `{byte_size}` (JPEG, ≤ 2 MiB) | `{upload: {method, url, headers}}`; presign only |
+| `POST /v1/videos/{id}/thumbnail/complete` | | after the PUT: checks the object (exists, ≤ 2 MiB, `image/jpeg`) and publishes it; video JSON, or 409 `NOT_UPLOADED` (a mismatching object is deleted) |
+| `POST /v1/videos/{id}/transcript` | `{byte_size}` (WebVTT, ≤ 1 MiB) | `{upload: {method, url, headers}}`; presign only |
+| `POST /v1/videos/{id}/transcript/complete` | | as for the thumbnail (≤ 1 MiB, `text/vtt`); open watch pages show the transcript and captions live |
 | `GET /v1/videos`, `GET /v1/videos/{id}` | | the caller's videos |
 | `PATCH /v1/videos/{id}` | `{title?, visibility?, password?}` | video JSON |
 | `DELETE /v1/videos/{id}` | | 204; aborts the upload, deletes objects and conversation |
 
-Every part except the last must be at least 5 MiB (S3 rule). Upload parts while recording and complete on stop; the watch page flips to the player within a moment. Oversized results (`MAX_VIDEO_BYTES`) are deleted at completion (413).
+Every part except the last must be at least 5 MiB (S3 rule). Upload parts while recording and complete on stop; the watch page flips to the player within a moment. Reservations live in `upload_parts` (migration `0009`, owner-only RLS); creating uploads, reserving parts and completing serialize per account with a transaction-scoped advisory lock, so the caps hold under concurrent requests. Completion and deletion release the reservation. The completion route accepts bodies up to about 1.6 MB (a 10,000-part manifest); the rest of `/v1` keeps the 64 KiB limit.
 
 ## Deploy (Fly.io + PostgreSQL)
 
@@ -143,6 +145,8 @@ There is no migration from the earlier Turso/libSQL backend: production starts f
 | `INACTIVE_USER_DAYS` | `90` | purge users not seen for this long; `0` disables |
 | `MAX_UPLOAD_BYTES` | `26214400` | screenshots |
 | `MAX_VIDEO_BYTES` | `5368709120` | videos |
+| `MAX_PENDING_UPLOADS` | `3` | unfinished recording uploads per account |
+| `MAX_PENDING_UPLOAD_BYTES` | `MAX_VIDEO_BYTES` | bytes one account may reserve across its unfinished uploads |
 | `WEB_SECRET` | random per process | keys unlock cookies and viewer hashes; set it in production so they survive restarts and agree across machines |
 | `TRUSTED_PROXY_HOPS` | `0` | reverse proxies that set `X-Forwarded-For` (1 on Fly) |
 | `DOWNLOAD_URL` | GitHub latest release | landing-page download button |
