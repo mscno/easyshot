@@ -155,7 +155,13 @@ struct CaptureRequest {
         case .restoreOverlay:
             let cards = quickAccess ?? QuickAccess(controller: self); quickAccess = cards
             if !cards.restore() { showToast("Nothing to restore",symbol: "rectangle.stack",hideAfter: 2) }
+        case .record: toggleRecord()
         }
+    }
+    /// App Intents (Shortcuts, Spotlight, user-assigned keyboard shortcuts) take the same path as launcher URLs.
+    func runIntent(_ action: LaunchAction) {
+        startupTask?.cancel(); launcherPending = false; idleExitTask?.cancel()
+        if launched { route(action) } else { pendingLaunch = action }
     }
     func application(_ application: NSApplication,open urls: [URL]) {
         if let path = urls.compactMap(LaunchAction.editPath).last {
@@ -167,11 +173,14 @@ struct CaptureRequest {
         startupTask?.cancel(); launcherPending = false; idleExitTask?.cancel()
         if launched { route(action) } else { pendingLaunch = action }
     }
-    func scheduleLauncher() {
+    /// `grace` gives a non-default launch (Shortcuts running an App Intent) time to claim the session before the
+    /// default capture bar opens. Ordinary launches and launcher URLs never wait.
+    func scheduleLauncher(grace: Double = 0) {
         idleExitTask?.cancel(); launcherPending = true
         startupTask?.cancel()
         startupTask = Task {
             await Task.yield()
+            if grace > 0 { try? await Task.sleep(for: .seconds(grace)) }
             guard !Task.isCancelled else { return }
             if let path = pendingEdit { pendingEdit = nil; openForEditing(path); return }
             route(pendingLaunch ?? .capture); pendingLaunch = nil
@@ -237,7 +246,8 @@ struct CaptureRequest {
         #if !APP_STORE
         if SMAppService.mainApp.status == .enabled { try? SMAppService.mainApp.unregister() }
         #endif
-        installMenu(); launched = true; scheduleLauncher()
+        let defaultLaunch = notification.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool ?? true
+        installMenu(); launched = true; scheduleLauncher(grace: defaultLaunch || pendingLaunch != nil ? 0 : 0.35)
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2,repeats: true) { [weak self] _ in
             Task { @MainActor in self?.permitted = CGPreflightScreenCaptureAccess() }
         }

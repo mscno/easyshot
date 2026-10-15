@@ -34,6 +34,21 @@ APP="${APP_OUTPUT_DIR:-$PWD/dist}/Easyshot.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_PATH/Easyshot" "$APP/Contents/MacOS/Easyshot"
+# App Intents (Shortcuts and Spotlight actions) need Metadata.appintents, which Xcode extracts after compiling.
+# SwiftPM already emits the compiler's const values; run the same extractor over them.
+INTENTS_DIR="$(dirname "$(dirname "$BIN_PATH")")/Intermediates.noindex/Easyshot.build/$(basename "$BIN_PATH")/Easyshot-p.build/Objects-normal/arm64"
+if xcrun --find appintentsmetadataprocessor >/dev/null 2>&1 && [[ -f "$INTENTS_DIR/Easyshot.SwiftFileList" ]]; then
+    find "$INTENTS_DIR" -name '*.swiftconstvalues' > "$INTENTS_DIR/Easyshot.SwiftConstValuesFileList"
+    TOOLCHAIN="$(dirname "$(dirname "$(dirname "$(xcrun --find swiftc)")")")"
+    xcrun appintentsmetadataprocessor --toolchain-dir "$TOOLCHAIN" --module-name Easyshot --sdk-root "$(xcrun --sdk macosx --show-sdk-path)" \
+        --xcode-version "$(xcodebuild -version | awk '/Build version/ { print $3 }')" --platform-family macOS --deployment-target 26.0 \
+        --bundle-identifier "$BUNDLE_ID" --output "$APP/Contents/Resources" --target-triple arm64-apple-macos26.0 --binary-file "$APP/Contents/MacOS/Easyshot" \
+        --source-file-list "$INTENTS_DIR/Easyshot.SwiftFileList" --swift-const-vals-list "$INTENTS_DIR/Easyshot.SwiftConstValuesFileList" \
+        --compile-time-extraction --force --quiet-warnings >/dev/null 2>&1
+    [[ -f "$APP/Contents/Resources/Metadata.appintents/extract.actionsdata" ]] || { echo 'App Intents metadata extraction failed.' >&2; exit 1; }
+else
+    echo 'warning: App Intents metadata not generated; Shortcuts and Spotlight actions will be missing.' >&2
+fi
 if [[ "$EDITION" == direct ]]; then
     SPARKLE_ROOT="$(bash scripts/fetch-sparkle.sh)"
     mkdir -p "$APP/Contents/Frameworks"

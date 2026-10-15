@@ -68,6 +68,8 @@ public enum LaunchAction: String, CaseIterable {
     case upload, pasteUpload = "paste-upload", cloud
     /// OCR an area straight to the clipboard; reopen the most recently closed Quick Access card.
     case captureText = "capture-text", restoreOverlay = "restore-overlay"
+    /// Start an area recording, or stop the current one.
+    case record
     public init?(url: URL) {
         guard ["easyshot","easyshot-dev"].contains(url.scheme?.lowercased() ?? ""),url.user == nil,url.password == nil,url.port == nil,
               url.path.isEmpty || url.path == "/",url.query == nil,url.fragment == nil,
