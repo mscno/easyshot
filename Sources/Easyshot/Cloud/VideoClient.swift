@@ -14,6 +14,8 @@ struct CloudVideo: Codable,Equatable,Sendable {
 struct PresignedPut: Decodable,Sendable { var method: String; var url: String; var headers: [String: String] }
 
 extension CloudClient {
+    /// Seconds without upload progress before a part PUT is abandoned and retried (`--share-test` shortens it).
+    nonisolated(unsafe) static var partIdleTimeout: TimeInterval = 25
     func createVideo(title: String?) async throws -> CloudVideo {
         struct Body: Encodable { var title: String?; var contentType = "video/mp4" }
         return try Self.decoder.decode(CloudVideo.self,from: await send(makeRequest("POST","v1/videos",body: Self.encoder.encode(Body(title: title)))))
@@ -51,10 +53,23 @@ extension CloudClient {
         struct Body: Encodable { var title: String }
         return try Self.decoder.decode(CloudVideo.self,from: await send(makeRequest("PATCH","v1/videos/\(id)",body: Self.encoder.encode(Body(title: title)))))
     }
+    /// Upload progress for the watch page and library. Returns false when the server has no such endpoint
+    /// (404/405); other failures throw and are ignored by the caller.
+    func reportProgress(_ id: String,uploadedBytes: Int,recording: Bool) async throws -> Bool {
+        struct Body: Encodable { var uploadedBytes: Int; var recording: Bool }
+        var request = try makeRequest("POST","v1/videos/\(id)/progress",body: Self.encoder.encode(Body(uploadedBytes: uploadedBytes,recording: recording)))
+        request.timeoutInterval = 10
+        let (_,response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 404 || status == 405 { return false }
+        guard (200..<300).contains(status) else { throw CloudError.server("Progress report failed (HTTP \(status)).") }
+        return true
+    }
     func deleteVideo(_ id: String) async throws { _ = try await send(makeRequest("DELETE","v1/videos/\(id)")) }
     /// PUT one part straight to object storage and return its ETag, quotes included.
     func putPart(_ data: Data,to url: URL) async throws -> String {
-        var request = URLRequest(url: url,timeoutInterval: 120); request.httpMethod = "PUT"
+        // An idle timeout: a stalled connection fails after this long without progress and the part is retried.
+        var request = URLRequest(url: url,timeoutInterval: Self.partIdleTimeout); request.httpMethod = "PUT"
         let (_,response) = try await session.upload(for: request,from: data)
         let http = response as? HTTPURLResponse
         guard let http,(200..<300).contains(http.statusCode) else { throw CloudError.uploadFailed(http?.statusCode ?? 0) }

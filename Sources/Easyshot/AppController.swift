@@ -693,9 +693,6 @@ struct CaptureRequest {
                 showPreview(clip)
                 finishShare(share,clip: clip,voice: Preferences.shared.microphone)
             } else if let url = recordURL {
-                if Preferences.shared.microphone {
-                    do { try await VideoTools.mixAudio(url) } catch { store.error = error.localizedDescription }
-                }
                 let clip = Clip(path: url.path,kind: "Recording",width: Int(recordSize.width),height: Int(recordSize.height))
                 await deliverRecording(clip)
                 status = "Recording saved\(Preferences.shared.copyToClipboard ? " and copied" : "")"

@@ -188,7 +188,7 @@ enum EditorDiagnostics {
     }
 
     /// 6 s of 30 fps frames with a pause from 2 s to 4 s, written through the recorder's own retiming.
-    static func pauseTest(_ folder: URL,_ check: (Bool,String) -> Void) async {
+    @MainActor static func pauseTest(_ folder: URL,_ check: @MainActor (Bool,String) -> Void) async {
         do {
             let url = folder.appendingPathComponent("paused.mp4")
             let writer = try AVAssetWriter(outputURL: url,fileType: .mp4)
@@ -246,7 +246,7 @@ enum EditorDiagnostics {
     }
 
     /// A 2 s synthetic 1280×720 recording exported as vertical 9:16 with the dot cursor.
-    static func studioAspectTest(_ folder: URL,_ check: (Bool,String) -> Void) async {
+    @MainActor static func studioAspectTest(_ folder: URL,_ check: @MainActor (Bool,String) -> Void) async {
         do {
             let url = folder.appendingPathComponent("wide.mp4")
             let writer = try AVAssetWriter(outputURL: url,fileType: .mp4)

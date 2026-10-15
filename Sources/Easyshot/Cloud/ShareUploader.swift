@@ -57,11 +57,39 @@ actor ShareUploader {
     /// Bytes stored on the server so far, for progress.
     private(set) var uploadedBytes = 0
     private(set) var retries = 0
+    /// Parts a retry skipped because the journal shows them stored.
+    private(set) var reusedParts = 0
+    /// Stored parts, persisted beside the recording so a retry resumes instead of starting over.
+    private let journalURL: URL
+    private var journal: UploadJournal?
+    private var saved: UploadJournal?
+    private var reusable: [Int: String] = [:]
+    private var progress: (@Sendable (Int) -> Void)?
 
-    init(client: CloudClient,spool: SegmentSpool) { self.client = client; self.spool = spool }
+    /// `resume` loads the journal of an earlier attempt; a new recording starts a fresh one.
+    init(client: CloudClient,spool: SegmentSpool,resume: Bool = false) {
+        self.client = client; self.spool = spool
+        journalURL = UploadJournal.url(for: spool.url)
+        if resume { saved = (try? Data(contentsOf: journalURL)).flatMap { try? JSONDecoder().decode(UploadJournal.self,from: $0) } }
+    }
+    func onProgress(_ handler: @escaping @Sendable (Int) -> Void) { progress = handler }
     func attach(videoID: String,minimumPartBytes: Int?,urlLifetime: Int?) {
-        if planner.nextNumber == 1,let minimumPartBytes { planner = PartPlanner(partSize: minimumPartBytes) }
+        if planner.nextNumber == 1 {
+            let minimum = max(PartPlanner.minimumPartSize,minimumPartBytes ?? 0)
+            if let saved,saved.videoID == videoID,saved.partSize >= minimum {
+                planner = PartPlanner(partSize: saved.partSize); journal = saved; reusable = saved.reusable(size: spool.total)
+            } else {
+                if let minimumPartBytes { planner = PartPlanner(partSize: minimumPartBytes) }
+                journal = UploadJournal(videoID: videoID,partSize: planner.partSize); saveJournal()
+            }
+        }
         self.videoID = videoID; pump()
+    }
+    /// The upload completed; the journal has no further use.
+    func discardJournal() { try? FileManager.default.removeItem(at: journalURL); journal = nil }
+    private func saveJournal() {
+        guard let journal,let data = try? JSONEncoder().encode(journal) else { return }
+        try? data.write(to: journalURL,options: .atomic)
     }
     func fail(_ error: Error) { failure = failure ?? error; settle() }
     func cancel() { fail(CancellationError()) }
@@ -73,7 +101,14 @@ actor ShareUploader {
         enqueue(planner.finish(total: total)); pump()
         return try await withCheckedThrowingContinuation { waiters.append($0); settle() }
     }
-    private func enqueue(_ parts: [PartPlanner.Part]) { for part in parts { ledger.expect(part.number); queue.append(part) } }
+    private func enqueue(_ parts: [PartPlanner.Part]) {
+        for part in parts {
+            ledger.expect(part.number)
+            if let etag = reusable.removeValue(forKey: part.number) { ledger.record(part.number,etag: etag); uploadedBytes += part.range.count; reusedParts += 1; continue }
+            queue.append(part)
+        }
+        if reusedParts > 0 { progress?(uploadedBytes) }
+    }
     private func pump() {
         guard videoID != nil,failure == nil else { settle(); return }
         while inFlight < Self.maxInFlight,!queue.isEmpty {
@@ -100,6 +135,8 @@ actor ShareUploader {
                 let data = try spool.read(part.range)
                 let etag = try await client.putPart(data,to: url)
                 ledger.record(part.number,etag: etag); uploadedBytes += data.count
+                journal?.record(part,etag: etag); saveJournal()
+                progress?(uploadedBytes)
                 return
             } catch {
                 let status: Int
@@ -125,61 +162,3 @@ actor ShareUploader {
     }
 }
 
-/// One Record & Share recording: the server video (created as recording starts, so the link exists
-/// immediately), the spool, and its uploader.
-@MainActor final class ShareRecording {
-    let spool: SegmentSpool
-    let uploader: ShareUploader
-    let client: CloudClient
-    private(set) var video: CloudVideo?
-    private var creation: Task<CloudVideo,Error>?
-
-    /// Creates the spool at `url` and starts creating the server video; `linked` runs when the link exists.
-    init(client: CloudClient,url: URL,title: String?,linked: @escaping @MainActor (CloudVideo) -> Void) throws {
-        self.client = client
-        spool = try SegmentSpool(url: url)
-        let uploader = ShareUploader(client: client,spool: spool); self.uploader = uploader
-        spool.onAppend = { total in Task { await uploader.spooled(total: total) } }
-        creation = Task { [weak self] in
-            do {
-                let video = try await client.createVideo(title: title)
-                await uploader.attach(videoID: video.id,minimumPartBytes: video.upload?.minPartBytes,urlLifetime: video.upload?.partUrlTtlSeconds)
-                self?.video = video; linked(video)
-                return video
-            } catch { await uploader.fail(error); throw error }
-        }
-    }
-    /// Retry: upload an existing local recording to `video` (or a new video when the original was never created).
-    init(client: CloudClient,file: URL,video: CloudVideo?,title: String?) throws {
-        self.client = client
-        spool = try SegmentSpool(finished: file)
-        let uploader = ShareUploader(client: client,spool: spool); self.uploader = uploader
-        self.video = video
-        creation = Task {
-            do {
-                let target: CloudVideo
-                if let video { target = video } else { target = try await client.createVideo(title: title) }
-                await uploader.attach(videoID: target.id,minimumPartBytes: target.upload?.minPartBytes,urlLifetime: target.upload?.partUrlTtlSeconds)
-                return target
-            } catch { await uploader.fail(error); throw error }
-        }
-    }
-    func creationValue() async throws -> CloudVideo {
-        guard let creation else { throw CloudError.invalidResponse }
-        return try await creation.value
-    }
-    /// Uploads the rest of the spool, then completes. Returns the ready video.
-    func finish(durationMs: Int,width: Int,height: Int) async throws -> CloudVideo {
-        guard let creation else { throw CloudError.invalidResponse }
-        let video = try await creation.value; self.video = video
-        let parts = try await uploader.finish(total: spool.total)
-        let ready = try await client.completeVideo(video.id,parts: parts,durationMs: durationMs,width: width,height: height)
-        self.video = ready
-        return ready
-    }
-    /// Stops uploading and deletes the server video, if it was created.
-    func cancel() async {
-        await uploader.cancel()
-        if let video = try? await creation?.value { try? await client.deleteVideo(video.id) }
-    }
-}

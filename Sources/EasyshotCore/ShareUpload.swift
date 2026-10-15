@@ -106,6 +106,67 @@ public enum WebVTT {
     }
 }
 
+/// Upload progress for the server (`POST /v1/videos/{id}/progress`): at most one report per `interval`,
+/// coalesced to the latest value, unchanged values dropped. The switch to `recording: false` at stop is
+/// sent at once. A server without the endpoint disables reporting for that video.
+public struct ProgressThrottle: Sendable {
+    public struct Report: Equatable, Sendable {
+        public var uploadedBytes: Int; public var recording: Bool
+        public init(uploadedBytes: Int,recording: Bool) { self.uploadedBytes = uploadedBytes; self.recording = recording }
+    }
+    public let interval: Double
+    public private(set) var disabled = false
+    public private(set) var pending: Report?
+    private var lastSent: Double?
+    private var last: Report?
+    public init(interval: Double = 1) { self.interval = interval }
+    /// The report to send now, or nil (it is kept as `pending` when the interval has not passed).
+    public mutating func update(_ report: Report,now: Double) -> Report? {
+        guard !disabled,report != last else { pending = nil; return nil }
+        let stopping = !report.recording && last?.recording != false
+        if stopping || lastSent.map({ now-$0 >= interval }) ?? true { return sent(report,now: now) }
+        pending = report; return nil
+    }
+    /// When the pending report may go out.
+    public var deadline: Double? { pending == nil || disabled ? nil : (lastSent ?? 0)+interval }
+    /// Sends the pending report once its interval has passed.
+    public mutating func flush(now: Double) -> Report? {
+        guard let pending,!disabled,let deadline,now >= deadline else { return nil }
+        return sent(pending,now: now)
+    }
+    public mutating func disable() { disabled = true; pending = nil }
+    private mutating func sent(_ report: Report,now: Double) -> Report { last = report; lastSent = now; pending = nil; return report }
+}
+
+/// Parts already stored for a server video, saved next to the recording so a retry after a failed
+/// upload sends only what is missing. Parts are byte ranges planned with `partSize`.
+public struct UploadJournal: Codable, Equatable, Sendable {
+    public struct Entry: Codable, Equatable, Sendable {
+        public var number: Int; public var start: Int; public var end: Int; public var etag: String
+        public init(number: Int,start: Int,end: Int,etag: String) { self.number = number; self.start = start; self.end = end; self.etag = etag }
+    }
+    public var videoID: String
+    public var partSize: Int
+    public var parts: [Entry] = []
+    public init(videoID: String,partSize: Int) { self.videoID = videoID; self.partSize = partSize }
+    public mutating func record(_ part: PartPlanner.Part,etag: String) {
+        parts.removeAll { $0.number == part.number }
+        parts.append(Entry(number: part.number,start: part.range.lowerBound,end: part.range.upperBound,etag: etag))
+    }
+    /// Entries that match the plan for a finished file of `size` bytes, by number and byte range. Anything
+    /// else (a different last part, a file that changed) is uploaded again under the same number.
+    public func reusable(size: Int) -> [Int: String] {
+        let plan = Dictionary(uniqueKeysWithValues: PartPlanner.whole(size: size,partSize: partSize).map { ($0.number,$0.range) })
+        var out: [Int: String] = [:]
+        for entry in parts where plan[entry.number] == entry.start..<entry.end { out[entry.number] = entry.etag }
+        return out
+    }
+    /// `.<name>.easyshot-upload.json` beside the recording, hidden like the Studio sidecars.
+    public static func url(for recording: URL) -> URL {
+        recording.deletingLastPathComponent().appendingPathComponent(".\(recording.lastPathComponent).easyshot-upload.json")
+    }
+}
+
 public enum ShareLinks {
     /// The watch page serves its poster at `<share_url>/thumbnail.jpg`.
     public static func thumbnail(_ shareURL: String) -> String {

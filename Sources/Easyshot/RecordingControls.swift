@@ -64,6 +64,8 @@ extension AppController {
 extension CaptureEngine {
     /// With "Clean desktop", display and area recordings hide desktop icons and can replace the wallpaper
     /// with a solid color. Finder windows and the Dock stay visible; only desktop-level windows are removed.
+    /// Retains the clean-desktop background color, which `SCStreamConfiguration` references unowned.
+    nonisolated(unsafe) static var recordingBackground: CGColor?
     func recordingFilter(for target: CaptureTarget,default filter: SCContentFilter,configuration: SCStreamConfiguration) -> SCContentFilter {
         let p = Preferences.shared
         guard p.cleanDesktop,let content else { return filter }
@@ -81,8 +83,11 @@ extension CaptureEngine {
         var hidden: Set<String> = ["com.apple.finder"]
         if p.replaceWallpaper {
             hidden.formUnion(["com.apple.dock","com.apple.wallpaper.agent","com.apple.WallpaperAgent"])
+            // The configuration holds this color unowned; keep it alive for the life of the recording.
             let c = p.wallpaperColor
-            configuration.backgroundColor = CGColor(srgbRed: c[0],green: c[1],blue: c[2],alpha: 1)
+            let color = CGColor(srgbRed: c[0],green: c[1],blue: c[2],alpha: 1)
+            CaptureEngine.recordingBackground = color
+            configuration.backgroundColor = color
         }
         let apps = content.applications.filter { hidden.contains($0.bundleIdentifier) }
         let pids = Set(apps.map(\.processID))

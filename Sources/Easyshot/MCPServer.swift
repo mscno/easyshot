@@ -313,8 +313,6 @@ enum MCPMode {
         if let note { result["note"] = note }
         do {
             try await recording.recorder.stop()
-            // A shared recording's file is the uploaded fragmented MP4; mixing would rewrite it.
-            if recording.share == nil,Preferences.shared.microphone { try? await VideoTools.mixAudio(recording.url) }
             let duration = (try? await AVURLAsset(url: recording.url).load(.duration).seconds) ?? Date().timeIntervalSince(recording.started)
             result["duration_seconds"] = duration
             result["bytes"] = (try? FileManager.default.attributesOfItem(atPath: recording.url.path)[.size] as? Int) ?? 0
