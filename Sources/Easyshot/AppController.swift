@@ -476,7 +476,7 @@ struct CaptureRequest {
     }
     /// Upload a saved capture and leave its share link on the clipboard.
     func uploadClip(_ clip: Clip) async {
-        pendingExports += 1; defer { pendingExports -= 1 }
+        pendingExports += 1; defer { pendingExports -= 1; finishIfIdle() }
         showToast("Uploading…",symbol: "icloud.and.arrow.up",spinner: true,hideAfter: nil)
         do {
             let url = clip.url
@@ -493,7 +493,7 @@ struct CaptureRequest {
         pendingExports += 1
         showToast("Uploading…",symbol: "icloud.and.arrow.up",spinner: true,hideAfter: nil)
         Task {
-            defer { pendingExports -= 1 }
+            defer { pendingExports -= 1; finishIfIdle() }
             do { try await finishUpload(image) } catch { uploadFailed(error) }
         }
     }
@@ -699,7 +699,11 @@ struct CaptureRequest {
             }
         } catch {
             recordingEffects?.stop(); fail(error)
-            if let share = shareRecording { Task { await share.cancel() } }
+            if let share = shareRecording {
+                // Deleting the half-uploaded server video must finish before an idle exit.
+                pendingExports += 1
+                Task { await share.cancel(); pendingExports -= 1; finishIfIdle() }
+            }
         }
         self.recorder = nil; recordingEffects = nil; recordURL = nil; shareRecording = nil; shareLink = nil; busy = false; finishIfIdle()
     }

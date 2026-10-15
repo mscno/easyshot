@@ -89,14 +89,22 @@ extension AppController {
     func retryShare(_ clip: Clip) {
         guard let client = CloudSession.shared.client,CloudSession.shared.isSignedIn else { requireSignIn(); return }
         let current = ShareCenter.shared.state(clip)
+        // Held from the click: closing the last Quick Access card during the lookup must not quit the app.
+        // finishShare takes its own hold before this one is released.
+        pendingExports += 1
         Task {
-            var existing: CloudVideo?
-            if let id = current?.videoID { existing = try? await client.video(id) }
+            defer { pendingExports -= 1; finishIfIdle() }
             do {
+                var existing: CloudVideo?
+                if let id = current?.videoID {
+                    // Only a video that is gone gets a new link; a network or server error is reported instead.
+                    do { existing = try await client.video(id) } catch CloudError.server(404,_,_) {}
+                }
                 let share = try ShareRecording(client: client,file: clip.url,video: existing,title: current?.title ?? Self.shareTitle(clip.date))
                 setShare(clip,CloudShare(video: existing,title: current?.title,status: .uploading))
                 finishShare(share,clip: clip,voice: true)
-            } catch { fail(error) }
+            } catch CloudError.notSignedIn { CloudSession.shared.sessionExpired(); requireSignIn() }
+            catch { fail(error) }
         }
     }
     func copyShareLink(_ clip: Clip) {
