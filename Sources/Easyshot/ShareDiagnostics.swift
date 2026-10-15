@@ -249,6 +249,22 @@ enum ShareDiagnostics {
             check(ready.status == "ready" && MockCloud.puts == 2 && reused == plan.count-2,"retry resumes: \(MockCloud.puts) of \(plan.count) parts re-sent, \(reused) reused from the journal")
             check(MockCloud.assembled() == (try? Data(contentsOf: url)),"the resumed upload reassembles to the local file")
             check(!FileManager.default.fileExists(atPath: UploadJournal.url(for: url).path),"the journal is removed once the upload completes")
+            // Durable states at interrupted journal writes: a missing/truncated sidecar
+            // re-uploads idempotently; the spool itself remains the source of truth.
+            for sidecar in [Data(),Data("{truncated".utf8)] {
+                try sidecar.write(to: UploadJournal.url(for: url),options: .atomic)
+                MockCloud.prepareRetry(keeping: Set(plan.map(\.number)))
+                let recovered = try ShareRecording(client: client,file: url,video: video,title: nil)
+                _ = try await recovered.finish(durationMs: 1000,width: 2560,height: 1440)
+                check(MockCloud.puts == plan.count && MockCloud.assembled() == (try? Data(contentsOf: url)),"interrupted journal persistence re-uploads the complete spool byte for byte")
+            }
+            // Storage and DB already completed, process stopped before local cleanup.
+            try Data("{truncated".utf8).write(to: UploadJournal.url(for: url),options: .atomic)
+            MockCloud.prepareRetry(keeping: Set(plan.map(\.number)))
+            var committed = video; committed.status = "ready"
+            let recovered = try ShareRecording(client: client,file: url,video: committed,title: nil)
+            let alreadyReady = try await recovered.finish(durationMs: 1000,width: 2560,height: 1440)
+            check(alreadyReady.status == "ready" && MockCloud.puts == 0,"a server-completed upload survives a crash before local journal cleanup")
         } catch { check(false,"resume: \(error.localizedDescription)") }
     }
 

@@ -2,6 +2,8 @@ import AppKit
 import EasyshotCore
 import AVFoundation
 import ScreenCaptureKit
+import ImageIO
+import UniformTypeIdentifiers
 
 @MainActor enum Diagnostics {
     static func startupBenchmark(controller: AppController) async -> Int32 {
@@ -471,6 +473,43 @@ import ScreenCaptureKit
             let text = try await CaptureEngine.recognize(image)
             check(text.contains("Easyshot") && text.contains("2026"),"on-device OCR recognizes exported text")
         } catch { check(false,"save/history/OCR: \(error.localizedDescription)") }
+        do {
+            func frame(_ text: String) -> CGImage {
+                let rep = NSBitmapImageRep(bitmapDataPlanes: nil,pixelsWide: 1600,pixelsHigh: 160,bitsPerSample: 8,samplesPerPixel: 4,hasAlpha: true,isPlanar: false,colorSpaceName: .deviceRGB,bytesPerRow: 0,bitsPerPixel: 0)!
+                NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+                NSColor.white.setFill(); NSBezierPath(rect: CGRect(x: 0,y: 0,width: 1600,height: 160)).fill()
+                (text as NSString).draw(at: CGPoint(x: 30,y: 50),withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 32,weight: .regular),.foregroundColor: NSColor.black])
+                NSGraphicsContext.restoreGraphicsState(); return rep.cgImage!
+            }
+            let secret = frame("sk-proj-1234567890abcdefghijklmnopqrstuv"),blank = frame("")
+            let png = try ScreenshotPixels.png(secret)
+            let original = folder.appendingPathComponent("scan.png"),renamed = folder.appendingPathComponent("scan.gif")
+            try png.write(to: original); try png.write(to: renamed)
+            let a = try UploadableImage.load(from: original),b = try UploadableImage.load(from: renamed)
+            check(a.contentType == "image/png" && b.contentType == a.contentType,"upload MIME type comes from bytes even with a .gif filename")
+            func findings(_ scan: Redaction.Scan) -> Int { if case .secrets(_,let secrets) = scan { return secrets.count }; return 0 }
+            let first = try await Redaction.scan(a),second = try await Redaction.scan(b)
+            check(findings(first) > 0 && findings(first) == findings(second),"renaming identical secret-bearing PNG bytes cannot bypass OCR")
+            if case .secrets(let image,let secrets) = first {
+                let redacted = try Redaction.redacted(a,image: image,secrets: secrets)
+                if case .clean = try await Redaction.scan(redacted) { check(true,"redacted upload no longer contains the detected secret") }
+                else { check(false,"redacted upload no longer contains the detected secret") }
+            }
+            func animation(_ frames: [CGImage]) throws -> UploadableImage {
+                let data = NSMutableData()
+                guard let out = CGImageDestinationCreateWithData(data,UTType.gif.identifier as CFString,frames.count,nil) else { throw ShotError.message("Cannot encode scanner fixture.") }
+                for frame in frames { CGImageDestinationAddImage(out,frame,nil) }
+                guard CGImageDestinationFinalize(out) else { throw ShotError.message("Cannot finalize scanner fixture.") }
+                return try UploadableImage.decode(data as Data,filename: "scan.gif")
+            }
+            if case .animated(let secrets,_) = try await Redaction.scan(animation([blank,secret,blank])) { check(!secrets.isEmpty,"secret scanning checks later animation frames") }
+            else { check(false,"secret scanning checks later animation frames") }
+            let invalid = UploadableImage(data: Data("invalid".utf8),contentType: "image/png",width: 1,height: 1,filename: "invalid.png")
+            if case .unscanned = try await Redaction.scan(invalid) { check(true,"undecodable bytes are unscanned, never clean") }
+            else { check(false,"undecodable bytes are unscanned, never clean") }
+            if case .unscanned = try await Redaction.scan(animation(Array(repeating: blank,count: UploadImageType.maxScannedFrames+1))) { check(true,"animations beyond the scanner budget are unscanned, never clean") }
+            else { check(false,"animations beyond the scanner budget are unscanned, never clean") }
+        } catch { check(false,"upload scanner regression: \(error.localizedDescription)") }
         let pattern = patternImage(width: 120,height: 450)
         let a = pattern.cropping(to: CGRect(x: 0,y: 0,width: 120,height: 220))!
         let b = pattern.cropping(to: CGRect(x: 0,y: 100,width: 120,height: 220))!

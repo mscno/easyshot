@@ -40,6 +40,7 @@ import EasyshotCore
             do {
                 let target: CloudVideo
                 if let existing { target = existing } else { target = try await client.createVideo(title: title) }
+                if target.status == "ready" { created(target); return target }
                 await progress.attach(target.id)
                 await uploader.onProgress { bytes in Task { await progress.report(bytes: bytes) } }
                 await uploader.attach(videoID: target.id,minimumPartBytes: target.upload?.minPartBytes,urlLifetime: target.upload?.partUrlTtlSeconds)
@@ -66,6 +67,9 @@ import EasyshotCore
     private func finishOnce(durationMs: Int,width: Int,height: Int) async throws -> CloudVideo {
         guard let creation else { throw CloudError.invalidResponse }
         let video = try await creation.value; self.video = video
+        // The server committed before a previous process removed its journal. No PUTs
+        // are needed, including when that journal is missing or was only partly written.
+        if video.status == "ready" { await uploader.discardJournal(); await progress.close(); return video }
         await progress.stopped(bytes: await uploader.uploadedBytes)
         let parts = try await uploader.finish(total: spool.total)
         let ready = try await client.completeVideo(video.id,parts: parts,durationMs: durationMs,width: width,height: height)
