@@ -1,6 +1,6 @@
 //! Row-level security is a second wall: these tests run deliberately unfiltered SQL as the
 //! app role (`easyshot_app`, NOBYPASSRLS) and check that PostgreSQL itself denies
-//! cross-owner, cross-workspace and out-of-share access, both through sqlx and inside
+//! cross-owner, cross-workspace and out-of-share access, both through raw SQL (`Db`) and inside
 //! Toasty transactions.
 
 use easyshot_server::db::{Context, Db, DbError};
@@ -279,7 +279,7 @@ async fn toasty_transactions_carry_the_rls_context() {
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
     video(&t.owner, "va", &a.to_string(), "slugA", None).await;
     video(&t.owner, "vb", &b.to_string(), "slugB", None).await;
-    let mut db = orm::connect(&t.config()).await.unwrap();
+    let mut db = t.app.toasty();
 
     // B asks Toasty for A's videos: the query is "correct" for A but runs as B.
     let mut tx = orm::begin(&mut db, &Context::user(b)).await.unwrap();

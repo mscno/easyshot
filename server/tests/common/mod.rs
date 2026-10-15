@@ -9,8 +9,7 @@ use std::str::FromStr;
 
 use easyshot_server::config::Config;
 use easyshot_server::db::{self, Db};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{ConnectOptions, Connection, Executor, PgConnection};
+use easyshot_server::pg;
 use tokio::sync::OnceCell;
 
 pub const DEFAULT_TEST_URL: &str =
@@ -24,33 +23,55 @@ pub fn test_url() -> String {
         .unwrap_or_else(|| DEFAULT_TEST_URL.into())
 }
 
+/// `url` with its database name replaced and extra query parameters appended.
+fn with(url: &str, user: Option<&str>, db: Option<&str>, extra: &str) -> String {
+    let cfg = tokio_postgres::Config::from_str(url).expect("TEST_DATABASE_URL");
+    let host = match cfg.get_hosts().first() {
+        Some(tokio_postgres::config::Host::Tcp(h)) => h.clone(),
+        _ => "localhost".into(),
+    };
+    let port = cfg.get_ports().first().copied().unwrap_or(5432);
+    let (user, pass) = match user {
+        Some(u) => (u.to_string(), u.to_string()),
+        None => (
+            cfg.get_user().unwrap_or("postgres").to_string(),
+            cfg.get_password()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .unwrap_or_default(),
+        ),
+    };
+    let name = db.unwrap_or(cfg.get_dbname().unwrap_or("easyshot_test"));
+    format!("postgres://{user}:{pass}@{host}:{port}/{name}?sslmode=disable{extra}")
+}
+
+pub fn test_db_name() -> String {
+    tokio_postgres::Config::from_str(&test_url())
+        .ok()
+        .and_then(|c| c.get_dbname().map(str::to_string))
+        .unwrap_or_else(|| "easyshot_test".into())
+}
+
 /// Create the test database and the cluster-wide app role once per process.
 async fn prepare() {
     static READY: OnceCell<()> = OnceCell::const_new();
     READY
         .get_or_init(|| async {
             let url = test_url();
-            let opts = PgConnectOptions::from_str(&url).expect("TEST_DATABASE_URL");
-            let name = opts.get_database().unwrap_or("easyshot_test").to_string();
-            let mut admin = opts
-                .clone()
-                .database("postgres")
-                .connect()
+            let name = test_db_name();
+            let admin = pg::connect(&with(&url, None, Some("postgres"), ""), None)
                 .await
                 .expect("connect to the test cluster (is Postgres on :5432 running?)");
-            let exists: Option<i32> =
-                sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
-                    .bind(&name)
-                    .fetch_optional(&mut admin)
-                    .await
-                    .unwrap();
+            let exists = admin
+                .query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&name])
+                .await
+                .unwrap();
             if exists.is_none() {
-                let _ = admin.execute(format!("CREATE DATABASE {name}").as_str()).await;
+                let _ = admin.batch_execute(&format!("CREATE DATABASE {name}")).await;
             }
             // Same statement as migration 0004; created here once so parallel per-test
             // migrations never race on the cluster-wide role.
             let _ = admin
-                .execute(
+                .batch_execute(
                     "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'easyshot_app') THEN \
                      CREATE ROLE easyshot_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOINHERIT \
                      PASSWORD 'easyshot_app'; END IF; END $$",
@@ -65,8 +86,10 @@ pub struct TestDb {
     pub owner: Db,
     /// App-role handle in the test schema: what the server uses; RLS applies.
     pub app: Db,
-    /// App-role URL (with search_path) for components that open their own pool (Toasty).
+    /// App-role URL (with search_path) for components that open their own pool.
     pub app_url: String,
+    /// Owner URL (with search_path), e.g. for a LISTEN connection.
+    pub owner_url: String,
     pub schema: String,
 }
 
@@ -78,13 +101,10 @@ impl TestDb {
 
     /// Drop the schema.
     pub async fn finish(self) {
-        self.app.pool().close().await;
         let _ = self
             .owner
-            .pool()
-            .execute(format!("DROP SCHEMA {} CASCADE", self.schema).as_str())
+            .execute(&format!("DROP SCHEMA {} CASCADE", self.schema), &[])
             .await;
-        self.owner.pool().close().await;
     }
 }
 
@@ -92,43 +112,27 @@ pub async fn database() -> TestDb {
     prepare().await;
     let url = test_url();
     let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
-    let opts = PgConnectOptions::from_str(&url).unwrap();
+    let search_path = format!("&options=-csearch_path%3D{schema}");
     {
-        let mut conn = PgConnection::connect_with(&opts).await.unwrap();
-        conn.execute(format!("CREATE SCHEMA {schema}").as_str())
+        let mut conn = pg::connect(&with(&url, None, None, ""), None)
             .await
             .unwrap();
-        conn.execute(format!("SET search_path TO {schema}").as_str())
-            .await
-            .unwrap();
+        conn.batch_execute(&format!(
+            "CREATE SCHEMA {schema}; SET search_path TO {schema}"
+        ))
+        .await
+        .unwrap();
         db::migrate_conn(&mut conn).await.expect("migrations");
-        conn.close().await.unwrap();
     }
-    let owner = PgPoolOptions::new()
-        .max_connections(3)
-        .connect_with(opts.clone().options([("search_path", schema.as_str())]))
-        .await
-        .unwrap();
-    let app_opts = opts
-        .clone()
-        .username(APP_ROLE)
-        .password(APP_ROLE)
-        .options([("search_path", schema.as_str())]);
-    let app = PgPoolOptions::new()
-        .max_connections(5)
-        .connect_with(app_opts)
-        .await
-        .unwrap();
-    let host = opts.get_host().to_string();
-    let port = opts.get_port();
-    let dbname = opts.get_database().unwrap_or("easyshot_test");
-    let app_url = format!(
-        "postgres://{APP_ROLE}:{APP_ROLE}@{host}:{port}/{dbname}?sslmode=disable&options=-csearch_path%3D{schema}"
-    );
+    let owner_url = with(&url, None, None, &search_path);
+    let app_url = with(&url, Some(APP_ROLE), None, &search_path);
+    let owner = Db::connect_url(&owner_url, 3).await.unwrap();
+    let app = Db::connect_url(&app_url, 5).await.unwrap();
     TestDb {
-        owner: Db::from_pool(owner),
-        app: Db::from_pool(app),
+        owner,
+        app,
         app_url,
+        owner_url,
         schema,
     }
 }

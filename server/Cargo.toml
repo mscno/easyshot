@@ -23,7 +23,6 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "limit"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 async-trait = "0.1"
@@ -41,10 +40,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 thiserror = "2"
 lambda_http = { version = "1", optional = true }
-# Web presence: Topcoat SSR host + Datastar; Toasty models for the video domain.
+# Web presence: Topcoat SSR host + Datastar. Toasty is the only database pool (models and
+# raw SQL); tokio-postgres (Toasty's own driver dependency) opens single connections for
+# migrations and LISTEN, with the same rustls stack.
 topcoat = { version = "0.10", default-features = false, features = ["router", "serve", "view", "cookie", "session", "datastar", "tower", "compression"] }
 toasty = { version = "0.11", default-features = false, features = ["postgresql"] }
 toasty-driver-postgresql = "0.11"
+tokio-postgres = "0.7.17"
+tokio-postgres-rustls = { version = "0.14", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-platform-verifier = "0.7"
 http = "1"
 bytes = "1"
 futures-util = "0.3"

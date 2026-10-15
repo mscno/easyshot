@@ -9,8 +9,7 @@ pub const ACCOUNTS: [&str; 2] = ["dev@easyshot.test", "teammate@easyshot.test"];
 pub const PASSWORD: &str = "easyshot-dev-password";
 
 pub async fn run(owner_url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let pool = sqlx::PgPool::connect(owner_url).await?;
-    let db = Db::from_pool(pool);
+    let db = Db::connect_url(owner_url, 2).await?;
     let mut out = Vec::new();
     for email in ACCOUNTS {
         let now = now_ms();

@@ -1,4 +1,4 @@
-//! The repository layer's SQL (sqlx over Postgres, see `db`); the video domain uses Toasty.
+//! The repository layer: raw SQL through the Toasty pool (see `db`); the video domain uses Toasty models.
 //! Ids are UUID strings, timestamps epoch milliseconds, booleans 0/1.
 //!
 //! users, sessions, auth_codes, api_tokens and login_attempts have no row-level-security
