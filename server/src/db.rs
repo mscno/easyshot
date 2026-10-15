@@ -329,6 +329,30 @@ fn query(sql: &str, params: &[Value]) -> toasty::sql::Query {
     q
 }
 
+/// Raw SQL inside an open Toasty transaction (e.g. one from `orm::begin`, whose RLS
+/// context is already applied); same values and NULL handling as [`Db::query`].
+pub async fn query_in(
+    tx: &mut dyn toasty::Executor,
+    sql: &str,
+    params: &[Value],
+) -> DbResult<Vec<Row>> {
+    query(sql, params)
+        .exec(tx)
+        .await?
+        .into_iter()
+        .map(to_row)
+        .collect()
+}
+
+/// A statement inside an open Toasty transaction; returns the affected-row count.
+pub async fn execute_in(
+    tx: &mut dyn toasty::Executor,
+    sql: &str,
+    params: &[Value],
+) -> DbResult<u64> {
+    Ok(statement(sql, params).exec(tx).await?)
+}
+
 /// Connections opened eagerly at startup so first requests skip the TCP/TLS/auth cost.
 const WARM_CONNECTIONS: usize = 4;
 

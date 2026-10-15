@@ -154,7 +154,10 @@ impl App {
                 "POST",
                 &format!("/v1/videos/{id}/parts"),
                 Some(token),
-                Some(json!({"part_numbers": [1, 2]})),
+                Some(json!({"parts": [
+                    {"part_number": 1, "size": 5 * 1024 * 1024},
+                    {"part_number": 2, "size": 1000}
+                ]})),
             )
             .await
             .json();
@@ -398,7 +401,7 @@ async fn instant_link_upload_and_watch() {
             "POST",
             &format!("/v1/videos/{id}/parts"),
             Some(&token),
-            Some(json!({"part_numbers": [0]})),
+            Some(json!({"parts": [{"part_number": 0, "size": 1}]})),
         )
         .await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
@@ -407,10 +410,14 @@ async fn instant_link_upload_and_watch() {
             "POST",
             &format!("/v1/videos/{id}/parts"),
             Some(&token),
-            Some(json!({"part_numbers": [1]})),
+            Some(json!({"parts": [{"part_number": 1, "size": 7_000_000}]})),
         )
         .await
         .json();
+    assert_eq!(
+        parts["parts"][0]["headers"]["content-length"], "7000000",
+        "{parts}"
+    );
     let up = upload_id(parts["parts"][0]["url"].as_str().unwrap());
     let e1 = app.store.put_part(&up, 1, 7_000_000);
     let bad = app
@@ -451,22 +458,42 @@ async fn instant_link_upload_and_watch() {
             .unwrap()
             .ends_with(".vtt?len=60&ttl=600")
     );
-    let key = app
-        .t
-        .owner
-        .query_one(
-            "SELECT transcript_key FROM videos WHERE id = $1",
-            &vals![id],
-        )
-        .await
+    // Presigning publishes nothing; completing after the PUT does.
+    let url = t.json()["upload"]["url"].as_str().unwrap().to_string();
+    let key = url
+        .strip_prefix("https://store.test/put/")
         .unwrap()
-        .text(0)
+        .split('?')
+        .next()
         .unwrap();
+    assert!(
+        app.t
+            .owner
+            .query_one(
+                "SELECT transcript_key FROM videos WHERE id = $1",
+                &vals![id],
+            )
+            .await
+            .unwrap()
+            .opt_text(0)
+            .unwrap()
+            .is_none()
+    );
     app.store.put_bytes(
-        &key,
+        key,
         b"WEBVTT\n\n00:00.000 --> 00:02.000\nHello\n",
         "text/vtt",
     );
+    let done = app
+        .api(
+            "POST",
+            &format!("/v1/videos/{id}/transcript/complete"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+    assert_eq!(done.json()["has_transcript"], true);
     let big = app
         .api(
             "POST",
@@ -549,7 +576,7 @@ async fn instant_link_upload_and_watch() {
         .api("DELETE", &format!("/v1/videos/{id}"), Some(&token), None)
         .await;
     assert_eq!(gone.status, StatusCode::NO_CONTENT);
-    assert!(!app.store.contains(&key));
+    assert!(!app.store.contains(key));
     assert_eq!(
         app.get(&format!("/v/{slug}"), None).await.status,
         StatusCode::NOT_FOUND

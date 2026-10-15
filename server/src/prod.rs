@@ -19,12 +19,13 @@ use crate::pg;
 
 pub const APP_ROLE: &str = "easyshot_app";
 /// Tables whose rows belong to an owner and must be guarded by a FORCE'd policy.
-pub const RLS_TABLES: [&str; 5] = [
+pub const RLS_TABLES: [&str; 6] = [
     "screenshots",
     "videos",
     "item_comments",
     "item_reactions",
     "item_views",
+    "upload_parts",
 ];
 
 /// How the server signs in.

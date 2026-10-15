@@ -156,7 +156,10 @@ impl App {
                 "POST",
                 &format!("/v1/videos/{id}/parts"),
                 Some(token),
-                Some(json!({"part_numbers": [1, 2]})),
+                Some(json!({"parts": [
+                    {"part_number": 1, "size": 5 * 1024 * 1024},
+                    {"part_number": 2, "size": 1000}
+                ]})),
             )
             .await
             .json();
@@ -318,6 +321,9 @@ async fn review_complete_recovers_after_storage_commit_before_database_commit() 
     let row = app.t.owner.query_one("SELECT object_key, upload_id FROM videos WHERE id=$1", &vals![id]).await.unwrap();
     let key = row.text(0).unwrap();
     let upload = row.text(1).unwrap();
+    let presigned = app.api("POST", &format!("/v1/videos/{id}/parts"), Some(&token),
+        Some(json!({"parts":[{"part_number":1,"size":1000}]}))).await;
+    assert_eq!(presigned.status, StatusCode::OK, "{}", presigned.body);
     let tag = app.store.put_part(&upload, 1, 1000);
     // Simulate the exact durable state after S3 commits and the process/DB fails
     // before videos.status becomes ready. No live storage service is contacted.

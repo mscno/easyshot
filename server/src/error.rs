@@ -35,6 +35,8 @@ pub enum AppError {
     NotUploaded,
     #[error("uploaded size does not match declared size")]
     SizeMismatch,
+    #[error("finish or delete an unfinished upload first")]
+    TooManyPendingUploads,
     #[error("storage error: {0}")]
     Storage(String),
     #[error("database error: {0}")]
@@ -62,6 +64,7 @@ impl AppError {
             UnsupportedType => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "UNSUPPORTED_TYPE"),
             NotUploaded => (StatusCode::CONFLICT, "NOT_UPLOADED"),
             SizeMismatch => (StatusCode::UNPROCESSABLE_ENTITY, "SIZE_MISMATCH"),
+            TooManyPendingUploads => (StatusCode::TOO_MANY_REQUESTS, "TOO_MANY_PENDING_UPLOADS"),
             Storage(_) => (StatusCode::BAD_GATEWAY, "STORAGE_ERROR"),
             Db(_) | Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
         }

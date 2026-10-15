@@ -325,6 +325,71 @@ async fn maintenance_bypass_reaches_every_owner() {
     t.finish().await;
 }
 
+/// Upload reservations (migration 0009) follow their owner: no context sees none, another
+/// account neither reads, changes nor deletes them, and nobody reserves against a video
+/// they do not own, not even under their own user id.
+#[tokio::test]
+async fn upload_reservations_are_owner_only() {
+    let t = common::database().await;
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    video(&t.owner, "va", &a.to_string(), "slugA", None).await;
+    video(&t.owner, "vb", &b.to_string(), "slugB", None).await;
+    let reserve = "INSERT INTO upload_parts (video_id, part_number, user_id, byte_size, created_at) \
+                   VALUES ($1, $2, $3, 100, 1)";
+    t.owner
+        .execute(reserve, &vals!["va", 1, a.to_string()])
+        .await
+        .unwrap();
+    assert!(
+        ids(&t.app, "SELECT video_id FROM upload_parts")
+            .await
+            .is_empty()
+    );
+    let as_b = t.app.scoped(Context::user(b));
+    assert!(
+        ids(&as_b, "SELECT video_id FROM upload_parts")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        as_b.execute("UPDATE upload_parts SET byte_size = 1", &[])
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        as_b.execute("DELETE FROM upload_parts", &[]).await.unwrap(),
+        0
+    );
+    for (video, user) in [("va", b), ("va", a), ("vb", a)] {
+        let e = as_b
+            .execute(reserve, &vals![video, 2, user.to_string()])
+            .await
+            .unwrap_err();
+        assert!(rls_violation(e), "{video} as {user}");
+    }
+    as_b.execute(reserve, &vals!["vb", 2, b.to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(
+            &t.app.scoped(Context::user(a)),
+            "SELECT video_id FROM upload_parts"
+        )
+        .await,
+        ["va"]
+    );
+    assert_eq!(
+        ids(
+            &t.app.scoped(Context::maintenance()),
+            "SELECT video_id FROM upload_parts"
+        )
+        .await,
+        ["va", "vb"]
+    );
+    t.finish().await;
+}
+
 #[tokio::test]
 async fn production_verify_reports_the_rls_posture() {
     let t = common::database().await;
