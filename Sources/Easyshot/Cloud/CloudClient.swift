@@ -50,7 +50,8 @@ struct CloudClient {
     struct Created { var screenshot: CloudScreenshot; var uploadURL: URL; var headers: [String: String]; var method: String }
     struct AuthResult { var token: String; var user: CloudUser }
     /// Accounts are usable only once their address is confirmed; until then the server mails a code instead of a session.
-    enum AuthOutcome { case signedIn(AuthResult),verificationRequired }
+    /// `attempt` ties the emailed code to this request: a code mailed for someone else's attempt is refused.
+    enum AuthOutcome { case signedIn(AuthResult),verificationRequired(attempt: String) }
 
     static let decoder: JSONDecoder = { let d = JSONDecoder(); d.keyDecodingStrategy = .convertFromSnakeCase; return d }()
 
@@ -92,15 +93,13 @@ struct CloudClient {
 
     func authenticate(register: Bool,email: String,password: String,deviceName: String) async throws -> AuthOutcome {
         struct Body: Encodable { var email: String; var password: String; var deviceName: String }
-        struct Reply: Decodable { var token: String?; var user: CloudUser?; var verificationRequired: Bool? }
+        struct Reply: Decodable { var token: String?; var user: CloudUser?; var verificationRequired: Bool?; var attempt: String? }
         let body = try Self.encoder.encode(Body(email: email,password: password,deviceName: deviceName))
-        let data: Data
-        do { data = try await send(makeRequest("POST","v1/auth/\(register ? "register" : "login")",body: body,authorized: false),authorized: false) }
-        catch CloudError.server(403,"EMAIL_NOT_VERIFIED",_) { return .verificationRequired }
+        let data = try await send(makeRequest("POST","v1/auth/\(register ? "register" : "login")",body: body,authorized: false),authorized: false)
         let reply = try Self.decoder.decode(Reply.self,from: data)
         if let token = reply.token,let user = reply.user { return .signedIn(AuthResult(token: token,user: user)) }
-        guard reply.verificationRequired == true else { throw CloudError.invalidResponse }
-        return .verificationRequired
+        guard reply.verificationRequired == true,let attempt = reply.attempt else { throw CloudError.invalidResponse }
+        return .verificationRequired(attempt: attempt)
     }
     private static let deviceName = Host.current().localizedName ?? "Mac"
     private func post<B: Encodable>(_ path: String,_ body: B,authorized: Bool = false) async throws -> Data {
@@ -111,10 +110,10 @@ struct CloudClient {
         struct Body: Encodable { var email: String }
         _ = try await post("v1/auth/\(reset ? "password/forgot" : "otp/request")",Body(email: email))
     }
-    func signIn(email: String,code: String) async throws -> AuthResult {
-        struct Body: Encodable { var email: String; var code: String; var deviceName: String }
+    func signIn(email: String,code: String,attempt: String? = nil) async throws -> AuthResult {
+        struct Body: Encodable { var email: String; var code: String; var deviceName: String; var attempt: String? }
         struct Reply: Decodable { var token: String; var user: CloudUser }
-        let reply = try Self.decoder.decode(Reply.self,from: await post("v1/auth/otp/verify",Body(email: email,code: code,deviceName: Self.deviceName)))
+        let reply = try Self.decoder.decode(Reply.self,from: await post("v1/auth/otp/verify",Body(email: email,code: code,deviceName: Self.deviceName,attempt: attempt)))
         return AuthResult(token: reply.token,user: reply.user)
     }
     func resetPassword(email: String,code: String,newPassword: String) async throws {

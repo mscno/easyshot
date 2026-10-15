@@ -39,19 +39,19 @@ import EasyshotCore
         guard let url = baseURL else { error = "Enter a valid server address (https://…)."; return nil }
         return Origin(url: url,account: account,generation: generation)
     }
-    /// Signs in with a password, or creates the account. Returns true when the server emailed a code to
-    /// confirm the address instead (new or unconfirmed accounts); `signIn(email:code:)` finishes it.
-    @discardableResult func signIn(email: String,password: String,register: Bool) async -> Bool {
-        guard let origin = origin() else { return false }
+    /// Signs in with a password, or creates the account. Returns the attempt when the server emailed a code
+    /// to confirm the address instead (new or unconfirmed accounts); `signIn(email:code:attempt:)` finishes it.
+    @discardableResult func signIn(email: String,password: String,register: Bool) async -> String? {
+        guard let origin = origin() else { return nil }
         let address = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard address.contains("@"),!password.isEmpty else { error = "Enter your email and password."; return false }
+        guard address.contains("@"),!password.isEmpty else { error = "Enter your email and password."; return nil }
         busy = true; error = nil; defer { busy = false }
         do {
             switch try await CloudClient(baseURL: origin.url).authenticate(register: register,email: address,password: password,deviceName: Host.current().localizedName ?? "Mac") {
-            case .signedIn(let result): finish(result,from: origin); return false
-            case .verificationRequired: return true
+            case .signedIn(let result): finish(result,from: origin); return nil
+            case .verificationRequired(let attempt): return attempt
             }
-        } catch { self.error = error.localizedDescription; return false }
+        } catch { self.error = error.localizedDescription; return nil }
     }
     private func finish(_ result: CloudClient.AuthResult,from origin: Origin) {
         loadIfNeeded()
@@ -85,9 +85,9 @@ import EasyshotCore
         guard let address = validEmail(email) else { return false }
         return await attempt { client,_ in try await client.requestCode(email: address,reset: reset) }
     }
-    func signIn(email: String,code: String) async {
+    func signIn(email: String,code: String,attempt confirming: String? = nil) async {
         guard let address = validEmail(email) else { return }
-        await attempt { client,origin in self.finish(try await client.signIn(email: address,code: code.trimmingCharacters(in: .whitespaces)),from: origin) }
+        await attempt { client,origin in self.finish(try await client.signIn(email: address,code: code.trimmingCharacters(in: .whitespaces),attempt: confirming),from: origin) }
     }
     func resetPassword(email: String,code: String,newPassword: String) async -> Bool {
         guard let address = validEmail(email) else { return false }

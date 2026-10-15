@@ -14,6 +14,8 @@ struct CloudAccountForm: View {
     @State private var code = ""
     @State private var newPassword = ""
     @State private var codeSent = false
+    /// The sign-up or sign-in attempt the emailed confirmation code belongs to.
+    @State private var attempt: String?
     @State private var notice: String?
     @State private var showServer = false
     private func switchTo(_ new: Mode) { mode = new; codeSent = false; code = ""; newPassword = ""; notice = nil; cloud.error = nil }
@@ -66,7 +68,7 @@ struct CloudAccountForm: View {
             HStack {
                 Button("Confirm",action: confirmAccount).buttonStyle(.glassProminent).disabled(cloud.busy || code.count < 6)
                 // Registering again mails a fresh code tied to this password; the server answers the same either way.
-                Button("Resend Code") { Task { if await cloud.signIn(email: email,password: password,register: true) { notice = "A new code is on its way." } } }
+                Button("Resend Code") { Task { if let next = await cloud.signIn(email: email,password: password,register: true) { attempt = next; notice = "A new code is on its way." } } }
                     .buttonStyle(.glass).disabled(cloud.busy)
                 Button("Back") { switchTo(.password) }.buttonStyle(.link)
                 if cloud.busy { ProgressView().controlSize(.small) }
@@ -86,11 +88,11 @@ struct CloudAccountForm: View {
     }
     private func passwordSignIn(register: Bool) {
         Task {
-            guard await cloud.signIn(email: email,password: password,register: register) else { return }
-            switchTo(.confirm); notice = "Check your email for a 6-digit code."
+            guard let started = await cloud.signIn(email: email,password: password,register: register) else { return }
+            switchTo(.confirm); attempt = started; notice = "Check your email for a 6-digit code."
         }
     }
-    private func confirmAccount() { Task { await cloud.signIn(email: email,code: code) } }
+    private func confirmAccount() { Task { await cloud.signIn(email: email,code: code,attempt: attempt) } }
     @ViewBuilder private func codeFields(sendTitle: String,confirmTitle: String,newPassword needsPassword: Bool = false,action: @escaping () -> Void) -> some View {
         if codeSent {
             TextField("6-digit code from the email",text: $code).onSubmit { if !needsPassword { action() } }
