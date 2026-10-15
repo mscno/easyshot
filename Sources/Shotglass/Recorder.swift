@@ -14,12 +14,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     private var mic: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var effects: RecordingEffects?
+    private var telemetry: CursorTelemetry?
     private var started = false
     private var ending = false
     private var sampleError: Error?
     var didFail: ((Error) -> Void)?
 
-    func start(filter: SCContentFilter,configuration: SCStreamConfiguration,url: URL,effects: RecordingEffects? = nil) async throws {
+    /// With `telemetry`, frames pass through untouched and the cursor is logged for Studio export.
+    func start(filter: SCContentFilter,configuration: SCStreamConfiguration,url: URL,effects: RecordingEffects? = nil,telemetry: CursorTelemetry? = nil) async throws {
         let writer = try AVAssetWriter(outputURL: url,fileType: .mp4)
         let video = AVAssetWriterInput(mediaType: .video,outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -38,7 +40,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ])
         }
-        self.writer = writer; self.video = video
+        self.writer = writer; self.video = video; self.telemetry = telemetry
         configuration.queueDepth = 6
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.capturesAudio = Preferences.shared.systemAudio
@@ -55,8 +57,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         if configuration.capturesAudio { try stream.addStreamOutput(self,type: .audio,sampleHandlerQueue: queue) }
         if #available(macOS 15.0, *),configuration.captureMicrophone { try stream.addStreamOutput(self,type: .microphone,sampleHandlerQueue: queue) }
         guard writer.startWriting() else { throw writer.error ?? ShotError.message("Could not start video writer.") }
+        telemetry?.start(fps: Int(1/max(configuration.minimumFrameInterval.seconds,1/120)),queue: queue)
         do { try await stream.startCapture() }
-        catch { writer.cancelWriting(); self.stream = nil; throw error }
+        catch { telemetry?.cancel(); writer.cancelWriting(); self.stream = nil; throw error }
     }
     private func audioInput(channels: Int) -> AVAssetWriterInput {
         let input = AVAssetWriterInput(mediaType: .audio,outputSettings: [
@@ -70,7 +73,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         if type == .screen {
             guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample,createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
                   let raw = attachments.first?[.status] as? Int,SCFrameStatus(rawValue: raw) == .complete else { return }
-            if !started { writer.startSession(atSourceTime: sample.presentationTimeStamp); started = true }
+            if !started { writer.startSession(atSourceTime: sample.presentationTimeStamp); telemetry?.setOrigin(sample.presentationTimeStamp); started = true }
             if video?.isReadyForMoreMediaData == true {
                 if let effects,let adaptor,let pool = adaptor.pixelBufferPool,let input = CMSampleBufferGetImageBuffer(sample) {
                     if let output = effects.composite(input,pool: pool),!adaptor.append(output,withPresentationTime: sample.presentationTimeStamp) { sampleError = writer.error }
@@ -86,7 +89,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     func stop() async throws {
         guard let stream,let writer else { return }
         do { try await stream.stopCapture() }
-        catch { writer.cancelWriting(); self.stream = nil; throw error }
+        catch { telemetry?.cancel(); writer.cancelWriting(); self.stream = nil; throw error }
         let hasFrames: Bool = await withCheckedContinuation { continuation in
             queue.async {
                 self.ending = true
@@ -94,10 +97,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
                 continuation.resume(returning: self.started)
             }
         }
-        guard hasFrames else { writer.cancelWriting(); throw ShotError.message("No video frames were received. Check Screen Recording permission.") }
+        guard hasFrames else { telemetry?.cancel(); writer.cancelWriting(); throw ShotError.message("No video frames were received. Check Screen Recording permission.") }
         await writer.finishWriting()
         self.stream = nil
-        if writer.status != .completed { throw writer.error ?? sampleError ?? ShotError.message("Recording could not be finalized.") }
+        if writer.status != .completed { telemetry?.cancel(); throw writer.error ?? sampleError ?? ShotError.message("Recording could not be finalized.") }
+        // A missing sidecar only disables Studio editing; the recording itself is intact.
+        let output = writer.outputURL
+        try? await withCheckedThrowingContinuation { (c: CheckedContinuation<Void,Error>) in queue.async { c.resume(with: Result { try self.telemetry?.finish(video: output) }) } }
     }
 }
 

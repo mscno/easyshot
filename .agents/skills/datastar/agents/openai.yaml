@@ -1,0 +1,3 @@
+interface:
+  display_name: "Datastar Web"
+  short_description: "Datastar forms and SSE with a Rust backend"

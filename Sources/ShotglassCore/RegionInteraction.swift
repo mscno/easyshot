@@ -69,9 +69,21 @@ public enum LaunchAction: String, CaseIterable {
     /// Capture, upload, and copy a shareable link. `pasteUpload` converts the clipboard image into a link instead.
     case upload, pasteUpload = "paste-upload", cloud
     public init?(url: URL) {
-        guard url.scheme?.lowercased() == "shotglass",url.user == nil,url.password == nil,url.port == nil,
+        guard ["shotglass","shotglass-dev"].contains(url.scheme?.lowercased() ?? ""),url.user == nil,url.password == nil,url.port == nil,
               url.path.isEmpty || url.path == "/",url.query == nil,url.fragment == nil,
               let host = url.host,let action = Self(rawValue: host.lowercased()) else { return nil }
         self = action
+    }
+    /// `shotglass://edit?path=/absolute/file` opens a capture, recording or project in the editor.
+    public static func editPath(_ url: URL) -> String? {
+        guard ["shotglass","shotglass-dev"].contains(url.scheme?.lowercased() ?? ""),url.host?.lowercased() == "edit",url.user == nil,url.password == nil,url.port == nil,
+              let items = URLComponents(url: url,resolvingAgainstBaseURL: false)?.queryItems,items.count == 1,items[0].name == "path",
+              let path = items[0].value,path.hasPrefix("/") else { return nil }
+        return (path as NSString).standardizingPath
+    }
+    public static func editURL(path: String) -> URL? {
+        var components = URLComponents(); components.scheme = "shotglass"; components.host = "edit"
+        components.queryItems = [URLQueryItem(name: "path",value: path)]
+        return components.url
     }
 }

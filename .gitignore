@@ -15,3 +15,4 @@ __pycache__/
 *.keychain-db
 *.provisionprofile
 .esec-keyring
+.claude/worktrees/

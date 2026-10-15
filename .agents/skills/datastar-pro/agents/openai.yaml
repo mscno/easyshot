@@ -1,0 +1,3 @@
+interface:
+  display_name: "Datastar Pro"
+  short_description: "Use Datastar Pro features with Rust-rendered HTML"

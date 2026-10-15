@@ -67,6 +67,7 @@ final class RegionInteractionTests: XCTestCase {
     func testAllLauncherRoutes() {
         for action in LaunchAction.allCases {
             XCTAssertEqual(LaunchAction(url: URL(string: "shotglass://\(action.rawValue)")!),action)
+            XCTAssertEqual(LaunchAction(url: URL(string: "shotglass-dev://\(action.rawValue)")!),action)
         }
     }
     func testInvalidURLsCannotRouteActions() {

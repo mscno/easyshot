@@ -13,6 +13,21 @@ if [[ "$EDITION" == app-store ]]; then
         echo 'Use an Apple Distribution identity for Store distribution, or Apple Development for local testing.' >&2; exit 1
     fi
 fi
+# Local direct builds (no SIGNING_IDENTITY) are development builds. macOS keys privacy
+# grants (Screen Recording, Accessibility, camera, microphone) to the designated
+# requirement. Ad-hoc signatures use the binary's cdhash, which changes on every build,
+# so they would re-prompt after each rebuild or version bump. Sign with a stable keychain
+# identity instead, and use a separate bundle ID so they never replace the grants of the installed release.
+BUNDLE_ID=no.paraply.shotglass
+LOCAL_IDENTITY=""
+if [[ "$EDITION" == direct && -z "${SIGNING_IDENTITY:-}" ]]; then
+    LOCAL_IDENTITY="${LOCAL_SIGNING_IDENTITY:-}"
+    for KIND in 'Apple Development:' 'Developer ID Application:'; do
+        [[ -n "$LOCAL_IDENTITY" ]] || LOCAL_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -v k="\"$KIND" 'index($0,k){print $2; exit}')"
+    done
+    [[ "${DEV_BUNDLE:-1}" == 0 ]] || BUNDLE_ID=no.paraply.shotglass.dev
+    [[ -n "$LOCAL_IDENTITY" ]] || echo 'warning: no code-signing identity found; ad-hoc builds lose privacy permissions after every rebuild.' >&2
+fi
 swift build "${BUILD_ARGS[@]}"
 BIN_PATH="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)"
 APP="${APP_OUTPUT_DIR:-$PWD/dist}/Shotglass.app"
@@ -23,12 +38,20 @@ if [[ "$EDITION" == direct ]]; then
     SPARKLE_ROOT="$(bash scripts/fetch-sparkle.sh)"
     mkdir -p "$APP/Contents/Frameworks"
     ditto "$SPARKLE_ROOT/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
-    bash scripts/sign-sparkle.sh "$APP"
+    if [[ -n "$LOCAL_IDENTITY" ]]; then SIGNING_IDENTITY="$LOCAL_IDENTITY" SIGN_TIMESTAMP=--timestamp=none bash scripts/sign-sparkle.sh "$APP"
+    else bash scripts/sign-sparkle.sh "$APP"; fi
 fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 # The Shotglass Cloud server address is never committed; inject it at build time.
 if [[ -n "${SHOTGLASS_CLOUD_URL:-}" ]]; then
     /usr/libexec/PlistBuddy -c "Add :ShotglassCloudURL string $SHOTGLASS_CLOUD_URL" "$APP/Contents/Info.plist"
+fi
+if [[ "$BUNDLE_ID" != no.paraply.shotglass ]]; then
+    # Separate name, URL scheme and no Sparkle feed: a development build never updates
+    # itself to the release or captures shotglass:// launches meant for the installed app.
+    PLIST="$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" -c 'Set :CFBundleName Shotglass Dev' -c 'Set :CFBundleDisplayName Shotglass Dev' \
+        -c "Set :CFBundleURLTypes:0:CFBundleURLName $BUNDLE_ID.capture" -c 'Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 shotglass-dev' -c 'Delete :SUFeedURL' "$PLIST"
 fi
 cp Resources/PrivacyInfo.xcprivacy "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
 if [[ "$EDITION" == app-store ]]; then
@@ -48,13 +71,16 @@ mkdir -p "$APP/Contents/Resources/Raycast"
 cp integrations/raycast/*.sh "$APP/Contents/Resources/Raycast/"
 swift scripts/make-icon.swift "$APP/Contents/Resources"
 if [[ -n "${SIGNING_IDENTITY:-}" ]]; then
-    SIGN_ARGS=(--force --sign "$SIGNING_IDENTITY" --identifier no.paraply.shotglass --options runtime --timestamp --entitlements "$ENTITLEMENTS")
+    SIGN_ARGS=(--force --sign "$SIGNING_IDENTITY" --identifier "$BUNDLE_ID" --options runtime --timestamp --entitlements "$ENTITLEMENTS")
     if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then SIGN_ARGS+=(--keychain "$SIGNING_KEYCHAIN"); fi
     # Sparkle's nested helpers were signed explicitly above.
     # Sign nested code explicitly here if the bundle gains any in future.
     codesign "${SIGN_ARGS[@]}" "$APP"
+elif [[ -n "$LOCAL_IDENTITY" ]]; then
+    codesign --force --sign "$LOCAL_IDENTITY" --identifier "$BUNDLE_ID" --options runtime --timestamp=none --entitlements "$ENTITLEMENTS" "$APP"
+    echo "Signed development build $BUNDLE_ID with a stable identity; privacy permissions persist across rebuilds."
 else
-    SIGN_ARGS=(--force --sign - --identifier no.paraply.shotglass)
+    SIGN_ARGS=(--force --sign - --identifier "$BUNDLE_ID")
     if [[ "$EDITION" == app-store ]]; then SIGN_ARGS+=(--entitlements "$ENTITLEMENTS"); fi
     codesign "${SIGN_ARGS[@]}" "$APP"
 fi

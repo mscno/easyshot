@@ -87,9 +87,20 @@ open 'shotglass://active-window'
 open 'shotglass://upload'        # capture, upload, copy a link
 open 'shotglass://paste-upload'  # upload the clipboard image, copy a link
 open 'shotglass://cloud'         # Library, Cloud page
+open 'shotglass://edit?path=/absolute/file.png'  # open a file in the editor
 ```
 
 The app remembers the foreground application while running and ignores launcher activation, so opening the bar through Raycast preserves the application you were working in for Active Window. URL routing handles both first launch and an already running app. Scripts require the packaged app to be registered with macOS; opening the installed app once does this.
+
+## AI agents (MCP)
+
+Claude Code, Codex, Claude Desktop and other MCP clients can drive Shotglass: list displays and windows, take native-resolution screenshots with a downscaled preview, read on-screen text with frames for clicking, record MP4s, upload to Shotglass Cloud and open the editor. The agent starts `Shotglass --mcp` as a stdio server for the length of its session; no resident process is added.
+
+```sh
+claude mcp add --scope user shotglass -- /Applications/Shotglass.app/Contents/MacOS/Shotglass --mcp
+```
+
+See [docs/MCP.md](docs/MCP.md) for Codex and Claude Desktop configuration, tools, coordinates and permissions.
 
 ## Included tools
 
@@ -103,6 +114,7 @@ The app remembers the foreground application while running and ignores launcher 
 - On-device text recognition and QR/barcode recognition, with searchable recognized text in history. OCR adds text to the clipboard while keeping the image/file representations available.
 - Floating reference images with resizing, opacity, click-through mode, and Window-menu unlock.
 - MP4 recording of a screen, window, or region, with selectable frame rate, cursor, system audio, microphone, webcam bubble, click highlights, and command shortcut captions.
+- **Studio recordings** (Settings → Recording → Studio): the cursor is hidden while recording and its position, clicks, keystroke timing (never key identities) and shape are logged to a hidden `.<name>.mp4.shotglass-cursor.json` sidecar; frames stay a passthrough, so capture costs the same as a plain recording. No Accessibility or Input Monitoring access is needed. Opening the recording adds a Studio panel: automatic zooms on clicks and typing bursts, a timeline strip (drag to add a zoom, click one to remove it), a spring-smoothed, enlarged cursor that dips on click, optional zoom motion blur, gradient/colour/wallpaper/custom-image backgrounds with padding, rounded corners and shadow. Preview and export use the same Core Image graph on the GPU; static layers render once per plan. Export at source, 1080p or 4K (never upscaled) in H.264 or HEVC, keeping audio and the trim range. Edits save to a `.shotglass-studio.json` sidecar.
 - Microphone/system-audio mixing for playback, trimming, GIF export, and native video sharing. GIFs export at 10 fps and a maximum dimension of 960 pixels, with a two-minute duration limit.
 - Scrolling screenshots with overlap detection and duplicate rejection. Select only the moving content, excluding fixed headers. Scroll manually and add frames, or enable automatic scrolling. Finish saves and copies the combined image. Auto scrolling is bounded to avoid unbounded captures.
 - Desktop-icon exclusion from display captures.
@@ -111,7 +123,7 @@ The app remembers the foreground application while running and ignores launcher 
 
 This is an independent local implementation, with its own interface and assets. It does not connect to CleanShot accounts or copy CleanShot's private services or proprietary project format.
 
-CleanShot Cloud hosting, team comments, transcripts, SSO/SCIM, and domain management are not implemented. Sharing uses the native macOS share sheet or file drag and drop. The video editor supports trim and GIF export; it does not implement Studio Mode's smart zooms, cursor smoothing, motion blur, or timeline composition. The capture overlay does not yet provide a magnifier. Image combination currently stacks images vertically. Scrolling capture currently supports vertical content and depends on sufficient overlap; animations and fixed elements can prevent matching. Recording a region spanning several monitors records the display containing the largest part of that region; screenshots can span monitors.
+CleanShot Cloud hosting, team comments, transcripts, SSO/SCIM, and domain management are not implemented. Sharing uses the native macOS share sheet or file drag and drop. The video editor supports trim, GIF export and Studio zoom/cursor/background export; it has no multi-clip timeline, cuts, speed changes or 3D scenes. Studio typing zooms aim at the last click because the caret position is not recorded. Window recordings map the cursor to the window's frame at the start, so moving the window during a Studio recording offsets the cursor. Studio recordings saved without Studio export have no cursor. The capture overlay does not yet provide a magnifier. Image combination currently stacks images vertically. Scrolling capture currently supports vertical content and depends on sufficient overlap; animations and fixed elements can prevent matching. Recording a region spanning several monitors records the display containing the largest part of that region; screenshots can span monitors.
 
 ## Build from source
 
@@ -122,7 +134,7 @@ bash scripts/build-app.sh                 # release app, Apple Silicon only
 open dist/Shotglass.app
 ```
 
-The script builds the executable, packages the `.app`, generates an original icon, and applies a local ad-hoc signature. For signed and notarized drag-to-Applications DMGs, follow [the release setup](docs/RELEASING.md). The **Release signed DMG** workflow runs on `master` pushes or manually, publishing the verified DMG and checksum as a downloadable Actions artifact. A versioned draft release is optional. An updated local build may require reauthorizing macOS permissions.
+The script builds the executable, packages the `.app` and generates an original icon. Without `SIGNING_IDENTITY` it produces a development build: bundle ID `no.paraply.shotglass.dev`, named *Shotglass Dev*, URL scheme `shotglass-dev://`, with no Sparkle feed. It is signed with the first *Apple Development* or *Developer ID Application* identity in your keychain. Override the identity with `LOCAL_SIGNING_IDENTITY`. macOS ties Screen Recording, Accessibility, camera and microphone grants to the signature's designated requirement. With a stable identity, those grants survive rebuilds and version bumps. The separate bundle ID keeps development builds from replacing the installed release's grants. With no identity available, the script falls back to an ad-hoc signature, which macOS treats as a new app on every build. Set `DEV_BUNDLE=0` to keep the release bundle ID locally. For signed and notarized drag-to-Applications DMGs, follow [the release setup](docs/RELEASING.md). The **Release signed DMG** workflow runs on `master` pushes or manually, publishing the verified DMG and checksum as a downloadable Actions artifact. A versioned draft release is optional. Grant permissions once to *Shotglass Dev*; signed releases keep theirs across Sparkle updates because they share the Paraply Developer ID requirement.
 
 Mac App Store preparation is documented in [the Store guide](docs/APP_STORE.md). A separate sandboxed edition, local package scripts, privacy/support copy and listing drafts are prepared. The app will be free under Paraply Ventures AS. Uploading and submission are on hold; public pages, Store distribution certificates, contacts and final screenshots still need completion. The Store edition uses manual scrolling and omits global keystroke captions.
 
@@ -135,6 +147,7 @@ swift test
 bash scripts/build-app.sh debug
 dist/Shotglass.app/Contents/MacOS/Shotglass --self-test
 dist/Shotglass.app/Contents/MacOS/Shotglass --capture-test
+dist/Shotglass.app/Contents/MacOS/Shotglass --studio-test       # offline: synthetic 1440p60 → Studio export, no permissions
 dist/Shotglass.app/Contents/MacOS/Shotglass --idle-exit-test
 dist/Shotglass.app/Contents/MacOS/Shotglass --escape-exit-test
 dist/Shotglass.app/Contents/MacOS/Shotglass --live-selection-test

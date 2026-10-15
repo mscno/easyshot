@@ -4,7 +4,7 @@ FRAMEWORK="$1/Contents/Frameworks/Sparkle.framework"
 [[ -d "$FRAMEWORK" ]] || { echo 'Missing embedded Sparkle framework' >&2; exit 1; }
 ARGS=(--force --sign "${SIGNING_IDENTITY:--}")
 if [[ -n "${SIGNING_IDENTITY:-}" ]]; then
-    ARGS+=(--options runtime --timestamp)
+    ARGS+=(--options runtime "${SIGN_TIMESTAMP:---timestamp}")
     if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then ARGS+=(--keychain "$SIGNING_KEYCHAIN"); fi
 fi
 mkdir -p "$1/Contents/Resources"

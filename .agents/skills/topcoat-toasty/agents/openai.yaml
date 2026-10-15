@@ -1,0 +1,4 @@
+interface:
+  display_name: "Topcoat and Toasty"
+  short_description: "Build Rust web apps with Topcoat and Toasty ORM"
+  default_prompt: "Use $topcoat-toasty to implement this change using the project's Topcoat and Toasty versions and architecture."

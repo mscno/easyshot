@@ -67,7 +67,8 @@ enum CaptureTarget {
         let p = Preferences.shared
         func pixelSize(_ n: Int) -> Int { recording ? even(n) : max(1,n) }
         let config = SCStreamConfiguration()
-        config.showsCursor = recording ? p.recordCursor : p.captureCursor
+        // Studio recordings hide the cursor; it is re-rendered, smoothed, at export.
+        config.showsCursor = recording ? p.recordCursor && !p.studio : p.captureCursor
         config.captureResolution = .best
         config.ignoreShadowsSingleWindow = !p.windowShadow || recording
         config.ignoreShadowsDisplay = true

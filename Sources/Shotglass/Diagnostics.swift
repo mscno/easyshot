@@ -464,6 +464,96 @@ import ScreenCaptureKit
         print("\(checks-failures)/\(checks) checks passed. Artifacts: \(folder.path)")
         return failures == 0 ? 0 : 1
     }
+    /// Offline Studio pipeline check: synthetic 1440p60 video plus a fake cursor track,
+    /// exported through the GPU renderer. Needs no permissions.
+    static func studioTest() async -> Int32 {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("shotglass-studio-tests-\(UUID().uuidString)")
+        var checks = 0; var failures = 0
+        func check(_ result: Bool,_ name: String) { checks += 1; if !result { failures += 1 }; print("\(result ? "PASS" : "FAIL"): \(name)"); fflush(stdout) }
+        do {
+            try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
+            let w = 2560, h = 1440, fps = 60, seconds = 5
+            let url = folder.appendingPathComponent("studio-source.mp4")
+            let writer = try AVAssetWriter(outputURL: url,fileType: .mp4)
+            let input = AVAssetWriterInput(mediaType: .video,outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264,AVVideoWidthKey: w,AVVideoHeightKey: h])
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input,sourcePixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,kCVPixelBufferWidthKey as String: w,kCVPixelBufferHeightKey as String: h])
+            writer.add(input)
+            guard writer.startWriting() else { throw writer.error ?? ShotError.message("Synthetic video writer failed.") }
+            writer.startSession(atSourceTime: .zero)
+            // Left half red, right half blue, so zoom position is measurable in exported pixels.
+            var row = [UInt8](repeating: 0,count: w*4)
+            for x in 0..<w { let red = x < w/2; row[x*4] = red ? 40 : 220; row[x*4+1] = 40; row[x*4+2] = red ? 220 : 40; row[x*4+3] = 255 }
+            for i in 0..<fps*seconds {
+                while !input.isReadyForMoreMediaData { try await Task.sleep(for: .milliseconds(2)) }
+                guard let pool = adaptor.pixelBufferPool else { throw ShotError.message("Video buffer pool unavailable.") }
+                var buffer: CVPixelBuffer?
+                CVPixelBufferPoolCreatePixelBuffer(nil,pool,&buffer)
+                guard let buffer else { throw ShotError.message("Video buffer allocation failed.") }
+                CVPixelBufferLockBaseAddress(buffer,[])
+                let base = CVPixelBufferGetBaseAddress(buffer)!, stride = CVPixelBufferGetBytesPerRow(buffer)
+                row.withUnsafeBytes { bytes in for y in 0..<h { memcpy(base+y*stride,bytes.baseAddress!,w*4) } }
+                CVPixelBufferUnlockBaseAddress(buffer,[])
+                guard adaptor.append(buffer,withPresentationTime: CMTime(value: Int64(i),timescale: CMTimeScale(fps))) else { throw writer.error ?? ShotError.message("Synthetic frame append failed.") }
+            }
+            input.markAsFinished(); await writer.finishWriting()
+            check(writer.status == .completed,"synthetic 1440p60 source")
+
+            var track = CursorTrack(width: Double(w),height: Double(h),scale: 2)
+            for i in 0...(seconds*30) { let t = Double(i)/30; track.samples.append(.init(t: t,x: Double(w)*(0.15+0.7*t/Double(seconds)),y: Double(h)*0.5)) }
+            track.clicks = [.init(t: 1.0,x: Double(w)*0.2,y: Double(h)*0.5),.init(t: 4.2,x: Double(w)*0.8,y: Double(h)*0.5)]
+            let arrow = NSCursor.arrow
+            if let image = arrow.image.cgImage(forProposedRect: nil,context: nil,hints: nil),let png = NSBitmapImageRep(cgImage: image).representation(using: .png,properties: [:]) {
+                track.shapes = [.init(png: png,w: arrow.image.size.width,h: arrow.image.size.height,hx: arrow.hotSpot.x,hy: arrow.hotSpot.y)]
+                track.shapeChanges = [.init(t: 0,i: 0)]
+            }
+            let encoded = try JSONEncoder().encode(track)
+            check(try JSONDecoder().decode(CursorTrack.self,from: encoded) == track,"cursor sidecar round-trips")
+            var plan = StudioPlan()
+            plan.segments = StudioPlanner.segments(for: track,duration: Double(seconds),zoom: 1.8)
+            check(plan.segments.count == 2,"two distant clicks produce two zoom segments")
+            plan.output = .p1080
+            let out = folder.appendingPathComponent("studio-1080.mp4")
+            var began = Date()
+            try await StudioExporter.export(video: url,track: track,plan: plan,to: out)
+            let elapsed = Date().timeIntervalSince(began)
+            let asset = AVURLAsset(url: out)
+            let duration = try await asset.load(.duration).seconds
+            let size = try await StudioExporter.videoSize(asset)
+            check(abs(duration-Double(seconds)) < 0.1,"Studio export keeps duration (\(String(format: "%.2f",duration))s)")
+            check(size == CGSize(width: 1920,height: 1080),"1080p preset output is 1920×1080")
+            print(String(format: "INFO: 1440p60 → 1080p H.264 Studio export, cold: %.2fs for %ds (%.0f fps, %.1f× realtime)",elapsed,seconds,Double(fps*seconds)/elapsed,Double(seconds)/elapsed))
+            began = Date()
+            try await StudioExporter.export(video: url,track: track,plan: plan,to: folder.appendingPathComponent("studio-1080-warm.mp4"))
+            let warm = Date().timeIntervalSince(began)
+            print(String(format: "INFO: same export, warm: %.2fs (%.0f fps, %.1f× realtime)",warm,Double(fps*seconds)/warm,Double(seconds)/warm))
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.requestedTimeToleranceBefore = .zero; generator.requestedTimeToleranceAfter = .zero
+            func pixel(_ t: Double,_ fx: Double,_ fy: Double) async throws -> (r: Int,g: Int,b: Int) {
+                let (image,_) = try await generator.image(at: CMTime(seconds: t,preferredTimescale: 600))
+                let rep = NSBitmapImageRep(cgImage: image)
+                let color = rep.colorAt(x: Int(Double(image.width)*fx),y: Int(Double(image.height)*fy))!.usingColorSpace(.sRGB)!
+                return (Int(color.redComponent*255),Int(color.greenComponent*255),Int(color.blueComponent*255))
+            }
+            let unzoomed = try await pixel(0.05,0.7,0.5)
+            check(unzoomed.b > unzoomed.r+80,"before zoom, the right of the canvas shows the right (blue) half")
+            let zoomed = try await pixel(1.5,0.7,0.5)
+            check(zoomed.r > zoomed.b+80,"during the first zoom, the left (red) half fills the canvas")
+            let corner = try await pixel(1.5,0.01,0.01)
+            check(abs(corner.r-corner.b) < 200 && corner != zoomed,"padding shows the background, not video")
+            plan.output = .source; plan.hevc = true; plan.motionBlur = true; plan.background = .none
+            let hevc = folder.appendingPathComponent("studio-source-hevc.mp4")
+            began = Date()
+            try await StudioExporter.export(video: url,track: track,plan: plan,to: hevc,range: 1...3)
+            let hevcElapsed = Date().timeIntervalSince(began)
+            let hevcAsset = AVURLAsset(url: hevc)
+            let hevcDuration = try await hevcAsset.load(.duration).seconds
+            check(abs(hevcDuration-2) < 0.1,"trimmed HEVC export with motion blur keeps the 2s range")
+            check(try await StudioExporter.videoSize(hevcAsset) == CGSize(width: w,height: h),"source preset keeps native size")
+            print(String(format: "INFO: 1440p60 source HEVC + motion blur, 2s range: %.2fs (%.1f× realtime)",hevcElapsed,2/hevcElapsed))
+        } catch { check(false,"Studio pipeline: \(error.localizedDescription)") }
+        print("\(checks-failures)/\(checks) Studio checks passed. Artifacts: \(folder.path)")
+        return failures == 0 ? 0 : 1
+    }
     static func patternImage(width: Int,height: Int) -> CGImage {
         var bytes = [UInt8](repeating: 255,count: width*height*4)
         var seed: UInt32 = 173

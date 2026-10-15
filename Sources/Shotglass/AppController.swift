@@ -61,6 +61,7 @@ struct CaptureRequest {
     var startupTask: Task<Void,Never>?
     var launched = false
     var pendingLaunch: LaunchAction?
+    var pendingEdit: String?
     var settingsWindow: NSWindow?
     var returnToCaptureAfterSettings = false
     var idleExitTask: Task<Void,Never>?
@@ -147,6 +148,11 @@ struct CaptureRequest {
         }
     }
     func application(_ application: NSApplication,open urls: [URL]) {
+        if let path = urls.compactMap(LaunchAction.editPath).last {
+            startupTask?.cancel(); launcherPending = false; idleExitTask?.cancel()
+            if launched { openForEditing(path) } else { pendingEdit = path }
+            return
+        }
         guard let action = urls.compactMap({ LaunchAction(url: $0) }).last else { return }
         startupTask?.cancel(); launcherPending = false; idleExitTask?.cancel()
         if launched { route(action) } else { pendingLaunch = action }
@@ -157,6 +163,7 @@ struct CaptureRequest {
         startupTask = Task {
             await Task.yield()
             guard !Task.isCancelled else { return }
+            if let path = pendingEdit { pendingEdit = nil; openForEditing(path); return }
             route(pendingLaunch ?? .capture); pendingLaunch = nil
         }
     }
@@ -200,6 +207,10 @@ struct CaptureRequest {
         if let flag = CommandLine.arguments.firstIndex(of: "--cloud-test"),CommandLine.arguments.indices.contains(flag+1) {
             let base = CommandLine.arguments[flag+1]
             Task { let result = await CloudDiagnostics.run(base: base); fflush(stdout); exit(result) }
+            return
+        }
+        if CommandLine.arguments.contains("--studio-test") {
+            Task { let result = await Diagnostics.studioTest(); fflush(stdout); exit(result) }
             return
         }
         if CommandLine.arguments.contains("--self-test") {
@@ -566,10 +577,13 @@ struct CaptureRequest {
             }
             source = display?.frame.intersection(quartz) ?? quartz
         }
-        let effects = (p.showClicks || p.showKeys || p.recordCamera) ? RecordingEffects(source: source,clicks: p.showClicks,keys: p.showKeys) : nil
+        // Studio animates clicks itself, so baked click rings are skipped to keep frames passthrough.
+        let clicks = p.showClicks && !p.studio
+        let effects = (clicks || p.showKeys || p.recordCamera) ? RecordingEffects(source: source,clicks: clicks,keys: p.showKeys) : nil
+        let telemetry = p.studio ? CursorTelemetry(source: source,pixels: CGSize(width: config.width,height: config.height)) : nil
         do {
             try await effects?.start(cameraEnabled: p.recordCamera)
-            try await recorder.start(filter: filter,configuration: config,url: url,effects: effects)
+            try await recorder.start(filter: filter,configuration: config,url: url,effects: effects,telemetry: telemetry)
         } catch { effects?.stop(); throw error }
         recordingEffects = effects
         self.recorder = recorder; recordURL = url; recordSize = CGSize(width: config.width,height: config.height)
@@ -699,6 +713,16 @@ struct CaptureRequest {
                 do { let clip = try store.write(image: image,kind: "Imported"); editor(clip) } catch { fail(error) }
             }
         }
+    }
+    /// `shotglass://edit?path=…`, sent by the MCP server's open_in_editor tool.
+    func openForEditing(_ path: String) {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.isReadableFile(atPath: path) else { fail(ShotError.message("Cannot open \(path).")); return }
+        if url.pathExtension.lowercased() == "json" { importProject(url); return }
+        if let clip = store.clips.first(where: { $0.path == path }) { editor(clip); return }
+        let properties = CGImageSourceCreateWithURL(url as CFURL,nil).flatMap { CGImageSourceCopyPropertiesAtIndex($0,0,nil) as? [CFString: Any] }
+        let clip = Clip(path: path,kind: "Imported",width: properties?[kCGImagePropertyPixelWidth] as? Int ?? 0,height: properties?[kCGImagePropertyPixelHeight] as? Int ?? 0)
+        store.add(clip); editor(clip)
     }
     func importProject(_ url: URL) {
         struct Project: Codable { var png: Data; var marks: [Mark]; var padding: Double; var background: [Double]; var shadow: Bool }

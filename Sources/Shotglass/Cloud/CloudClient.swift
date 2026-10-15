@@ -150,7 +150,7 @@ struct CloudClient {
 
 /// Generic-password Keychain item holding the session token for one server.
 enum CloudKeychain {
-    private static let service = "no.paraply.shotglass.cloud"
+    private static let service = "\(Bundle.main.bundleIdentifier ?? "no.paraply.shotglass").cloud"
     private static func query(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,kSecAttrService as String: service,kSecAttrAccount as String: account]
     }

@@ -35,6 +35,7 @@ final class Preferences: ObservableObject {
     @Published var recordCamera: Bool { didSet { save() } }
     @Published var showClicks: Bool { didSet { save() } }
     @Published var showKeys: Bool { didSet { save() } }
+    @Published var studio: Bool { didSet { save() } }
     @Published var hideDesktopIcons: Bool { didSet { save() } }
     @Published var lastRegion: SavedRegion? { didSet { save() } }
     @Published var presets: [RegionPreset] { didSet { save() } }
@@ -64,6 +65,7 @@ final class Preferences: ObservableObject {
         recordCamera = d.bool(forKey: "recordCamera")
         showClicks = d.object(forKey: "showClicks") as? Bool ?? true
         showKeys = Distribution.isAppStore ? false : d.bool(forKey: "showKeys")
+        studio = d.bool(forKey: "studio")
         hideDesktopIcons = d.bool(forKey: "hideDesktopIcons")
         lastRegion = d.data(forKey: "region").flatMap { try? JSONDecoder().decode(SavedRegion.self,from: $0) }
         presets = d.data(forKey: "presets").flatMap { try? JSONDecoder().decode([RegionPreset].self,from: $0) } ?? []
@@ -85,7 +87,7 @@ final class Preferences: ObservableObject {
         d.set(windowShadow,forKey: "shadow"); d.set(captureCursor,forKey: "cursor"); d.set(delay,forKey: "delay")
         d.set(systemAudio,forKey: "audio"); d.set(microphone,forKey: "microphone"); d.set(fps,forKey: "fps")
         d.set(recordCursor,forKey: "recordCursor"); d.set(recordCamera,forKey: "recordCamera")
-        d.set(showClicks,forKey: "showClicks"); d.set(showKeys,forKey: "showKeys"); d.set(hideDesktopIcons,forKey: "hideDesktopIcons")
+        d.set(showClicks,forKey: "showClicks"); d.set(showKeys,forKey: "showKeys"); d.set(studio,forKey: "studio"); d.set(hideDesktopIcons,forKey: "hideDesktopIcons")
         d.set(try? JSONEncoder().encode(lastRegion),forKey: "region")
         d.set(try? JSONEncoder().encode(presets),forKey: "presets")
         d.set(try? JSONEncoder().encode(selection),forKey: "captureSelection")
@@ -219,5 +221,7 @@ enum ShotError: LocalizedError {
 extension NSScreen {
     var displayID: CGDirectDisplayID { (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? CGMainDisplayID() }
     static var pointerScreen: NSScreen { screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? screens[0] }
-    static var primaryHeight: CGFloat { screens.first?.frame.height ?? 0 }
+    /// The menu-bar screen is CoreGraphics' main display. Reading it there avoids building AppKit's screen list,
+    /// which also registers a headless `--mcp` process with LaunchServices.
+    static var primaryHeight: CGFloat { CGDisplayBounds(CGMainDisplayID()).height }
 }

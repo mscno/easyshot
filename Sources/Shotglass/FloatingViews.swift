@@ -87,10 +87,33 @@ struct VideoEditorView: View {
     @State var end = 0.0
     @State var exporting = false
     @State var notice = ""
+    @StateObject private var studio: StudioBox
+    @State private var playhead = 0.0
+    @State private var observer: Any?
+    init(clip: Clip,controller: AppController) {
+        self.clip = clip; self.controller = controller
+        _studio = StateObject(wrappedValue: StudioBox(model: StudioModel(clip: clip)))
+    }
     var body: some View {
+        HStack(spacing: 16) {
+            editor
+            if let model = studio.model { StudioSidebar(model: model) { exportStudio(model) } }
+        }.padding(24).background(canvasColor).preferredColorScheme(.dark).frame(minWidth: studio.model == nil ? 700 : 960,minHeight: 500)
+            .task {
+                do {
+                    if let model = studio.model { player = try await model.makePlayer() } else { player = AVPlayer(url: clip.url) }
+                    duration = try await AVURLAsset(url: clip.url).load(.duration).seconds; end = duration
+                    observer = player?.addPeriodicTimeObserver(forInterval: CMTime(value: 1,timescale: 15),queue: .main) { time in MainActor.assumeIsolated { playhead = time.seconds } }
+                } catch { notice = error.localizedDescription }
+            }.onDisappear { player?.pause(); if let observer { player?.removeTimeObserver(observer) } }
+    }
+    var editor: some View {
         VStack(spacing: 20) {
             HStack { Image(systemName: "video").foregroundStyle(accent); Text("Recording").font(.system(size: 18,weight: .semibold)); Spacer(); Text(clip.url.lastPathComponent).font(.system(size: 11)).foregroundStyle(.secondary) }
             VideoPlayer(player: player).frame(maxWidth: .infinity,maxHeight: .infinity).clipShape(RoundedRectangle(cornerRadius: 10))
+            if let model = studio.model {
+                StudioTimelineStrip(model: model,playhead: playhead) { player?.seek(to: CMTime(seconds: $0,preferredTimescale: 600),toleranceBefore: .zero,toleranceAfter: .zero) }
+            }
             HStack(spacing: 20) {
                 VStack(alignment: .leading) { Text("Start · \(start,specifier: "%.1f")s"); Slider(value: $start,in: 0...max(0.1,duration)).onChange(of: start) { _,value in player?.seek(to: CMTime(seconds: value,preferredTimescale: 600)) } }
                 VStack(alignment: .leading) { Text("End · \(end,specifier: "%.1f")s"); Slider(value: $end,in: 0...max(0.1,duration)) }
@@ -102,14 +125,22 @@ struct VideoEditorView: View {
                 ShareLink(item: clip.url) { Label("Share",systemImage: "square.and.arrow.up") }
                 Button("Copy file") { controller.store.copy(clip) }
                 Button("Export GIF") { export(gif: true) }.disabled(exporting || end <= start)
-                Button("Save trimmed MP4") { export(gif: false) }.buttonStyle(.glassProminent).tint(accent).disabled(exporting || end <= start)
+                if studio.model == nil { Button("Save trimmed MP4") { export(gif: false) }.buttonStyle(.glassProminent).tint(accent).disabled(exporting || end <= start) }
+                else { Button("Save original MP4") { export(gif: false) }.disabled(exporting || end <= start) }
             }
-        }.padding(24).background(canvasColor).preferredColorScheme(.dark).frame(minWidth: 700,minHeight: 500)
-            .task {
-                player = AVPlayer(url: clip.url)
-                do { duration = try await AVURLAsset(url: clip.url).load(.duration).seconds; end = duration }
-                catch { notice = error.localizedDescription }
-            }.onDisappear { player?.pause() }
+        }
+    }
+    func exportStudio(_ model: StudioModel) {
+        guard end > start else { notice = "Choose a non-empty range."; return }
+        notice = "Exporting Studio video…"; let range = start...end
+        Task {
+            do {
+                let began = Date()
+                let saved = try await model.export(range: range,controller: controller)
+                controller.store.add(saved); if Preferences.shared.copyToClipboard { controller.store.copy(saved) }
+                notice = String(format: "Studio export saved in %.1fs",Date().timeIntervalSince(began)); controller.showPreview(saved)
+            } catch { notice = error.localizedDescription }
+        }
     }
     func export(gif: Bool) {
         exporting = true; notice = "Exporting…"; controller.pendingExports += 1
@@ -150,3 +181,10 @@ struct ToastView: View {
             .accessibilityElement(children: .combine)
     }
 }
+
+/// Holds the optional Studio model so the editor owns it for its lifetime.
+@MainActor final class StudioBox: ObservableObject {
+    let model: StudioModel?
+    init(model: StudioModel?) { self.model = model }
+}
+

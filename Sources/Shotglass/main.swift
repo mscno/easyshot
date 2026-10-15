@@ -1,5 +1,8 @@
 import AppKit
 
+// Agents spawn `Shotglass --mcp` as a headless stdio server; it never reaches NSApplication.
+MCPMode.runIfRequested()
+
 MainActor.assumeIsolated {
     _ = StartupTrace.started
     let app = NSApplication.shared
