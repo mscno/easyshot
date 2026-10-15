@@ -51,7 +51,7 @@ fn libpq_tls_compat(url: &str) -> String {
     let kept: Vec<String> = query
         .split('&')
         .filter(|kv| !kv.is_empty())
-        .filter_map(|kv| match kv.split_once('=').map(|(k, v)| (k, v)) {
+        .filter_map(|kv| match kv.split_once('=') {
             Some(("sslrootcert" | "sslcert" | "sslkey", _)) => None,
             Some(("sslmode", "verify-ca" | "verify-full")) => Some("sslmode=require".to_string()),
             _ => Some(kv.to_string()),
