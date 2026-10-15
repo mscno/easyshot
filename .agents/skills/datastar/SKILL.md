@@ -13,7 +13,9 @@ Easyshot's web presence lives in `server/` (crate `easyshot-server`). Topcoat 0.
 | --- | --- |
 | `server/src/web/mod.rs` | Router: pages, the mounted axum API (`TowerRoute` at `/v1/{*rest}`, `/s/{slug}`, `/healthz`), security headers and CSP, session helpers (`member`) |
 | `server/src/web/watch.rs` | Watch page `/v/{slug}`: regions with stable ids, comment/reaction posts, `live` SSE stream |
-| `server/src/web/account.rs` | Landing, sign-in, library and its item actions |
+| `server/src/web/account.rs` | Landing, library, its item actions and `/library/live` |
+| `server/src/web/auth.rs` | Sign-up, verify, password and code sign-in, reset, sign-out (plain forms, 303) |
+| `server/src/web/settings.rs` | `/account`: verification, password, devices, API tokens, deletion, `/account/live` |
 | `server/src/web/layout.rs` | Page shell; loads the one Datastar bundle and `static/app.js` |
 | `server/src/web/assets.rs`, `server/static/` | Assets compiled into the binary; `datastar-rocket-1.0.4.js` (Datastar v1.0.4 + Rocket beta.2, MIT, sha256 in `assets.rs`) |
 | `server/src/video/{live,scope,service}.rs` | Change fan-out, access scope, video use cases |

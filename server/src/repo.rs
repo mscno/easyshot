@@ -281,6 +281,63 @@ pub async fn delete_session(db: &Db, id: Uuid) -> DbResult<()> {
     Ok(())
 }
 
+/// Record use without extending the session (web sessions have a fixed cookie lifetime).
+pub async fn touch_session(db: &Db, id: Uuid, now: i64) -> DbResult<()> {
+    db.execute(
+        "UPDATE sessions SET last_used_at = $2 WHERE id = $1",
+        &vals![id, now],
+    )
+    .await?;
+    Ok(())
+}
+
+pub struct SessionRow {
+    pub id: Uuid,
+    pub device_name: Option<String>,
+    pub created_at: i64,
+    pub last_used_at: i64,
+}
+
+/// A user's unexpired sessions, most recently used first: Mac app devices and browsers.
+pub async fn list_sessions(db: &Db, user_id: Uuid, now: i64) -> DbResult<Vec<SessionRow>> {
+    db.query(
+        "SELECT id, device_name, created_at, last_used_at FROM sessions \
+         WHERE user_id = $1 AND expires_at > $2 ORDER BY last_used_at DESC, id DESC LIMIT 100",
+        &vals![user_id, now],
+    )
+    .await?
+    .iter()
+    .map(|r| {
+        Ok(SessionRow {
+            id: r.uuid(0)?,
+            device_name: r.opt_text(1)?,
+            created_at: r.i64(2)?,
+            last_used_at: r.i64(3)?,
+        })
+    })
+    .collect()
+}
+
+/// Remove one of the user's sessions; returns whether it existed.
+pub async fn delete_user_session(db: &Db, user_id: Uuid, id: Uuid) -> DbResult<bool> {
+    Ok(db
+        .execute(
+            "DELETE FROM sessions WHERE id = $1 AND user_id = $2",
+            &vals![id, user_id],
+        )
+        .await?
+        > 0)
+}
+
+/// Remove every session of the user except `keep`; returns how many.
+pub async fn delete_other_sessions(db: &Db, user_id: Uuid, keep: Uuid) -> DbResult<u64> {
+    db.execute(
+        "DELETE FROM sessions WHERE user_id = $1 AND id <> $2",
+        &vals![user_id, keep],
+    )
+    .await
+}
+
 pub async fn delete_session_by_hash(db: &Db, token_hash: &str) -> DbResult<()> {
     db.execute(
         "DELETE FROM sessions WHERE token_hash = $1",

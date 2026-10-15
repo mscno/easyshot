@@ -1,36 +1,41 @@
-//! Landing page, email-code sign-in and the owner's library.
+//! Landing page and the owner's library. The library keeps one live stream: recordings
+//! appear the instant the Mac app creates them, show upload progress while it records, and
+//! renames, privacy changes, deletes, comments and views from anywhere patch in place.
 
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use futures_util::stream;
+use futures_util::{Stream, stream};
 use serde::Deserialize;
 use topcoat::{
     Result,
     context::Cx,
-    datastar::{PatchElements, datastar_request},
+    datastar::{ElementPatchMode, PatchElements, datastar_request},
     router::{
-        StatusCode,
         content::{
             Form,
-            sse::{Event, Sse},
+            sse::{Event, KeepAlive, Sse},
         },
-        error::{redirect, see_other},
+        error::{redirect, see_other, unauthorized},
         page, path_param, query_params,
         response::{IntoResponse, Response},
         route,
     },
-    session,
     view::{View, ViewExt, component, view},
 };
 use uuid::Uuid;
 
 use super::layout::{Meta, ago, clock, plural, shell};
-use super::{Member, WebResult, hex, member, state};
-use crate::mailer::{CodePurpose, Email};
-use crate::repo::{self, now_ms};
+use super::watch::upload_status;
+use super::{Member, WebResult, admit_stream, member, signed_out_patch, state};
+use crate::db::Context;
+use crate::error::AppError;
+use crate::mailer::Email;
+use crate::repo::{self, Screenshot, now_ms};
 use crate::routes::auth::normalize_email;
-use crate::routes::codes::{check_code, send_code};
+use crate::state::AppState;
+use crate::video::live::{Change, Hub, StreamSlot, Subscription, next_ping, try_ping};
 use crate::video::model::Video;
 use crate::video::scope::{Scope, Visibility};
 use crate::video::service::{self, Edit, share_url};
@@ -63,12 +68,11 @@ pub async fn landing(cx: &Cx) -> Result<impl View> {
                     <a class="button primary" href=(download.as_str())>
                         "Download for Mac"
                     </a>
-                    <a
-                        class="button"
-                        href=(if signed_in { "/library" } else { "/login" })
-                    >
-                        (if signed_in { "Your library" } else { "Sign in" })
-                    </a>
+                    if signed_in {
+                        <a class="button" href="/library">"Your library"</a>
+                    } else {
+                        <a class="button" href="/signup">"Create a free account"</a>
+                    }
                 </div>
                 <p class="fineprint">"Apple Silicon · macOS 26 or later"</p>
             </section>
@@ -109,254 +113,6 @@ pub async fn landing(cx: &Cx) -> Result<impl View> {
     })
 }
 
-// ---------- sign in ----------
-
-#[query_params]
-pub struct LoginQuery {
-    next: Option<String>,
-}
-
-/// Only local destinations that we serve after sign-in.
-fn safe_next(next: Option<&str>) -> String {
-    match next {
-        Some(n)
-            if (n.starts_with("/v/") || n == "/library")
-                && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'/') =>
-        {
-            n.to_string()
-        }
-        _ => "/library".into(),
-    }
-}
-
-enum LoginStep {
-    Email {
-        error: Option<String>,
-    },
-    Code {
-        email: String,
-        error: Option<String>,
-    },
-}
-
-#[component]
-async fn login_card(next: String, step: LoginStep, mail_ok: bool) -> Result<impl View> {
-    Ok(view! {
-        shell(
-            meta: Meta { noindex: true, ..Meta::titled("Sign in") },
-            signed_in: false,
-            <section class="card narrow">
-                <h1>"Sign in"</h1>
-                if !mail_ok {
-                    <p class="notice error" role="alert">
-                        "Email sign-in is not configured on this server."
-                    </p>
-                }
-                match step {
-                    LoginStep::Email { error } => {
-                        <p class="muted">
-                            "We'll email you a 6-digit code. Accounts are created in the Easyshot app."
-                        </p>
-                        match error {
-                            Some(e) => <p class="notice error" role="alert">(e)</p>,
-                            None => "",
-                        }
-                        <form method="post" action="/login" class="stack">
-                            <input type="hidden" name="next" value=(next.as_str())>
-                            <label for="email">"Email"</label>
-                            <input
-                                id="email"
-                                name="email"
-                                type="email"
-                                required=""
-                                autocomplete="email"
-                                autofocus=""
-                            >
-                            <button type="submit" class="button primary">
-                                "Email me a code"
-                            </button>
-                        </form>
-                    }
-                    LoginStep::Code { email, error } => {
-                        <p class="muted">
-                            "If "
-                            <strong>(email.as_str())</strong>
-                            " has a Easyshot account, a code is on its way."
-                        </p>
-                        match error {
-                            Some(e) => <p class="notice error" role="alert">(e)</p>,
-                            None => "",
-                        }
-                        <form method="post" action="/login/verify" class="stack">
-                            <input type="hidden" name="next" value=(next.as_str())>
-                            <input type="hidden" name="email" value=(email.as_str())>
-                            <label for="code">"Code"</label>
-                            <input
-                                id="code"
-                                name="code"
-                                inputmode="numeric"
-                                pattern="[0-9]{6}"
-                                maxlength="6"
-                                required=""
-                                autocomplete="one-time-code"
-                                autofocus=""
-                            >
-                            <button type="submit" class="button primary">
-                                "Sign in"
-                            </button>
-                        </form>
-                        <form method="post" action="/login" class="inline">
-                            <input type="hidden" name="next" value=(next.as_str())>
-                            <input type="hidden" name="email" value=(email.as_str())>
-                            <button type="submit" class="link">
-                                "Send a new code"
-                            </button>
-                        </form>
-                    }
-                }
-            </section>
-        )
-    })
-}
-
-#[page("/login")]
-pub async fn login_page(cx: &Cx) -> Result<impl View> {
-    let next = safe_next(
-        query_params::<LoginQuery>(cx)
-            .ok()
-            .and_then(|q| q.next.as_deref()),
-    );
-    if member(cx).await?.is_some() {
-        return Err(redirect(next).into());
-    }
-    let mail_ok = state(cx).mailer.enabled();
-    Ok(view! {
-        login_card(next: next, step: LoginStep::Email { error: None }, mail_ok: mail_ok)
-    })
-}
-
-/// Render the sign-in card as a full response from a route handler.
-async fn login_response(
-    cx: &Cx,
-    next: String,
-    step: LoginStep,
-    status: StatusCode,
-) -> Result<Response> {
-    let mail_ok = state(cx).mailer.enabled();
-    let html = view! { cx => login_card(next: next, step: step, mail_ok: mail_ok) }
-        .single()
-        .await?
-        .render(cx);
-    let mut res = Response::new(html.into());
-    *res.status_mut() = status;
-    res.headers_mut().insert(
-        topcoat::router::header::CONTENT_TYPE,
-        topcoat::router::HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    Ok(res)
-}
-
-#[derive(Deserialize)]
-pub struct LoginForm {
-    email: String,
-    next: Option<String>,
-}
-
-#[route(POST "/login")]
-pub async fn login_submit(cx: &Cx, Form(f): Form<LoginForm>) -> Result<Response> {
-    let next = safe_next(f.next.as_deref());
-    let st = state(cx);
-    let Ok(email) = normalize_email(&f.email) else {
-        let step = LoginStep::Email {
-            error: Some("Enter a valid email address.".into()),
-        };
-        return login_response(cx, next, step, StatusCode::UNPROCESSABLE_ENTITY).await;
-    };
-    super::limit(cx, "login", 10, Duration::from_secs(600))?;
-    if st.mailer.enabled()
-        && let Some(u) = repo::find_user_for_login(&st.db, &email)
-            .await
-            .map_err(Into::into)
-            .web()?
-        && !u.disabled
-    {
-        send_code(st, u.id, &email, CodePurpose::LoginOtp);
-    }
-    let step = LoginStep::Code { email, error: None };
-    login_response(cx, next, step, StatusCode::OK).await
-}
-
-#[derive(Deserialize)]
-pub struct VerifyForm {
-    email: String,
-    code: String,
-    next: Option<String>,
-}
-
-#[route(POST "/login/verify")]
-pub async fn login_verify(cx: &Cx, Form(f): Form<VerifyForm>) -> Result<Response> {
-    let next = safe_next(f.next.as_deref());
-    let st = state(cx);
-    let email = f.email.trim().to_lowercase();
-    super::limit(cx, "verify", 20, Duration::from_secs(600))?;
-    let user = repo::find_user_for_login(&st.db, &email)
-        .await
-        .map_err(Into::into)
-        .web()?
-        .filter(|u| !u.disabled);
-    let checked = match &user {
-        Some(u) => check_code(st, u.id, CodePurpose::LoginOtp, &f.code)
-            .await
-            .is_ok(),
-        None => false,
-    };
-    let (Some(u), true) = (user, checked) else {
-        let step = LoginStep::Code {
-            email,
-            error: Some("That code is not valid or has expired.".into()),
-        };
-        return login_response(cx, next, step, StatusCode::UNPROCESSABLE_ENTITY).await;
-    };
-    let s = session::start(cx).await?;
-    let now = now_ms();
-    let expires = s
-        .expires_at
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(now);
-    repo::insert_session(
-        &st.db,
-        u.id,
-        &hex(&s.token_hash[..]),
-        Some("Web"),
-        now,
-        expires,
-    )
-    .await
-    .map_err(Into::into)
-    .web()?;
-    repo::touch_user(&st.db, u.id, now)
-        .await
-        .map_err(Into::into)
-        .web()?;
-    repo::set_email_verified(&st.db, u.id, now)
-        .await
-        .map_err(Into::into)
-        .web()?;
-    see_other(next).into_response(cx)
-}
-
-#[route(POST "/logout")]
-pub async fn logout(cx: &Cx) -> Result<Response> {
-    if let Some(hash) = session::stop(cx).await? {
-        repo::delete_session_by_hash(&state(cx).db, &hex(&hash[..]))
-            .await
-            .map_err(Into::into)
-            .web()?;
-    }
-    see_other("/").into_response(cx)
-}
-
 // ---------- library ----------
 
 async fn require_member(cx: &Cx, next: &str) -> Result<Member> {
@@ -366,24 +122,77 @@ async fn require_member(cx: &Cx, next: &str) -> Result<Member> {
     }
 }
 
+/// What a card shows besides the video row itself.
+#[derive(Clone, Copy, Default)]
+struct Counts {
+    views: i64,
+    comments: i64,
+}
+
+async fn counts(st: &AppState, scope: &Scope, ids: &[&str]) -> Result<HashMap<String, Counts>> {
+    let views = service::view_counts(st, scope.context(), ids).await.web()?;
+    let comments = service::comment_counts(st, scope.context(), ids)
+        .await
+        .web()?;
+    Ok(ids
+        .iter()
+        .map(|id| {
+            let c = Counts {
+                views: views.get(*id).copied().unwrap_or(0),
+                comments: comments.get(*id).copied().unwrap_or(0),
+            };
+            (id.to_string(), c)
+        })
+        .collect())
+}
+
+/// Everything the library shows; rendered on the page and re-rendered by the stream.
+struct Library {
+    videos: Vec<Video>,
+    counts: HashMap<String, Counts>,
+    shots: Vec<Screenshot>,
+}
+
+const LIBRARY_LIMIT: usize = 200;
+const SHOT_LIMIT: i64 = 50;
+
+async fn load_library(st: &AppState, user_id: Uuid) -> Result<Library> {
+    let scope = Scope::user(user_id);
+    let videos = scope.items(st, LIBRARY_LIMIT).await.web()?;
+    let ids: Vec<&str> = videos.iter().map(|v| v.id.as_str()).collect();
+    let counts = counts(st, &scope, &ids).await?;
+    let shots = repo::list_ready(
+        &st.db.scoped(Context::user(user_id)),
+        user_id,
+        now_ms(),
+        None,
+        SHOT_LIMIT,
+    )
+    .await
+    .map_err(AppError::from)
+    .web()?;
+    Ok(Library {
+        videos,
+        counts,
+        shots,
+    })
+}
+
 #[page("/library")]
 pub async fn library(cx: &Cx) -> Result<impl View> {
     let m = require_member(cx, "/library").await?;
     let st = state(cx);
-    let scope = Scope::user(m.user_id);
-    let items = scope.items(st, 200).await.web()?;
-    let ids: Vec<&str> = items.iter().map(|v| v.id.as_str()).collect();
-    let views = service::view_counts(st, scope.context(), &ids)
-        .await
-        .web()?;
+    let lib = load_library(st, m.user_id).await?;
     let mail = st.mailer.enabled();
     let base = st.config.public_base_url.clone();
     let now = now_ms();
+    let live =
+        format!("@get('/library/live?since={now}', {{retry: 'always', retryMaxCount: 1000}})");
     Ok(view! {
         shell(
             meta: Meta { noindex: true, ..Meta::titled("Library") },
             signed_in: true,
-            <section class="library">
+            <section class="library" data-init=(live.as_str())>
                 <div class="library-head">
                     <h1>"Library"</h1>
                     <p class="muted">
@@ -391,37 +200,146 @@ pub async fn library(cx: &Cx) -> Result<impl View> {
                         (m.email.as_str())
                     </p>
                 </div>
-                if items.is_empty() {
-                    <div class="empty card">
-                        <h2>"No recordings yet"</h2>
-                        <p>
-                            "Record in the Easyshot app with Easyshot Cloud enabled. The link appears here and on your clipboard."
-                        </p>
-                    </div>
-                }
-                <div id="items" class="items">
-                    #[key(v.id.clone())]
-                    for v in items {
-                        let n = views.get(&v.id).copied().unwrap_or(0);
-                        item_card(
-                            video: v,
-                            views: n,
-                            base: base.clone(),
-                            mail: mail,
-                            now: now,
-                            notice: None
-                        )
-                    }
-                </div>
+                items_region(
+                    videos: lib.videos,
+                    counts: lib.counts,
+                    base: base.clone(),
+                    mail: mail,
+                    now: now
+                )
+                shots_region(shots: lib.shots, base: base, now: now)
             </section>
         )
     })
 }
 
 #[component]
+async fn items_region(
+    videos: Vec<Video>,
+    counts: HashMap<String, Counts>,
+    base: String,
+    mail: bool,
+    now: i64,
+) -> Result<impl View> {
+    Ok(view! {
+        <div id="library-items">
+            if videos.is_empty() {
+                <div id="library-empty" class="empty card">
+                    <h2>"No recordings yet"</h2>
+                    <p>
+                        "Record in the Easyshot app with Easyshot Cloud enabled. The link appears here and on your clipboard."
+                    </p>
+                </div>
+            }
+            <div id="items" class="items">
+                #[key(v.id.clone())]
+                for v in videos {
+                    let c = counts.get(&v.id).copied().unwrap_or_default();
+                    item_card(
+                        video: v,
+                        views: c.views,
+                        comments: c.comments,
+                        base: base.clone(),
+                        mail: mail,
+                        now: now,
+                        notice: None
+                    )
+                }
+            </div>
+        </div>
+    })
+}
+
+#[component]
+async fn shots_region(shots: Vec<Screenshot>, base: String, now: i64) -> Result<impl View> {
+    Ok(view! {
+        <section id="shots" class="shots">
+            if !shots.is_empty() {
+                <h2>"Screenshot links"</h2>
+                <ul class="list">
+                    #[key(s.id.to_string())]
+                    for s in shots {
+                        let link = format!("{base}/s/{}", s.slug);
+                        let li = format!("shot-{}", s.id);
+                        <li id=(li.as_str()) class="list-row">
+                            <div>
+                                <a href=(link.as_str())>
+                                    (s.filename.clone().unwrap_or_else(|| "Screenshot".into()))
+                                </a>
+                                <p class="muted small">
+                                    (ago(s.created_at, now))
+                                    if let (Some(w), Some(h)) = (s.width, s.height) {
+                                        " · "
+                                        (format!("{w}×{h}"))
+                                    }
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                class="button small"
+                                data-copy=(link.as_str())
+                            >
+                                "Copy link"
+                            </button>
+                        </li>
+                    }
+                </ul>
+            }
+        </section>
+    })
+}
+
+/// The parts of a card that change while a recording uploads or gets watched; patched on
+/// their own so an open "Manage" panel and half-typed input survive.
+#[component]
+async fn card_meta(video: Video, views: i64, comments: i64, now: i64) -> Result<impl View> {
+    let v = video;
+    let id = v.id.clone();
+    let meta_id = format!("meta-{id}");
+    let visibility = Visibility::parse(&v.visibility).unwrap_or(Visibility::Private);
+    let pending = v.status != "ready";
+    Ok(view! {
+        <p id=(meta_id.as_str()) class="muted small">
+            (ago(v.created_at, now))
+            " · "
+            (plural(views, "view", "views"))
+            " · "
+            (plural(comments, "comment", "comments"))
+            " · "
+            (visibility.label())
+            if pending {
+                " · "
+                <span class="pill live">(upload_status(&v))</span>
+            }
+        </p>
+    })
+}
+
+#[component]
+async fn card_thumb(video: Video, link: String) -> Result<impl View> {
+    let v = video;
+    let thumb_id = format!("thumb-{}", v.id);
+    let thumb = format!("/v/{}/thumbnail.jpg", v.slug);
+    Ok(view! {
+        <a id=(thumb_id.as_str()) class="thumb" href=(link.as_str())>
+            if v.thumbnail_key.is_some() {
+                <img src=(thumb.as_str()) alt="" loading="lazy">
+            } else {
+                <span class="thumb-empty">"▶"</span>
+            }
+            if v.duration_ms > 0 {
+                <span class="badge">(clock(v.duration_ms))</span>
+            }
+        </a>
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[component]
 pub async fn item_card(
     video: Video,
     views: i64,
+    comments: i64,
     base: String,
     mail: bool,
     now: i64,
@@ -451,33 +369,12 @@ pub async fn item_card(
         format!("to-{id}"),
     );
     let visibility = Visibility::parse(&v.visibility).unwrap_or(Visibility::Private);
-    let pending = v.status != "ready";
-    let thumb = format!("/v/{}/thumbnail.jpg", v.slug);
     Ok(view! {
         <article id=(card_id.as_str()) class="item card">
-            <a class="thumb" href=(link.as_str())>
-                if v.thumbnail_key.is_some() {
-                    <img src=(thumb.as_str()) alt="" loading="lazy">
-                } else {
-                    <span class="thumb-empty">"▶"</span>
-                }
-                if v.duration_ms > 0 {
-                    <span class="badge">(clock(v.duration_ms))</span>
-                }
-            </a>
+            card_thumb(video: v.clone(), link: link.clone())
             <div class="item-body">
                 <a class="item-title" href=(link.as_str())>(v.title.as_str())</a>
-                <p class="muted small">
-                    (ago(v.created_at, now))
-                    " · "
-                    (plural(views, "view", "views"))
-                    " · "
-                    (visibility.label())
-                    if pending {
-                        " · "
-                        <span class="pill">"Uploading"</span>
-                    }
-                </p>
+                card_meta(video: v.clone(), views: views, comments: comments, now: now)
                 match notice {
                     Some(n) => <p class="notice" role="status">(n)</p>,
                     None => "",
@@ -597,6 +494,36 @@ async fn managed(cx: &Cx) -> Result<(Member, Scope, Video)> {
     Ok((m, scope, v))
 }
 
+async fn render_card(
+    cx: &Cx,
+    st: &AppState,
+    scope: &Scope,
+    v: Video,
+    notice: Option<String>,
+) -> Result<String> {
+    let c = counts(st, scope, &[v.id.as_str()])
+        .await?
+        .remove(&v.id)
+        .unwrap_or_default();
+    let base = st.config.public_base_url.clone();
+    let mail = st.mailer.enabled();
+    Ok(view! {
+        cx =>
+        item_card(
+            video: v,
+            views: c.views,
+            comments: c.comments,
+            base: base,
+            mail: mail,
+            now: now_ms(),
+            notice: notice
+        )
+    }
+    .single()
+    .await?
+    .render(cx))
+}
+
 /// Datastar gets the refreshed card; a plain form post returns to the library.
 async fn card_response(
     cx: &Cx,
@@ -607,27 +534,7 @@ async fn card_response(
     if !datastar_request(cx) {
         return see_other("/library").into_response(cx);
     }
-    let st = state(cx);
-    let views = service::view_counts(st, scope.context(), &[v.id.as_str()])
-        .await
-        .web()?
-        .get(&v.id)
-        .copied()
-        .unwrap_or(0);
-    let html = view! {
-        cx =>
-        item_card(
-            video: v,
-            views: views,
-            base: st.config.public_base_url.clone(),
-            mail: st.mailer.enabled(),
-            now: now_ms(),
-            notice: notice
-        )
-    }
-    .single()
-    .await?
-    .render(cx);
+    let html = render_card(cx, state(cx), scope, v, notice).await?;
     PatchElements::new(html).into_response(cx)
 }
 
@@ -668,7 +575,7 @@ pub async fn item_visibility(cx: &Cx, Form(f): Form<VisibilityForm>) -> Result<R
     .await
     {
         Ok(v) => card_response(cx, &scope, v, Some(format!("Now: {}.", vis.label()))).await,
-        Err(crate::error::AppError::Invalid(msg)) => card_response(cx, &scope, v, Some(msg)).await,
+        Err(AppError::Invalid(msg)) => card_response(cx, &scope, v, Some(msg)).await,
         Err(e) => Err(e).web(),
     }
 }
@@ -752,4 +659,279 @@ pub fn share_email(to: &str, from_name: &str, title: &str, link: &str) -> Email 
         html,
         idempotency_key: format!("share-{}", Uuid::new_v4()),
     }
+}
+
+// ---------- live library ----------
+
+/// What a card was last rendered with, to choose between a meta patch and a full card.
+#[derive(PartialEq)]
+struct Shown {
+    title: String,
+    visibility: String,
+    ready: bool,
+    thumb: bool,
+    duration: i64,
+}
+
+impl Shown {
+    fn of(v: &Video) -> Shown {
+        Shown {
+            title: v.title.clone(),
+            visibility: v.visibility.clone(),
+            ready: v.status == "ready",
+            thumb: v.thumbnail_key.is_some(),
+            duration: v.duration_ms,
+        }
+    }
+}
+
+struct Live {
+    cx: Cx,
+    st: AppState,
+    user_id: Uuid,
+    session_id: Uuid,
+    shown: HashMap<String, Shown>,
+    user: Subscription,
+    session: Subscription,
+    _slot: StreamSlot,
+    queue: VecDeque<Event>,
+    done: bool,
+    opened: Instant,
+}
+
+/// Rows to refresh after a burst of pings.
+#[derive(Default)]
+struct Dirty {
+    all: bool,
+    shots: bool,
+    items: Vec<String>,
+}
+
+impl Live {
+    fn push(&mut self, p: PatchElements) {
+        self.queue.push_back(p.into());
+    }
+
+    /// Re-check the session; `false` (with a sign-out patch queued) when it ended.
+    async fn authorized(&mut self) -> Result<bool> {
+        let ok = member(&self.cx)
+            .await?
+            .is_some_and(|m| m.session_id == self.session_id && m.user_id == self.user_id);
+        if !ok {
+            self.done = true;
+            self.push(signed_out_patch("/library"));
+        }
+        Ok(ok)
+    }
+
+    async fn render_all(&mut self) -> Result<()> {
+        let lib = load_library(&self.st, self.user_id).await?;
+        self.shown = lib
+            .videos
+            .iter()
+            .map(|v| (v.id.clone(), Shown::of(v)))
+            .collect();
+        let base = self.st.config.public_base_url.clone();
+        let items_base = base.clone();
+        let mail = self.st.mailer.enabled();
+        let now = now_ms();
+        let cx = &self.cx;
+        let Library {
+            videos,
+            counts,
+            shots,
+        } = lib;
+        let items = view! {
+            cx =>
+            items_region(
+                videos: videos,
+                counts: counts,
+                base: items_base,
+                mail: mail,
+                now: now
+            )
+        }
+        .single()
+        .await?
+        .render(cx);
+        let shots = view! { cx => shots_region(shots: shots, base: base, now: now) }
+            .single()
+            .await?
+            .render(cx);
+        self.push(PatchElements::new(items));
+        self.push(PatchElements::new(shots));
+        Ok(())
+    }
+
+    async fn render_shots(&mut self) -> Result<()> {
+        let shots = load_library(&self.st, self.user_id).await?.shots;
+        let base = self.st.config.public_base_url.clone();
+        let cx = &self.cx;
+        let html = view! { cx => shots_region(shots: shots, base: base, now: now_ms()) }
+            .single()
+            .await?
+            .render(cx);
+        self.push(PatchElements::new(html));
+        Ok(())
+    }
+
+    /// One recording changed (or appeared, or went away).
+    async fn render_item(&mut self, id: &str) -> Result<()> {
+        let scope = Scope::user(self.user_id);
+        let v = match scope.managed(&self.st, id).await {
+            Ok(v) => v,
+            Err(AppError::NotFound) => {
+                if self.shown.remove(id).is_some() {
+                    self.push(PatchElements::remove(format!("#item-{id}")));
+                    if self.shown.is_empty() {
+                        return self.render_all().await;
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e).web(),
+        };
+        let shown = Shown::of(&v);
+        let cx = &self.cx;
+        match self.shown.get(id) {
+            None => {
+                // New recording: put it first, drop the empty-state card.
+                let card = render_card(cx, &self.st, &scope, v, None).await?;
+                if self.shown.is_empty() {
+                    self.push(PatchElements::remove("#library-empty"));
+                }
+                self.push(
+                    PatchElements::new(card)
+                        .selector("#items")
+                        .mode(ElementPatchMode::Prepend),
+                );
+            }
+            Some(old) if *old == shown => {
+                // Progress, counts: only the line that changes.
+                let c = counts(&self.st, &scope, &[id])
+                    .await?
+                    .remove(id)
+                    .unwrap_or_default();
+                let html = view! {
+                    cx =>
+                    card_meta(
+                        video: v,
+                        views: c.views,
+                        comments: c.comments,
+                        now: now_ms()
+                    )
+                }
+                .single()
+                .await?
+                .render(cx);
+                self.push(PatchElements::new(html));
+            }
+            Some(_) => {
+                let card = render_card(cx, &self.st, &scope, v, None).await?;
+                self.push(PatchElements::new(card));
+            }
+        }
+        self.shown.insert(id.to_string(), shown);
+        Ok(())
+    }
+
+    async fn render(&mut self, d: Dirty) -> Result<()> {
+        if !self.authorized().await? {
+            return Ok(());
+        }
+        if d.all {
+            return self.render_all().await;
+        }
+        for id in d.items {
+            self.render_item(&id).await?;
+        }
+        if d.shots {
+            self.render_shots().await?;
+        }
+        Ok(())
+    }
+
+    async fn next(mut self) -> Option<(Result<Event>, Live)> {
+        loop {
+            if let Some(e) = self.queue.pop_front() {
+                return Some((Ok(e), self));
+            }
+            if self.done || self.opened.elapsed() > Duration::from_secs(6 * 3600) {
+                return None;
+            }
+            let mut ping = next_ping(&mut self.user, Some(&mut self.session)).await;
+            ping.as_ref()?;
+            let mut d = Dirty::default();
+            while let Some(p) = ping {
+                match p.change {
+                    Change::Video
+                    | Change::Gone
+                    | Change::Comments
+                    | Change::Views
+                    | Change::Reactions => {
+                        if !d.items.iter().any(|i| **i == *p.item) {
+                            d.items.push(p.item.to_string());
+                        }
+                    }
+                    Change::Screenshots => d.shots = true,
+                    Change::Session | Change::Resync => d.all = true,
+                    _ => {}
+                }
+                ping = try_ping(&mut self.user, Some(&mut self.session));
+            }
+            if !d.all && !d.shots && d.items.is_empty() {
+                continue;
+            }
+            if let Err(e) = self.render(d).await {
+                return Some((Err(e), self));
+            }
+        }
+    }
+}
+
+#[query_params]
+pub struct LiveQuery {
+    since: Option<i64>,
+}
+
+#[route(GET "/library/live")]
+pub async fn library_live(
+    cx: &Cx,
+) -> Result<Sse<impl Stream<Item = Result<Event>> + Send + use<>>> {
+    let Some(m) = member(cx).await? else {
+        return Err(unauthorized().into());
+    };
+    let st = state(cx).clone();
+    let slot = admit_stream(cx, &Some(m.clone()))?;
+    let since = query_params::<LiveQuery>(cx)
+        .ok()
+        .and_then(|q| q.since)
+        .unwrap_or(0);
+    let mut live = Live {
+        cx: cx.clone(),
+        user: st.live.subscribe(&Hub::user_topic(&m.user_id.to_string())),
+        session: st
+            .live
+            .subscribe(&Hub::session_topic(&m.session_id.to_string())),
+        st,
+        user_id: m.user_id,
+        session_id: m.session_id,
+        shown: HashMap::new(),
+        _slot: slot,
+        queue: VecDeque::new(),
+        done: false,
+        opened: Instant::now(),
+    };
+    // Know what the page shows even when it is fresh, so later pings patch correctly.
+    let lib = load_library(&live.st, m.user_id).await?;
+    live.shown = lib
+        .videos
+        .iter()
+        .map(|v| (v.id.clone(), Shown::of(v)))
+        .collect();
+    if now_ms() - since > 5_000 {
+        live.render_all().await?;
+    }
+    let events = stream::unfold(live, |l| l.next());
+    Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

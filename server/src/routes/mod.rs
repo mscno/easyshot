@@ -73,6 +73,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(videos::delete),
         )
         .route("/videos/{id}/parts", post(videos::parts))
+        .route("/videos/{id}/progress", post(videos::progress))
         .route("/videos/{id}/complete", post(videos::complete))
         .route("/videos/{id}/thumbnail", post(videos::thumbnail))
         .route("/videos/{id}/transcript", post(videos::transcript))

@@ -51,6 +51,22 @@ async fn delete_rows_and_objects(st: &AppState, rows: &repo::KeyedIds) -> AppRes
     Ok(())
 }
 
+/// Delete an account and everything it owns: screenshot objects and rows, videos and their
+/// conversation, then sessions, tokens, codes and the user. Used when someone deletes their
+/// account on the web.
+pub async fn purge_account(st: &AppState, user: Uuid) -> AppResult<()> {
+    loop {
+        let rows = repo::user_screenshots(&st.db, user, BATCH).await?;
+        if rows.is_empty() {
+            break;
+        }
+        delete_rows_and_objects(st, &rows).await?;
+    }
+    crate::video::service::purge_user(st, user).await?;
+    repo::delete_user_records(&st.db, user).await?;
+    Ok(())
+}
+
 /// Purge users not seen since `cutoff`: objects first, then screenshot rows, sessions, API
 /// tokens and finally the user. Returns `(purged, more)`.
 async fn purge_inactive_users(

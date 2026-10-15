@@ -86,16 +86,22 @@ pub async fn shell(
                         <nav>
                             if signed_in {
                                 <a href="/library">"Library"</a>
+                                <a href="/account">"Account"</a>
                                 <form method="post" action="/logout" class="inline">
                                     <button type="submit" class="link">"Sign out"</button>
                                 </form>
                             } else {
                                 <a href="/login">"Sign in"</a>
+                                <a class="button small primary" href="/signup">
+                                    "Sign up"
+                                </a>
                             }
                         </nav>
                     </header>
                 }
                 <main id="main">(child)</main>
+                // Target for the live streams' "your session ended" redirect.
+                <div id="live-redirect" hidden=""></div>
                 if !bare {
                     <footer class="footer">
                         <span>"Easyshot · recorded and encoded on your Mac"</span>

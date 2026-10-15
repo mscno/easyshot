@@ -177,6 +177,8 @@ pub async fn create(st: &AppState, scope: &Scope, input: NewVideo) -> AppResult<
             updated_at: now,
             ready_at: None::<i64>,
             expires_at,
+            uploaded_bytes: 0,
+            recording_ended_at: None::<i64>,
         })
         .exec(&mut tx)
         .await;
@@ -514,18 +516,70 @@ pub async fn record_view(
         .db
         .scoped(scope.share(v))
         .execute(
-            "INSERT INTO item_views (id, item_id, workspace_id, viewer_hash, first_seen) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+            "INSERT INTO item_views (id, item_id, workspace_id, viewer_hash, first_seen, owner_id) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
             &vals![
                 Uuid::new_v4(),
                 v.id.as_str(),
                 v.workspace_id.as_deref(),
                 &hash[..32],
-                now_ms()
+                now_ms(),
+                v.user_id.as_str()
             ],
         )
         .await?;
     Ok(inserted > 0)
+}
+
+/// Upload progress reported by the app while it records. Ignored once the video is ready;
+/// counts never move backwards, and once recording has ended it stays ended. A report
+/// that changes nothing writes nothing (and so notifies nobody).
+pub async fn progress(
+    st: &AppState,
+    scope: &Scope,
+    v: &Video,
+    uploaded_bytes: i64,
+    recording: bool,
+) -> AppResult<()> {
+    if v.status == "ready" {
+        return Ok(());
+    }
+    if !(0..=st.config.max_video_bytes).contains(&uploaded_bytes) {
+        return Err(AppError::Invalid("uploaded_bytes is out of range".into()));
+    }
+    if uploaded_bytes < v.uploaded_bytes {
+        return Err(AppError::Invalid("uploaded_bytes must not decrease".into()));
+    }
+    let ended = v.recording_ended_at.or_else(|| (!recording).then(now_ms));
+    if uploaded_bytes == v.uploaded_bytes && ended == v.recording_ended_at {
+        return Ok(());
+    }
+    let mut db = st.orm().await?;
+    let mut tx = begin(&mut db, &scope.context()).await?;
+    // Raw SQL: the guards make concurrent or replayed reports harmless. The end time is an
+    // integer we produced (Toasty cannot bind an untyped NULL), so it is inlined.
+    let ended = ended.map_or("NULL".to_string(), |t| t.to_string());
+    toasty::sql::statement(format!(
+        "UPDATE videos SET uploaded_bytes = GREATEST(uploaded_bytes, $2), \
+         recording_ended_at = COALESCE(recording_ended_at, {ended}) \
+         WHERE id = $1 AND status = 'pending'"
+    ))
+    .bind(v.id.as_str())
+    .bind(uploaded_bytes)
+    .exec(&mut tx)
+    .await
+    .map_err(orm_err)?;
+    tx.commit().await.map_err(orm_err)?;
+    Ok(())
+}
+
+/// Comments per item, for items visible under `ctx`.
+pub async fn comment_counts(
+    st: &AppState,
+    ctx: Context,
+    ids: &[&str],
+) -> AppResult<HashMap<String, i64>> {
+    counts(st, ctx, "item_comments", ids).await
 }
 
 /// Views per item, for items visible under `ctx`.
@@ -534,11 +588,20 @@ pub async fn view_counts(
     ctx: Context,
     ids: &[&str],
 ) -> AppResult<HashMap<String, i64>> {
+    counts(st, ctx, "item_views", ids).await
+}
+
+async fn counts(
+    st: &AppState,
+    ctx: Context,
+    table: &'static str,
+    ids: &[&str],
+) -> AppResult<HashMap<String, i64>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
     let sql = format!(
-        "SELECT item_id, COUNT(*) FROM item_views WHERE item_id IN ({}) GROUP BY item_id",
+        "SELECT item_id, COUNT(*) FROM {table} WHERE item_id IN ({}) GROUP BY item_id",
         crate::db::placeholders(1, ids.len())
     );
     let params: Vec<crate::db::Value> = ids.iter().map(|i| (*i).into()).collect();
@@ -592,6 +655,7 @@ pub async fn add_comment(
         id: Uuid::new_v4().to_string(),
         item_id: v.id.clone(),
         workspace_id: v.workspace_id.clone(),
+        owner_id: Some(v.user_id.clone()),
         user_id: scope.user_id.map(|u| u.to_string()),
         author_name: name,
         body,
@@ -632,6 +696,7 @@ pub async fn add_reaction(
         id: Uuid::new_v4().to_string(),
         item_id: v.id.clone(),
         workspace_id: v.workspace_id.clone(),
+        owner_id: Some(v.user_id.clone()),
         user_id: scope.user_id.map(|u| u.to_string()),
         emoji: *emoji,
         timestamp_ms: clamp_ts(v, timestamp_ms),

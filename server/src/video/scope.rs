@@ -194,6 +194,8 @@ mod tests {
             updated_at: 0,
             ready_at: None,
             expires_at: i64::MAX,
+            uploaded_bytes: 0,
+            recording_ended_at: None,
         }
     }
 

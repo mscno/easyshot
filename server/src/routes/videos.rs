@@ -246,3 +246,30 @@ pub async fn delete(
     service::purge(&st, &scope.context(), &v).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[derive(Deserialize)]
+pub struct ProgressBody {
+    uploaded_bytes: i64,
+    recording: bool,
+}
+
+/// Upload progress while the app is still recording: about one call per second. Updates
+/// that move backwards are rejected; once the video is ready they are ignored.
+pub async fn progress(
+    State(st): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+    ApiJson(b): ApiJson<ProgressBody>,
+) -> AppResult<StatusCode> {
+    if !st.limiter.allow(
+        &format!("progress:{id}"),
+        4,
+        std::time::Duration::from_secs(1),
+    ) {
+        return Err(AppError::RateLimited);
+    }
+    let scope = scope(&st, &user)?;
+    let v = scope.managed(&st, &id).await?;
+    service::progress(&st, &scope, &v, b.uploaded_bytes, b.recording).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
