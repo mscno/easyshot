@@ -245,7 +245,7 @@ pub fn signed_out_patch(next: &str) -> PatchElements {
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_'))
         .collect();
     PatchElements::new(format!(
-        "<div id=\"live-redirect\" hidden data-init=\"window.location.assign('/login?next={next}')\"></div>"
+        "<div id=\"live-redirect\" hidden data-init=\"!window.easyshotNavigating &amp;&amp; window.location.assign('/login?next={next}')\"></div>"
     ))
 }
 

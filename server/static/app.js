@@ -182,3 +182,10 @@ document.addEventListener('click', async (evt) => {
     button.textContent = label
   }, 1500)
 })
+
+// Native forms navigate using their response (password changes, sign-out, deletion).
+// A concurrent session-revocation patch must not interrupt that response or its cookies.
+document.addEventListener('submit', (evt) => {
+  if (!evt.defaultPrevented) window.easyshotNavigating = true
+})
+window.addEventListener('pageshow', () => { window.easyshotNavigating = false })
