@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use tokio::sync::OnceCell;
 
 use crate::config::Config;
 use crate::db::Db;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::mailer::{DisabledMailer, LettermintMailer, Mailer};
 use crate::storage::{ObjectStore, S3Store};
 use crate::video::limit::RateLimiter;
@@ -18,9 +17,7 @@ pub struct AppState {
     pub store: Arc<dyn ObjectStore>,
     pub config: Arc<Config>,
     pub mailer: Arc<dyn Mailer>,
-    /// Toasty handle for the video models, built on first use over `db`.
-    orm: Arc<OnceCell<toasty::Db>>,
-    /// In-process fan-out of video updates to open watch pages.
+    /// Fan-out of live updates to open pages, fed by Postgres LISTEN/NOTIFY.
     pub live: Arc<Hub>,
     pub limiter: Arc<RateLimiter>,
     /// 32-byte key for unlock cookies and viewer hashes (see `Config::web_secret`).
@@ -37,13 +34,13 @@ impl AppState {
                 k
             }
         };
+        let database_url = config.database_url.clone();
         Self {
             db,
             store,
             config: Arc::new(config),
             mailer: Arc::new(DisabledMailer),
-            orm: Arc::new(OnceCell::new()),
-            live: Arc::new(Hub::default()),
+            live: Arc::new(Hub::new(Some(database_url))),
             limiter: Arc::new(RateLimiter::default()),
             secret: Arc::new(secret),
         }
@@ -54,20 +51,16 @@ impl AppState {
         self
     }
 
-    /// A Toasty executor for the video models (clones share the pool).
+    /// A Toasty executor for the video models (clones share the one pool).
     pub async fn orm(&self) -> AppResult<toasty::Db> {
-        self.orm
-            .get_or_try_init(|| crate::orm::connect(&self.config))
-            .await
-            .cloned()
-            .map_err(|e| AppError::Internal(format!("orm: {e}")))
+        Ok(self.db.toasty())
     }
 
-    /// Production wiring: lazy database handle + S3 store. No network I/O happens here.
+    /// Production wiring: the warmed app-role pool + S3 store.
     pub async fn from_config(
         config: Config,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let db = Db::connect(&config)?;
+        let db = Db::connect(&config).await?;
         let store = S3Store::from_config(&config).await;
         let state = Self::new(db, Arc::new(store), config);
         let mailer: Option<Arc<dyn Mailer>> =

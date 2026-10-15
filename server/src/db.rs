@@ -1,18 +1,21 @@
-//! PostgreSQL access for the repository layer (sqlx), plus the migration runner.
+//! PostgreSQL access through one Toasty pool, plus the migration runner.
 //!
-//! Values are `NULL`, 64-bit integers or text; ids are UUID strings, timestamps epoch
-//! milliseconds, booleans 0/1. Placeholders are `$1, $2, ...`.
+//! The repository layer issues raw SQL through Toasty (`toasty::sql`); the video domain
+//! uses Toasty models on the same pool (see [`Db::toasty`] and `crate::orm`). Values are
+//! `NULL`, 64-bit integers or text; ids are UUID strings, timestamps epoch milliseconds,
+//! booleans 0/1. Placeholders are `$1, $2, ...`.
 //!
-//! Two roles: migrations run as the table owner (`MIGRATION_DATABASE_URL`); the server
-//! connects as `easyshot_app`, which is `NOSUPERUSER NOBYPASSRLS`, so row-level security
-//! applies. A plain [`Db`] carries no tenant context and therefore sees no rows of
-//! owner-scoped tables; use [`Db::scoped`] for those (see [`Context`]).
+//! Two roles: migrations run as the table owner (`MIGRATION_DATABASE_URL`) over a single
+//! `tokio-postgres` connection ([`crate::pg`]); the server connects as `easyshot_app`,
+//! which is `NOSUPERUSER NOBYPASSRLS`, so row-level security applies. A plain [`Db`]
+//! carries no tenant context and therefore sees no rows of owner-scoped tables; use
+//! [`Db::scoped`] for those (see [`Context`]).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::postgres::{PgConnection, PgPoolOptions, PgRow, PgTypeInfo};
-use sqlx::{Column, Connection, Row as _, TypeInfo, ValueRef};
+use tokio_postgres::Client;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -27,12 +30,18 @@ pub enum DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
-impl From<sqlx::Error> for DbError {
-    fn from(e: sqlx::Error) -> Self {
-        match &e {
-            sqlx::Error::Database(d) if d.is_unique_violation() => DbError::UniqueViolation,
-            _ => DbError::Other(e.to_string()),
+impl From<toasty::Error> for DbError {
+    fn from(e: toasty::Error) -> Self {
+        if crate::orm::is_unique_violation(&e) {
+            return DbError::UniqueViolation;
         }
+        DbError::Other(e.to_string())
+    }
+}
+
+impl From<tokio_postgres::Error> for DbError {
+    fn from(e: tokio_postgres::Error) -> Self {
+        crate::pg::pg_err(e)
     }
 }
 
@@ -188,130 +197,201 @@ impl Context {
         ]
     }
 
-    pub async fn apply(&self, conn: &mut PgConnection) -> DbResult<()> {
-        let mut q = sqlx::query(Self::SQL);
+    /// Install this context on `tx` (the first statement of every scoped transaction).
+    pub async fn apply(&self, tx: &mut dyn toasty::Executor) -> DbResult<()> {
+        let mut q = toasty::sql::query(Self::SQL);
         for p in self.params() {
             q = q.bind(p);
         }
-        q.execute(conn).await?;
+        q.exec(tx).await?;
         Ok(())
     }
 }
 
-/// The app-role pool, optionally bound to an RLS [`Context`].
-#[derive(Clone)]
-pub struct Db {
-    pool: sqlx::PgPool,
-    context: Option<Arc<Context>>,
-}
-
-/// An argument that binds as a NULL of unspecified type (OID 0), so Postgres infers the type
-/// from context instead of rejecting e.g. text NULL into a bigint column.
-struct PgNull;
-
-impl sqlx::Type<sqlx::Postgres> for PgNull {
-    fn type_info() -> PgTypeInfo {
-        PgTypeInfo::with_oid(sqlx::postgres::types::Oid(0))
+/// Toasty binds every parameter with a concrete type, but a NULL's type depends on where
+/// it lands (`text` into a `bigint` column fails). Inline NULLs as literals, which Postgres
+/// types from context, and renumber the remaining placeholders. Quoted strings and
+/// identifiers, dollar-quoted bodies and `--` comments are copied unchanged.
+fn inline_nulls<'a>(sql: &'a str, params: &[Value]) -> (Cow<'a, str>, Vec<Value>) {
+    if !params.contains(&Value::Null) {
+        return (Cow::Borrowed(sql), params.to_vec());
     }
-    fn compatible(_: &PgTypeInfo) -> bool {
-        true
-    }
-}
-impl sqlx::Encode<'_, sqlx::Postgres> for PgNull {
-    fn encode_by_ref(
-        &self,
-        _: &mut sqlx::postgres::PgArgumentBuffer,
-    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
-        Ok(sqlx::encode::IsNull::Yes)
-    }
-}
-
-fn pg_row(row: &PgRow) -> DbResult<Row> {
-    let mut out = Vec::with_capacity(row.columns().len());
-    for (i, col) in row.columns().iter().enumerate() {
-        if row.try_get_raw(i)?.is_null() {
-            out.push(Value::Null);
-            continue;
+    let mut map = Vec::with_capacity(params.len());
+    let mut kept = Vec::new();
+    for p in params {
+        if *p == Value::Null {
+            map.push(None);
+        } else {
+            kept.push(p.clone());
+            map.push(Some(kept.len()));
         }
-        let v = match col.type_info().name() {
-            "INT2" => Value::Int(row.try_get::<i16, _>(i)? as i64),
-            "INT4" => Value::Int(row.try_get::<i32, _>(i)? as i64),
-            "INT8" => Value::Int(row.try_get::<i64, _>(i)?),
-            "BOOL" => Value::Int(row.try_get::<bool, _>(i)? as i64),
-            _ => Value::Text(row.try_get::<String, _>(i)?),
-        };
-        out.push(v);
     }
-    Ok(Row(out))
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        let end = match b[i] {
+            q @ (b'\'' | b'"') => sql[i + 1..].find(q as char).map_or(b.len(), |j| i + 2 + j),
+            b'-' if b.get(i + 1) == Some(&b'-') => sql[i..].find('\n').map_or(b.len(), |j| i + j),
+            b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                let mut j = i + 1;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let n: usize = sql[i + 1..j].parse().unwrap_or(0);
+                match map.get(n.wrapping_sub(1)) {
+                    Some(Some(k)) => out.push_str(&format!("${k}")),
+                    Some(None) => out.push_str("NULL"),
+                    None => out.push_str(&sql[i..j]),
+                }
+                i = j;
+                continue;
+            }
+            b'$' => match sql[i + 1..].find('$').map(|j| i + 2 + j) {
+                // Dollar quote: `$tag$ ... $tag$`.
+                Some(t)
+                    if sql[i + 1..t - 1]
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_') =>
+                {
+                    let tag = &sql[i..t];
+                    sql[t..].find(tag).map_or(b.len(), |j| t + j + tag.len())
+                }
+                _ => i + 1,
+            },
+            _ => {
+                let mut j = i + 1;
+                while j < b.len() && !matches!(b[j], b'\'' | b'"' | b'-' | b'$') {
+                    j += 1;
+                }
+                j
+            }
+        };
+        out.push_str(&sql[i..end]);
+        i = end;
+    }
+    (Cow::Owned(out), kept)
 }
 
-fn bind<'q>(
-    mut q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-    params: &'q [Value],
-) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-    // Untyped NULLs make Postgres infer the parameter type per statement; a cached prepared
-    // statement would pin that type and break later calls that bind a value there.
-    if params.contains(&Value::Null) {
-        q = q.persistent(false);
-    }
+fn to_row(v: toasty::stmt::Value) -> DbResult<Row> {
+    use toasty::stmt::Value as V;
+    let V::Record(rec) = v else {
+        return Err(DbError::Other(format!("expected a row, got {v:?}")));
+    };
+    rec.into_iter()
+        .map(|f| {
+            Ok(match f {
+                V::Null => Value::Null,
+                V::Bool(b) => Value::Int(b as i64),
+                V::I8(n) => Value::Int(n.into()),
+                V::I16(n) => Value::Int(n.into()),
+                V::I32(n) => Value::Int(n.into()),
+                V::I64(n) => Value::Int(n),
+                V::U8(n) => Value::Int(n.into()),
+                V::U16(n) => Value::Int(n.into()),
+                V::U32(n) => Value::Int(n.into()),
+                V::String(s) => Value::Text(s),
+                V::Uuid(u) => Value::Text(u.to_string()),
+                other => {
+                    return Err(DbError::Other(format!(
+                        "unsupported column value {other:?}"
+                    )));
+                }
+            })
+        })
+        .collect::<DbResult<Vec<_>>>()
+        .map(Row)
+}
+
+fn statement(sql: &str, params: &[Value]) -> toasty::sql::Statement {
+    let (sql, params) = inline_nulls(sql, params);
+    let mut q = toasty::sql::statement(sql.into_owned());
     for p in params {
         q = match p {
-            Value::Null => q.bind(PgNull),
-            Value::Int(n) => q.bind(*n),
-            Value::Text(s) => q.bind(s.as_str()),
+            Value::Int(n) => q.bind(n),
+            Value::Text(s) => q.bind(s),
+            Value::Null => unreachable!("NULLs are inlined"),
         };
     }
     q
 }
 
+fn query(sql: &str, params: &[Value]) -> toasty::sql::Query {
+    let (sql, params) = inline_nulls(sql, params);
+    let mut q = toasty::sql::query(sql.into_owned());
+    for p in params {
+        q = match p {
+            Value::Int(n) => q.bind(n),
+            Value::Text(s) => q.bind(s),
+            Value::Null => unreachable!("NULLs are inlined"),
+        };
+    }
+    q
+}
+
+/// Connections opened eagerly at startup so first requests skip the TCP/TLS/auth cost.
+const WARM_CONNECTIONS: usize = 4;
+
+/// The app-role Toasty pool, optionally bound to an RLS [`Context`].
+#[derive(Clone)]
+pub struct Db {
+    orm: toasty::Db,
+    context: Option<Arc<Context>>,
+}
+
 impl Db {
-    /// Lazy app-role pool: no network I/O happens until the first query.
-    pub fn connect(cfg: &Config) -> DbResult<Db> {
-        let url = cfg.database_url.trim();
+    /// The app-role pool, with up to [`WARM_CONNECTIONS`] connections opened up front.
+    pub async fn connect(cfg: &Config) -> DbResult<Db> {
+        Self::connect_url(cfg.database_url.trim(), cfg.db_max_connections as usize).await
+    }
+
+    pub async fn connect_url(url: &str, max: usize) -> DbResult<Db> {
         if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
             return Err(DbError::Other(
                 "DATABASE_URL must start with postgres:// or postgresql://".into(),
             ));
         }
-        let pool = PgPoolOptions::new()
-            .max_connections(cfg.db_max_connections)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect_lazy(url)?;
-        Ok(Db::from_pool(pool))
+        let max = max.max(1);
+        let orm = toasty::Db::builder()
+            .models(crate::video::model::models())
+            .max_pool_size(max)
+            .pool_wait_timeout(Some(Duration::from_secs(5)))
+            .build(toasty_driver_postgresql::PostgreSQL::new(url)?)
+            .await?;
+        let db = Db { orm, context: None };
+        db.warm(WARM_CONNECTIONS.min(max)).await?;
+        Ok(db)
     }
 
-    pub fn from_pool(pool: sqlx::PgPool) -> Db {
-        Db {
-            pool,
-            context: None,
-        }
+    /// Hold `n` connections at once so the pool opens them, then return them idle.
+    pub async fn warm(&self, n: usize) -> DbResult<()> {
+        let conns =
+            futures_util::future::try_join_all((0..n).map(|_| self.orm.connection())).await?;
+        drop(conns);
+        Ok(())
     }
 
-    pub fn pool(&self) -> &sqlx::PgPool {
-        &self.pool
+    /// The Toasty handle (clones share the pool) for model queries; see `crate::orm`.
+    pub fn toasty(&self) -> toasty::Db {
+        self.orm.clone()
     }
 
     /// The same pool, running every statement in a transaction that first applies `ctx`.
     pub fn scoped(&self, ctx: Context) -> Db {
         Db {
-            pool: self.pool.clone(),
+            orm: self.orm.clone(),
             context: Some(Arc::new(ctx)),
         }
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> DbResult<u64> {
+        let mut db = self.orm.clone();
         match &self.context {
-            None => Ok(bind(sqlx::query(sql), params)
-                .execute(&self.pool)
-                .await?
-                .rows_affected()),
+            None => Ok(statement(sql, params).exec(&mut db).await?),
             Some(ctx) => {
-                let mut tx = self.pool.begin().await?;
+                let mut tx = db.transaction().await?;
                 ctx.apply(&mut tx).await?;
-                let n = bind(sqlx::query(sql), params)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected();
+                let n = statement(sql, params).exec(&mut tx).await?;
                 tx.commit().await?;
                 Ok(n)
             }
@@ -319,17 +399,18 @@ impl Db {
     }
 
     pub async fn query(&self, sql: &str, params: &[Value]) -> DbResult<Vec<Row>> {
+        let mut db = self.orm.clone();
         let rows = match &self.context {
-            None => bind(sqlx::query(sql), params).fetch_all(&self.pool).await?,
+            None => query(sql, params).exec(&mut db).await?,
             Some(ctx) => {
-                let mut tx = self.pool.begin().await?;
+                let mut tx = db.transaction().await?;
                 ctx.apply(&mut tx).await?;
-                let rows = bind(sqlx::query(sql), params).fetch_all(&mut *tx).await?;
+                let rows = query(sql, params).exec(&mut tx).await?;
                 tx.commit().await?;
                 rows
             }
         };
-        rows.iter().map(pg_row).collect()
+        rows.into_iter().map(to_row).collect()
     }
 
     pub async fn query_opt(&self, sql: &str, params: &[Value]) -> DbResult<Option<Row>> {
@@ -343,45 +424,34 @@ impl Db {
     }
 }
 
-// ---------- migrations (owner role) ----------
+// ---------- migrations (owner role, one tokio-postgres connection) ----------
 
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
 /// Serializes concurrent migration runs (deploy release command vs. local tasks).
 const MIGRATION_LOCK: i64 = 0x5347_4d49_4752; // "SGMIGR"
 
-async fn owner_conn(url: &str) -> DbResult<PgConnection> {
-    Ok(PgConnection::connect(url).await?)
-}
-
-async fn applied(conn: &mut PgConnection) -> DbResult<Vec<String>> {
-    let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('_migrations')::text")
-        .fetch_one(&mut *conn)
-        .await?;
-    if exists.is_none() {
-        sqlx::raw_sql(
-            "CREATE TABLE _migrations (name TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)",
-        )
-        .execute(&mut *conn)
-        .await?;
-    }
-    Ok(
-        sqlx::query_scalar("SELECT name FROM _migrations ORDER BY name")
-            .fetch_all(&mut *conn)
-            .await?,
+async fn applied(conn: &Client) -> DbResult<Vec<String>> {
+    conn.batch_execute(
+        "CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)",
     )
+    .await?;
+    Ok(conn
+        .query("SELECT name FROM _migrations ORDER BY name", &[])
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect())
 }
 
 /// Apply pending migrations as the table owner. Each file runs in its own transaction.
 pub async fn migrate(owner_url: &str) -> DbResult<Vec<&'static str>> {
-    let mut conn = owner_conn(owner_url).await?;
+    let mut conn = crate::pg::connect(owner_url, None).await?;
     migrate_conn(&mut conn).await
 }
 
-pub async fn migrate_conn(conn: &mut PgConnection) -> DbResult<Vec<&'static str>> {
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(MIGRATION_LOCK)
-        .execute(&mut *conn)
+pub async fn migrate_conn(conn: &mut Client) -> DbResult<Vec<&'static str>> {
+    conn.execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK])
         .await?;
     let result = async {
         let done = applied(conn).await?;
@@ -390,33 +460,31 @@ pub async fn migrate_conn(conn: &mut PgConnection) -> DbResult<Vec<&'static str>
             if done.iter().any(|d| d == name) {
                 continue;
             }
-            let mut tx = conn.begin().await?;
-            sqlx::raw_sql(sql)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| DbError::Other(format!("migration {name}: {e}")))?;
-            sqlx::query("INSERT INTO _migrations (name, applied_at) VALUES ($1, $2)")
-                .bind(*name)
-                .bind(chrono::Utc::now().timestamp_millis())
-                .execute(&mut *tx)
-                .await?;
+            let tx = conn.transaction().await?;
+            tx.batch_execute(sql).await.map_err(|e| {
+                DbError::Other(format!("migration {name}: {}", crate::pg::pg_err(e)))
+            })?;
+            tx.execute(
+                "INSERT INTO _migrations (name, applied_at) VALUES ($1, $2)",
+                &[name, &chrono::Utc::now().timestamp_millis()],
+            )
+            .await?;
             tx.commit().await?;
             ran.push(*name);
         }
         Ok(ran)
     }
     .await;
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(MIGRATION_LOCK)
-        .execute(&mut *conn)
+    let _ = conn
+        .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK])
         .await;
     result
 }
 
 /// `(name, applied)` for every embedded migration.
 pub async fn status(owner_url: &str) -> DbResult<Vec<(&'static str, bool)>> {
-    let mut conn = owner_conn(owner_url).await?;
-    let done = applied(&mut conn).await?;
+    let conn = crate::pg::connect(owner_url, None).await?;
+    let done = applied(&conn).await?;
     Ok(MIGRATIONS
         .iter()
         .map(|(n, _)| (*n, done.iter().any(|d| d == n)))
@@ -438,9 +506,8 @@ pub async fn reset(owner_url: &str) -> DbResult<Vec<&'static str>> {
             "refusing to reset database {db:?}: only *_dev or *_test databases"
         )));
     }
-    let mut conn = owner_conn(owner_url).await?;
-    sqlx::raw_sql("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;")
-        .execute(&mut conn)
+    let mut conn = crate::pg::connect(owner_url, None).await?;
+    conn.batch_execute("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;")
         .await?;
     migrate_conn(&mut conn).await
 }
@@ -469,6 +536,18 @@ mod tests {
         assert_eq!(Value::from(None::<String>), Value::Null);
         assert_eq!(Value::from(true), Value::Int(1));
         assert_eq!(Value::from("x"), Value::Text("x".into()));
+    }
+
+    #[test]
+    fn inlines_nulls_and_renumbers() {
+        let p = [Value::Int(1), Value::Null, Value::Text("x".into())];
+        let (sql, kept) = inline_nulls("UPDATE t SET a=$1, b=$2, c=$3 WHERE d='$2' AND e=$3", &p);
+        assert_eq!(sql, "UPDATE t SET a=$1, b=NULL, c=$2 WHERE d='$2' AND e=$2");
+        assert_eq!(kept, vec![Value::Int(1), Value::Text("x".into())]);
+        let (sql, _) = inline_nulls("SELECT $$ $1 $$, $1 -- $1\n", &[Value::Null]);
+        assert_eq!(sql, "SELECT $$ $1 $$, NULL -- $1\n");
+        let (sql, _) = inline_nulls("SELECT $1", &[Value::Int(2)]);
+        assert!(matches!(sql, Cow::Borrowed(_)));
     }
 
     #[test]

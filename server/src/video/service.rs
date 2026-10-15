@@ -14,7 +14,6 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use uuid::Uuid;
 
-use super::live::Change;
 use super::model::{Comment, ItemView, Reaction, Video};
 use super::scope::{Scope, Visibility};
 use crate::auth::{generate_slug, hash_password_blocking, verify_password_blocking};
@@ -296,7 +295,6 @@ pub async fn complete(st: &AppState, scope: &Scope, v: Video, c: Completion) -> 
         .await
         .map_err(orm_err)?;
     tx.commit().await.map_err(orm_err)?;
-    st.live.publish(&v.id, Change::Video);
     scope.managed(st, &v.id).await
 }
 
@@ -360,9 +358,6 @@ pub async fn presign_asset(
     };
     q.exec(&mut tx).await.map_err(orm_err)?;
     tx.commit().await.map_err(orm_err)?;
-    if asset == Asset::Transcript {
-        st.live.publish(&v.id, Change::Video);
-    }
     Ok(put)
 }
 
@@ -419,7 +414,6 @@ pub async fn edit(st: &AppState, scope: &Scope, v: &Video, e: Edit) -> AppResult
     }
     q.exec(&mut tx).await.map_err(orm_err)?;
     tx.commit().await.map_err(orm_err)?;
-    st.live.publish(&v.id, Change::Video);
     scope.managed(st, &v.id).await
 }
 
@@ -459,7 +453,6 @@ pub async fn purge(st: &AppState, ctx: &Context, v: &Video) -> AppResult<()> {
         .await
         .map_err(orm_err)?;
     tx.commit().await.map_err(orm_err)?;
-    st.live.publish(&v.id, Change::Gone);
     Ok(())
 }
 
@@ -609,7 +602,6 @@ pub async fn add_comment(
     .await
     .map_err(orm_err)?;
     tx.commit().await.map_err(orm_err)?;
-    st.live.publish(&v.id, Change::Comments);
     Ok(c)
 }
 
@@ -649,7 +641,6 @@ pub async fn add_reaction(
     .await
     .map_err(orm_err)?;
     tx.commit().await.map_err(orm_err)?;
-    st.live.publish(&v.id, Change::Reactions);
     Ok(r)
 }
 

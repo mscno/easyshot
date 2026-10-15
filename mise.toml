@@ -40,14 +40,26 @@ dir = "{{config_root}}/server"
 run = 'cargo run -q -- migrate reset --yes --database-url "$DEV_DATABASE_URL"'
 
 [tasks."db:new"]
-description = "New timestamped SQL migration: mise run db:new -- add_widgets"
+description = "New numbered SQL migration (next 000N_): mise run db:new -- add_widgets"
 usage = 'arg "<name>" help="snake_case migration name"'
 dir = "{{config_root}}/server"
 run = '''
-f="migrations/$(date -u +%Y%m%d%H%M%S)_${usage_name}.sql"
+last=$(ls migrations/*.sql | sed -E 's#.*/([0-9]+)_.*#\1#' | sort -n | tail -1)
+f="migrations/$(printf '%04d' $((10#${last:-0} + 1)))_${usage_name}.sql"
+[ -e "$f" ] && { echo "$f exists" >&2; exit 1; }
 printf -- '-- %s\n' "$usage_name" > "$f"
 echo "created $f"
 '''
+
+[tasks."db:bootstrap"]
+description = "Production: create or rotate the easyshot_app role and migrate (MIGRATION_DATABASE_URL + APP_DATABASE_PASSWORD, or esec .env.production)"
+dir = "{{config_root}}/server"
+run = "bash scripts/run-production-db.sh bootstrap"
+
+[tasks."db:verify"]
+description = "Production: check the app role cannot bypass RLS, migrations are applied and policies are FORCE'd"
+dir = "{{config_root}}/server"
+run = "bash scripts/run-production-db.sh verify"
 
 [tasks."db:seed"]
 description = "Seed two confirmed dev accounts (safe to rerun)"

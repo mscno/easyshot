@@ -34,6 +34,7 @@ use crate::video::live::{Change, Subscription};
 use crate::video::model::{Comment, Reaction, Video};
 use crate::video::scope::{Access, Scope, Visibility};
 use crate::video::service::{self, Author, MEDIA_URL_TTL, SHORT_URL_TTL};
+use tokio::sync::broadcast;
 
 path_param!(pub slug);
 
@@ -914,8 +915,6 @@ pub struct LiveQuery {
     since: Option<i64>,
 }
 
-/// Re-render cadence for view counts and cross-instance changes.
-const RESYNC_EVERY: Duration = Duration::from_secs(20);
 /// Snapshots older than this on (re)connect are refreshed immediately.
 const STALE_AFTER_MS: i64 = 5_000;
 
@@ -925,9 +924,7 @@ struct Live {
     scope: Scope,
     video: Video,
     sub: Subscription,
-    tick: tokio::time::Interval,
     queue: std::collections::VecDeque<Event>,
-    ticks: u32,
     gone: bool,
     opened: Instant,
 }
@@ -1063,27 +1060,38 @@ impl Live {
             if self.gone || self.opened.elapsed() > Duration::from_secs(6 * 3600) {
                 return None;
             }
-            let dirty = tokio::select! {
-                change = self.sub.rx.recv() => match change {
-                    Ok(Change::Comments) => Dirty { comments: true, ..Dirty::default() },
-                    Ok(Change::Reactions) => Dirty { reactions: true, ..Dirty::default() },
-                    Ok(Change::Video) => Dirty { head: true, ..Dirty::default() },
+            // Changes arrive through Postgres NOTIFY from every instance; a burst (several
+            // views, a comment plus its reaction) coalesces into one render.
+            let mut next = self.sub.rx.recv().await;
+            let mut dirty = Dirty::default();
+            loop {
+                match next {
+                    Ok(Change::Comments) => dirty.comments = true,
+                    Ok(Change::Reactions) => dirty.reactions = true,
+                    Ok(Change::Video | Change::Views) => dirty.head = true,
+                    Ok(Change::Screenshots) => {}
                     Ok(Change::Gone) => {
                         if let Err(e) = self.gone().await {
                             return Some((Err(e), self));
                         }
-                        continue;
+                        break;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Dirty::all(),
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                },
-                _ = self.tick.tick() => {
-                    self.ticks += 1;
-                    // Views every tick; the conversation every third (other instances).
-                    if self.ticks.is_multiple_of(3) { Dirty { head: true, comments: true, reactions: true, player: false } }
-                    else { Dirty { head: true, ..Dirty::default() } }
+                    Ok(Change::Resync) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        dirty = Dirty::all()
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
-            };
+                next = match self.sub.rx.try_recv() {
+                    Ok(c) => Ok(c),
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        Err(broadcast::error::RecvError::Lagged(n))
+                    }
+                    Err(_) => break,
+                };
+            }
+            if self.gone || !(dirty.head || dirty.player || dirty.comments || dirty.reactions) {
+                continue;
+            }
             if let Err(e) = self.render(dirty).await {
                 return Some((Err(e), self));
             }
@@ -1100,18 +1108,13 @@ pub async fn live(cx: &Cx) -> Result<Sse<impl Stream<Item = Result<Event>> + Sen
         .and_then(|q| q.since)
         .unwrap_or(0);
     let sub = st.live.subscribe(&w.video.id);
-    let mut tick =
-        tokio::time::interval_at(tokio::time::Instant::now() + RESYNC_EVERY, RESYNC_EVERY);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut live = Live {
         cx: cx.clone(),
         st,
         scope: w.scope,
         video: w.video,
         sub,
-        tick,
         queue: Default::default(),
-        ticks: 0,
         gone: false,
         opened: Instant::now(),
     };

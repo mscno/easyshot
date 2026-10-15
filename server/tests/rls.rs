@@ -1,6 +1,6 @@
 //! Row-level security is a second wall: these tests run deliberately unfiltered SQL as the
 //! app role (`easyshot_app`, NOBYPASSRLS) and check that PostgreSQL itself denies
-//! cross-owner, cross-workspace and out-of-share access, both through sqlx and inside
+//! cross-owner, cross-workspace and out-of-share access, both through raw SQL (`Db`) and inside
 //! Toasty transactions.
 
 use easyshot_server::db::{Context, Db, DbError};
@@ -279,7 +279,7 @@ async fn toasty_transactions_carry_the_rls_context() {
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
     video(&t.owner, "va", &a.to_string(), "slugA", None).await;
     video(&t.owner, "vb", &b.to_string(), "slugB", None).await;
-    let mut db = orm::connect(&t.config()).await.unwrap();
+    let mut db = t.app.toasty();
 
     // B asks Toasty for A's videos: the query is "correct" for A but runs as B.
     let mut tx = orm::begin(&mut db, &Context::user(b)).await.unwrap();
@@ -322,5 +322,31 @@ async fn maintenance_bypass_reaches_every_owner() {
     video(&t.owner, "vb", &Uuid::new_v4().to_string(), "slugB", None).await;
     let m = t.app.scoped(Context::maintenance());
     assert_eq!(ids(&m, "SELECT id FROM videos").await, ["va", "vb"]);
+    t.finish().await;
+}
+
+#[tokio::test]
+async fn production_verify_reports_the_rls_posture() {
+    let t = common::database().await;
+    let checks = easyshot_server::prod::verify(&t.owner_url, &t.app_url)
+        .await
+        .unwrap();
+    let failed: Vec<_> = checks
+        .iter()
+        .filter(|(_, ok)| !ok)
+        .map(|(w, _)| w.as_str())
+        .collect();
+    // The test cluster uses the development password on purpose; everything else holds.
+    assert_eq!(
+        failed,
+        ["app role does not use the development password"],
+        "{checks:?}"
+    );
+    assert!(checks.iter().any(|(w, ok)| w.starts_with("videos:") && *ok));
+    // Pointing the "app" URL at the owner (a superuser) fails the role checks.
+    let checks = easyshot_server::prod::verify(&t.owner_url, &t.owner_url)
+        .await
+        .unwrap();
+    assert!(checks.iter().any(|(w, ok)| w.contains("bypass") && !ok));
     t.finish().await;
 }
