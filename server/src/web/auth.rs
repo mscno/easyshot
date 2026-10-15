@@ -38,9 +38,8 @@ pub const MAX_PASSWORD: usize = 256;
 /// Same rule as the API (`/v1/auth/register`, `/v1/auth/password/reset`).
 pub fn password_problem(pw: &str) -> Option<String> {
     let n = pw.chars().count();
-    (!(MIN_PASSWORD..=MAX_PASSWORD).contains(&n)).then(|| {
-        format!("Use a password of {MIN_PASSWORD} to {MAX_PASSWORD} characters.")
-    })
+    (!(MIN_PASSWORD..=MAX_PASSWORD).contains(&n))
+        .then(|| format!("Use a password of {MIN_PASSWORD} to {MAX_PASSWORD} characters."))
 }
 
 /// Only local destinations we serve after sign-in.
@@ -78,7 +77,7 @@ fn query(cx: &Cx) -> (String, String) {
 /// Signed-in visitors skip the sign-in pages.
 async fn already_signed_in(cx: &Cx, next: &str) -> Result<()> {
     if member(cx).await?.is_some() {
-        return Err(redirect(next.to_string()).into());
+        return Err(redirect(next).into());
     }
     Ok(())
 }
@@ -94,7 +93,11 @@ fn html(body: String, status: StatusCode) -> Response {
 }
 
 #[component]
-async fn card(title: &'static str, error: Option<String>, child: topcoat::view::Child<'_>) -> Result<impl View> {
+async fn card(
+    title: &'static str,
+    error: Option<String>,
+    child: topcoat::view::Child<'_>,
+) -> Result<impl View> {
     Ok(view! {
         shell(
             meta: Meta { noindex: true, ..Meta::titled(title) },
@@ -114,7 +117,12 @@ async fn card(title: &'static str, error: Option<String>, child: topcoat::view::
 // ---------- sign up ----------
 
 #[component]
-async fn signup_form(next: String, email: String, error: Option<String>, open: bool) -> Result<impl View> {
+async fn signup_form(
+    next: String,
+    email: String,
+    error: Option<String>,
+    open: bool,
+) -> Result<impl View> {
     Ok(view! {
         card(
             title: "Create your account",
@@ -143,8 +151,12 @@ async fn signup_form(next: String, email: String, error: Option<String>, open: b
                         autocomplete="new-password"
                         aria-describedby="password-help"
                     >
-                    <p id="password-help" class="muted small">"At least 10 characters."</p>
-                    <button type="submit" class="button primary">"Create account"</button>
+                    <p id="password-help" class="muted small">
+                        "At least 10 characters."
+                    </p>
+                    <button type="submit" class="button primary">
+                        "Create account"
+                    </button>
                 </form>
             } else {
                 <p class="muted">"Sign-ups are closed on this server."</p>
@@ -180,13 +192,14 @@ pub async fn signup_submit(cx: &Cx, Form(f): Form<SignupForm>) -> Result<Respons
     let fail = |email: String, msg: String, status| {
         let next = fail_next.clone();
         async move {
-        let body = view! {
-            cx => signup_form(next: next, email: email, error: Some(msg), open: true)
-        }
-        .single()
-        .await?
-        .render(cx);
-        Ok::<Response, topcoat::Error>(html(body, status))
+            let body = view! {
+                cx =>
+                signup_form(next: next, email: email, error: Some(msg), open: true)
+            }
+            .single()
+            .await?
+            .render(cx);
+            Ok::<Response, topcoat::Error>(html(body, status))
         }
     };
     if !st.config.allow_signups {
@@ -231,19 +244,27 @@ pub async fn signup_submit(cx: &Cx, Form(f): Form<SignupForm>) -> Result<Respons
             )
             .await;
         }
-        Err(e) => return Err(e).map_err(Into::into).web(),
+        Err(e) => return Err(crate::error::AppError::from(e)).web(),
     }
-    let body = view! { cx => code_form(next: next, email: email, error: None, resent: false) }
-        .single()
-        .await?
-        .render(cx);
+    let body = view! {
+        cx =>
+        code_form(next: next, email: email, error: None, resent: false)
+    }
+    .single()
+    .await?
+    .render(cx);
     Ok(html(body, StatusCode::OK))
 }
 
 // ---------- verify (after sign-up, or an emailed sign-in code) ----------
 
 #[component]
-async fn code_form(next: String, email: String, error: Option<String>, resent: bool) -> Result<impl View> {
+async fn code_form(
+    next: String,
+    email: String,
+    error: Option<String>,
+    resent: bool,
+) -> Result<impl View> {
     Ok(view! {
         card(
             title: "Check your email",
@@ -370,17 +391,25 @@ pub async fn verify_resend(cx: &Cx, Form(f): Form<EmailForm>) -> Result<Response
         };
         send_code(st, u.id, &email, purpose);
     }
-    let body = view! { cx => code_form(next: next, email: email, error: None, resent: true) }
-        .single()
-        .await?
-        .render(cx);
+    let body = view! {
+        cx =>
+        code_form(next: next, email: email, error: None, resent: true)
+    }
+    .single()
+    .await?
+    .render(cx);
     Ok(html(body, StatusCode::OK))
 }
 
 // ---------- sign in with a password ----------
 
 #[component]
-async fn login_form(next: String, email: String, error: Option<String>, mail: bool) -> Result<impl View> {
+async fn login_form(
+    next: String,
+    email: String,
+    error: Option<String>,
+    mail: bool,
+) -> Result<impl View> {
     let code_url = format!("/login/code?next={next}");
     let signup_url = format!("/signup?next={next}");
     Ok(view! {
@@ -452,10 +481,13 @@ pub async fn login_submit(cx: &Cx, Form(f): Form<PasswordLogin>) -> Result<Respo
     let fail = |msg: &str, status| {
         let (next, email, msg) = (next.clone(), email.clone(), msg.to_string());
         async move {
-            let body = view! { cx => login_form(next: next, email: email, error: Some(msg), mail: mail) }
-                .single()
-                .await?
-                .render(cx);
+            let body = view! {
+                cx =>
+                login_form(next: next, email: email, error: Some(msg), mail: mail)
+            }
+            .single()
+            .await?
+            .render(cx);
             Ok::<Response, topcoat::Error>(html(body, status))
         }
     };
@@ -500,7 +532,11 @@ pub async fn login_submit(cx: &Cx, Form(f): Form<PasswordLogin>) -> Result<Respo
 // ---------- sign in with an emailed code ----------
 
 #[component]
-async fn code_request_form(next: String, email: String, error: Option<String>) -> Result<impl View> {
+async fn code_request_form(
+    next: String,
+    email: String,
+    error: Option<String>,
+) -> Result<impl View> {
     Ok(view! {
         card(
             title: "Sign in with a code",
@@ -540,7 +576,12 @@ pub async fn code_submit(cx: &Cx, Form(f): Form<EmailForm>) -> Result<Response> 
     let st = state(cx);
     let Ok(email) = normalize_email(&f.email) else {
         let body = view! {
-            cx => code_request_form(next: next, email: f.email, error: Some("Enter a valid email address.".into()))
+            cx =>
+            code_request_form(
+                next: next,
+                email: f.email,
+                error: Some("Enter a valid email address.".into())
+            )
         }
         .single()
         .await?
@@ -557,10 +598,13 @@ pub async fn code_submit(cx: &Cx, Form(f): Form<EmailForm>) -> Result<Response> 
     {
         send_code(st, u.id, &email, CodePurpose::LoginOtp);
     }
-    let body = view! { cx => code_form(next: next, email: email, error: None, resent: false) }
-        .single()
-        .await?
-        .render(cx);
+    let body = view! {
+        cx =>
+        code_form(next: next, email: email, error: None, resent: false)
+    }
+    .single()
+    .await?
+    .render(cx);
     Ok(html(body, StatusCode::OK))
 }
 
@@ -642,10 +686,16 @@ pub async fn forgot_page(cx: &Cx) -> Result<impl View> {
 pub async fn forgot_submit(cx: &Cx, Form(f): Form<EmailForm>) -> Result<Response> {
     let st = state(cx);
     let Ok(email) = normalize_email(&f.email) else {
-        let body = view! { cx => forgot_form(email: f.email, error: Some("Enter a valid email address.".into())) }
-            .single()
-            .await?
-            .render(cx);
+        let body = view! {
+            cx =>
+            forgot_form(
+                email: f.email,
+                error: Some("Enter a valid email address.".into())
+            )
+        }
+        .single()
+        .await?
+        .render(cx);
         return Ok(html(body, StatusCode::UNPROCESSABLE_ENTITY));
     };
     limit(cx, "forgot", 5, Duration::from_secs(600))?;

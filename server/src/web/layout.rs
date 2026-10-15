@@ -92,7 +92,9 @@ pub async fn shell(
                                 </form>
                             } else {
                                 <a href="/login">"Sign in"</a>
-                                <a class="button small primary" href="/signup">"Sign up"</a>
+                                <a class="button small primary" href="/signup">
+                                    "Sign up"
+                                </a>
                             }
                         </nav>
                     </header>

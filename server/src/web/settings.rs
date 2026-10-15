@@ -60,7 +60,11 @@ fn enhance(url: &str) -> String {
 // ---------- regions ----------
 
 #[component]
-pub async fn profile_region(email: String, verified: bool, notice: Option<String>) -> Result<impl View> {
+pub async fn profile_region(
+    email: String,
+    verified: bool,
+    notice: Option<String>,
+) -> Result<impl View> {
     let send_js = enhance("/account/verify/send");
     let verify_js = enhance("/account/verify");
     Ok(view! {
@@ -89,7 +93,9 @@ pub async fn profile_region(email: String, verified: bool, notice: Option<String
                     class="row"
                     data-on:submit=(send_js.as_str())
                 >
-                    <button type="submit" class="button small">"Email me a code"</button>
+                    <button type="submit" class="button small">
+                        "Email me a code"
+                    </button>
                 </form>
                 <form
                     method="post"
@@ -131,7 +137,12 @@ pub async fn sessions_region(rows: Vec<SessionRow>, current: Uuid, now: i64) -> 
                     let li_id = format!("session-{}", r.id);
                     <li id=(li_id.as_str()) class="list-row">
                         <div>
-                            <strong>(r.device_name.clone().unwrap_or_else(|| "Unknown device".into()))</strong>
+                            <strong>
+                                (r
+                                    .device_name
+                                    .clone()
+                                    .unwrap_or_else(|| "Unknown device".into()))
+                            </strong>
                             if this {
                                 " "
                                 <span class="pill ok">"This browser"</span>
@@ -149,7 +160,9 @@ pub async fn sessions_region(rows: Vec<SessionRow>, current: Uuid, now: i64) -> 
                                 action=(url.as_str())
                                 data-on:submit=(js.as_str())
                             >
-                                <button type="submit" class="button small danger">"Sign out"</button>
+                                <button type="submit" class="button small danger">
+                                    "Sign out"
+                                </button>
                             </form>
                         }
                     </li>
@@ -161,7 +174,9 @@ pub async fn sessions_region(rows: Vec<SessionRow>, current: Uuid, now: i64) -> 
                     action="/account/sessions/revoke-others"
                     data-on:submit=(others_js.as_str())
                 >
-                    <button type="submit" class="button small">"Sign out all other devices"</button>
+                    <button type="submit" class="button small">
+                        "Sign out all other devices"
+                    </button>
                 </form>
             }
         </section>
@@ -199,8 +214,14 @@ pub async fn tokens_region(rows: Vec<TokenRow>, now: i64) -> Result<impl View> {
                                     })
                                 </p>
                             </div>
-                            <form method="post" action=(url.as_str()) data-on:submit=(js.as_str())>
-                                <button type="submit" class="button small danger">"Revoke"</button>
+                            <form
+                                method="post"
+                                action=(url.as_str())
+                                data-on:submit=(js.as_str())
+                            >
+                                <button type="submit" class="button small danger">
+                                    "Revoke"
+                                </button>
                             </form>
                         </li>
                     }
@@ -233,10 +254,16 @@ pub async fn token_created(token: Option<String>) -> Result<impl View> {
         <div id="token-created">
             if let Some(t) = token.as_deref() {
                 <div class="notice" role="status">
-                    <p><strong>"Copy your new token now. It is not shown again."</strong></p>
+                    <p>
+                        <strong>
+                            "Copy your new token now. It is not shown again."
+                        </strong>
+                    </p>
                     <p class="row">
                         <code class="token">(t)</code>
-                        <button type="button" class="button small" data-copy=(t)>"Copy"</button>
+                        <button type="button" class="button small" data-copy=(t)>
+                            "Copy"
+                        </button>
                     </p>
                 </div>
             }
@@ -263,9 +290,8 @@ async fn account_view(cx: &Cx, m: Member, n: Notices) -> Result<String> {
         .await
         .map_err(Into::into)
         .web()?;
-    let live_expr = format!(
-        "@get('/account/live?since={now}', {{retry: 'always', retryMaxCount: 1000}})"
-    );
+    let live_expr =
+        format!("@get('/account/live?since={now}', {{retry: 'always', retryMaxCount: 1000}})");
     let Notices {
         profile,
         password,
@@ -278,7 +304,11 @@ async fn account_view(cx: &Cx, m: Member, n: Notices) -> Result<String> {
             meta: Meta { noindex: true, ..Meta::titled("Account") },
             signed_in: true,
             <div id="account" class="account" data-init=(live_expr.as_str())>
-                profile_region(email: m.email.clone(), verified: m.email_verified, notice: profile)
+                profile_region(
+                    email: m.email.clone(),
+                    verified: m.email_verified,
+                    notice: profile
+                )
                 <section id="password-card" class="card">
                     <h2>"Password"</h2>
                     match password {
@@ -286,9 +316,20 @@ async fn account_view(cx: &Cx, m: Member, n: Notices) -> Result<String> {
                         None => "",
                     }
                     <form method="post" action="/account/password" class="stack">
-                        <input type="hidden" name="username" value=(m.email.as_str()) autocomplete="username">
+                        <input
+                            type="hidden"
+                            name="username"
+                            value=(m.email.as_str())
+                            autocomplete="username"
+                        >
                         <label for="current">"Current password"</label>
-                        <input id="current" name="current" type="password" required="" autocomplete="current-password">
+                        <input
+                            id="current"
+                            name="current"
+                            type="password"
+                            required=""
+                            autocomplete="current-password"
+                        >
                         <label for="new-password">"New password"</label>
                         <input
                             id="new-password"
@@ -300,7 +341,9 @@ async fn account_view(cx: &Cx, m: Member, n: Notices) -> Result<String> {
                             autocomplete="new-password"
                         >
                         <button type="submit" class="button">"Change password"</button>
-                        <p class="muted small">"Other devices are signed out when you change it."</p>
+                        <p class="muted small">
+                            "Other devices are signed out when you change it."
+                        </p>
                     </form>
                 </section>
                 sessions_region(rows: sessions, current: m.session_id, now: now)
@@ -317,8 +360,16 @@ async fn account_view(cx: &Cx, m: Member, n: Notices) -> Result<String> {
                     }
                     <form method="post" action="/account/delete" class="stack">
                         <label for="confirm">"Type your email to confirm"</label>
-                        <input id="confirm" name="confirm" type="email" required="" autocomplete="off">
-                        <button type="submit" class="button danger">"Delete my account"</button>
+                        <input
+                            id="confirm"
+                            name="confirm"
+                            type="email"
+                            required=""
+                            autocomplete="off"
+                        >
+                        <button type="submit" class="button danger">
+                            "Delete my account"
+                        </button>
                     </form>
                 </section>
             </div>
@@ -358,15 +409,23 @@ pub async fn account(cx: &Cx) -> Result<Response> {
     Ok(page_response(account_view(cx, m, n).await?, StatusCode::OK))
 }
 
-async fn patch_profile(cx: &Cx, m: &Member, verified: bool, notice: Option<String>) -> Result<Response> {
+async fn patch_profile(
+    cx: &Cx,
+    m: &Member,
+    verified: bool,
+    notice: Option<String>,
+) -> Result<Response> {
     if !datastar_request(cx) {
         return back(cx);
     }
     let email = m.email.clone();
-    let html = view! { cx => profile_region(email: email, verified: verified, notice: notice) }
-        .single()
-        .await?
-        .render(cx);
+    let html = view! {
+        cx =>
+        profile_region(email: email, verified: verified, notice: notice)
+    }
+    .single()
+    .await?
+    .render(cx);
     PatchElements::new(html).into_response(cx)
 }
 
@@ -477,10 +536,12 @@ async fn render_sessions(cx: &Cx, st: &AppState, m: &Member) -> Result<String> {
         .map_err(Into::into)
         .web()?;
     let current = m.session_id;
-    Ok(view! { cx => sessions_region(rows: rows, current: current, now: now) }
-        .single()
-        .await?
-        .render(cx))
+    Ok(
+        view! { cx => sessions_region(rows: rows, current: current, now: now) }
+            .single()
+            .await?
+            .render(cx),
+    )
 }
 
 async fn render_tokens(cx: &Cx, st: &AppState, m: &Member) -> Result<String> {
@@ -500,7 +561,8 @@ path_param!(pub id);
 #[route(POST "/account/sessions/{id}/revoke")]
 pub async fn revoke_session(cx: &Cx) -> Result<Response> {
     let m = require(cx).await?;
-    let id = Uuid::parse_str(path_param::<Id>(cx)).map_err(|_| topcoat::router::error::not_found())?;
+    let id =
+        Uuid::parse_str(path_param::<Id>(cx)).map_err(|_| topcoat::router::error::not_found())?;
     // This browser signs out with "Sign out" instead.
     if id != m.session_id {
         repo::delete_user_session(&state(cx).db, m.user_id, id)
@@ -563,7 +625,8 @@ pub async fn create_token(cx: &Cx, Form(f): Form<TokenForm>) -> Result<Response>
 pub async fn revoke_token(cx: &Cx) -> Result<Response> {
     let m = require(cx).await?;
     let st = state(cx);
-    let id = Uuid::parse_str(path_param::<Id>(cx)).map_err(|_| topcoat::router::error::not_found())?;
+    let id =
+        Uuid::parse_str(path_param::<Id>(cx)).map_err(|_| topcoat::router::error::not_found())?;
     repo::revoke_api_token(&st.db, id, m.user_id, now_ms())
         .await
         .map_err(Into::into)
@@ -638,10 +701,13 @@ impl Live {
         if d.profile {
             let (email, verified) = (m.email.clone(), m.email_verified);
             out.push(
-                view! { cx => profile_region(email: email, verified: verified, notice: None) }
-                    .single()
-                    .await?
-                    .render(cx),
+                view! {
+                    cx =>
+                    profile_region(email: email, verified: verified, notice: None)
+                }
+                .single()
+                .await?
+                .render(cx),
             );
         }
         if d.sessions {
@@ -713,7 +779,9 @@ pub async fn live(cx: &Cx) -> Result<Sse<impl Stream<Item = Result<Event>> + Sen
     let mut live = Live {
         cx: cx.clone(),
         user: st.live.subscribe(&Hub::user_topic(&m.user_id.to_string())),
-        session: st.live.subscribe(&Hub::session_topic(&m.session_id.to_string())),
+        session: st
+            .live
+            .subscribe(&Hub::session_topic(&m.session_id.to_string())),
         st,
         session_id: m.session_id,
         _slot: slot,

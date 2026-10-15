@@ -186,9 +186,8 @@ pub async fn library(cx: &Cx) -> Result<impl View> {
     let mail = st.mailer.enabled();
     let base = st.config.public_base_url.clone();
     let now = now_ms();
-    let live = format!(
-        "@get('/library/live?since={now}', {{retry: 'always', retryMaxCount: 1000}})"
-    );
+    let live =
+        format!("@get('/library/live?since={now}', {{retry: 'always', retryMaxCount: 1000}})");
     Ok(view! {
         shell(
             meta: Meta { noindex: true, ..Meta::titled("Library") },
@@ -201,7 +200,13 @@ pub async fn library(cx: &Cx) -> Result<impl View> {
                         (m.email.as_str())
                     </p>
                 </div>
-                items_region(videos: lib.videos, counts: lib.counts, base: base.clone(), mail: mail, now: now)
+                items_region(
+                    videos: lib.videos,
+                    counts: lib.counts,
+                    base: base.clone(),
+                    mail: mail,
+                    now: now
+                )
                 shots_region(shots: lib.shots, base: base, now: now)
             </section>
         )
@@ -269,7 +274,11 @@ async fn shots_region(shots: Vec<Screenshot>, base: String, now: i64) -> Result<
                                     }
                                 </p>
                             </div>
-                            <button type="button" class="button small" data-copy=(link.as_str())>
+                            <button
+                                type="button"
+                                class="button small"
+                                data-copy=(link.as_str())
+                            >
                                 "Copy link"
                             </button>
                         </li>
@@ -734,7 +743,13 @@ impl Live {
         } = lib;
         let items = view! {
             cx =>
-            items_region(videos: videos, counts: counts, base: items_base, mail: mail, now: now)
+            items_region(
+                videos: videos,
+                counts: counts,
+                base: items_base,
+                mail: mail,
+                now: now
+            )
         }
         .single()
         .await?
@@ -798,7 +813,13 @@ impl Live {
                     .remove(id)
                     .unwrap_or_default();
                 let html = view! {
-                    cx => card_meta(video: v, views: c.views, comments: c.comments, now: now_ms())
+                    cx =>
+                    card_meta(
+                        video: v,
+                        views: c.views,
+                        comments: c.comments,
+                        now: now_ms()
+                    )
                 }
                 .single()
                 .await?

@@ -820,7 +820,12 @@ async fn sign_in_library_and_owner_actions() {
 
     // Unknown emails get the same answer and no mail.
     let r = app
-        .form("/login/code", &[("email", "nobody@example.com")], None, false)
+        .form(
+            "/login/code",
+            &[("email", "nobody@example.com")],
+            None,
+            false,
+        )
         .await;
     assert!(r.body.contains("name=\"code\""));
     let bad = app
@@ -935,5 +940,450 @@ async fn expire_job_purges_expired_and_abandoned_videos() {
         .unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].text(0).unwrap(), keep["id"].as_str().unwrap());
+    app.t.finish().await;
+}
+
+// ---------- web sign-up, sign-in and the account page ----------
+
+/// Open a live stream as the page would; returns its body.
+async fn open_stream(app: &App, path: &str, cookie: Option<&str>) -> Body {
+    let mut r = http::Request::builder()
+        .uri(path)
+        .header("datastar-request", "true");
+    if let Some(c) = cookie {
+        r = r.header("cookie", c);
+    }
+    let res = app.router.handle(r.body(Body::empty()).unwrap()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "text/event-stream");
+    res.into_body()
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+#[tokio::test]
+async fn signup_verify_password_login_and_reset() {
+    let app = App::new().await;
+    let page = app.get("/signup", None).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("action=\"/signup\""));
+
+    let weak = app
+        .form(
+            "/signup",
+            &[("email", "new@example.com"), ("password", "short")],
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(weak.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(weak.body.contains("new@example.com") && !weak.body.contains("short"));
+
+    // Sign up, then confirm with the emailed code: signed in with a fresh session.
+    let r = app
+        .form(
+            "/signup",
+            &[
+                ("email", "New@Example.com"),
+                ("password", "correct horse battery"),
+                ("next", "/account"),
+            ],
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.body.contains("action=\"/verify\""));
+    let code = app.mailed_code("new@example.com", "Confirm your").await;
+    let r = app
+        .form(
+            "/verify",
+            &[
+                ("email", "new@example.com"),
+                ("code", &code),
+                ("next", "/account"),
+            ],
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert_eq!(r.header("location"), "/account");
+    let first = r.cookie("sg_session").unwrap();
+    let acct = app.get("/account", Some(&first)).await;
+    assert_eq!(acct.status, StatusCode::OK);
+    assert!(acct.body.contains("Verified") && acct.body.contains("This browser"));
+
+    // Signing up again with the same email looks the same and mails a sign-in code.
+    let again = app
+        .form(
+            "/signup",
+            &[
+                ("email", "new@example.com"),
+                ("password", "another long one"),
+            ],
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert!(again.body.contains("action=\"/verify\""));
+    app.mailed_code("new@example.com", "sign-in code").await;
+
+    // Password sign-in: wrong, then right (a new token each time).
+    let out = app.form("/logout", &[], Some(&first), false).await;
+    assert_eq!(out.status, StatusCode::SEE_OTHER);
+    let bad = app
+        .form(
+            "/login",
+            &[
+                ("email", "new@example.com"),
+                ("password", "wrong password!"),
+            ],
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let ok = app
+        .form(
+            "/login",
+            &[
+                ("email", "new@example.com"),
+                ("password", "correct horse battery"),
+                ("next", "/library"),
+            ],
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(ok.status, StatusCode::SEE_OTHER, "{}", ok.body);
+    let second = ok.cookie("sg_session").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(
+        app.get("/account", Some(&first)).await.status,
+        StatusCode::TEMPORARY_REDIRECT
+    );
+
+    // Forgot password: reset with the code; every earlier session ends.
+    let r = app
+        .form("/forgot", &[("email", "new@example.com")], None, false)
+        .await;
+    assert!(r.body.contains("action=\"/reset\""));
+    let code = app.mailed_code("new@example.com", "Reset your").await;
+    let r = app
+        .form(
+            "/reset",
+            &[
+                ("email", "new@example.com"),
+                ("code", &code),
+                ("password", "a brand new password"),
+            ],
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    let third = r.cookie("sg_session").unwrap();
+    assert_eq!(
+        app.get("/library", Some(&second)).await.status,
+        StatusCode::TEMPORARY_REDIRECT
+    );
+    assert_eq!(
+        app.get("/library", Some(&third)).await.status,
+        StatusCode::OK
+    );
+
+    // Ten failures within 15 minutes lock password sign-in for that email.
+    for _ in 0..10 {
+        app.form(
+            "/login",
+            &[("email", "new@example.com"), ("password", "nope nope nope")],
+            None,
+            false,
+        )
+        .await;
+    }
+    let locked = app
+        .form(
+            "/login",
+            &[
+                ("email", "new@example.com"),
+                ("password", "a brand new password"),
+            ],
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(locked.status, StatusCode::TOO_MANY_REQUESTS);
+    app.t.finish().await;
+}
+
+#[tokio::test]
+async fn account_live_sessions_tokens_revocation_and_deletion() {
+    let app = App::new().await;
+    let token = app.user("owner@example.com").await;
+    let session = app.web_login("owner@example.com").await;
+    // A second browser, signed in with the password (codes have a resend cooldown).
+    let other = app
+        .form(
+            "/login",
+            &[
+                ("email", "owner@example.com"),
+                ("password", "supersecret123"),
+            ],
+            None,
+            false,
+        )
+        .await
+        .cookie("sg_session")
+        .unwrap();
+
+    let mut acct = open_stream(
+        &app,
+        &format!("/account/live?since={}", now()),
+        Some(&session),
+    )
+    .await;
+    let mut lib = open_stream(
+        &app,
+        &format!("/library/live?since={}", now()),
+        Some(&other),
+    )
+    .await;
+
+    // A Mac app signs in: the devices list updates in the open account page.
+    let r = app
+        .api(
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(json!({"email": "owner@example.com", "password": "supersecret123", "device_name": "Studio Mac"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let seen = read_until(&mut acct, "Studio Mac", Duration::from_secs(5)).await;
+    assert!(seen.contains("Studio Mac"), "{seen}");
+
+    // API tokens: shown once on creation, listed live, revocable.
+    let created = app
+        .form(
+            "/account/tokens",
+            &[("name", "CI runner")],
+            Some(&session),
+            true,
+        )
+        .await;
+    assert!(
+        created.body.contains("sgp_") && created.body.contains("CI runner"),
+        "{}",
+        created.body
+    );
+    let seen = read_until(&mut acct, "CI runner", Duration::from_secs(5)).await;
+    assert!(
+        seen.contains("CI runner") && !seen.contains("sgp_"),
+        "{seen}"
+    );
+    let api_tokens = app
+        .api("GET", "/v1/tokens", Some(&token), None)
+        .await
+        .json();
+    let tid = api_tokens["items"][0]["id"].as_str().unwrap().to_string();
+    let r = app
+        .form(
+            &format!("/account/tokens/{tid}/revoke"),
+            &[],
+            Some(&session),
+            true,
+        )
+        .await;
+    assert!(r.body.contains("No tokens."), "{}", r.body);
+
+    // "Sign out all other devices": the other browser's open page is sent to sign-in.
+    let r = app
+        .form("/account/sessions/revoke-others", &[], Some(&session), true)
+        .await;
+    assert!(!r.body.contains("Studio Mac"), "{}", r.body);
+    let seen = read_until(&mut lib, "live-redirect", Duration::from_secs(5)).await;
+    assert!(seen.contains("/login?next=/library"), "{seen}");
+    assert_eq!(
+        app.get("/library", Some(&other)).await.status,
+        StatusCode::TEMPORARY_REDIRECT
+    );
+    assert_eq!(
+        app.api("GET", "/v1/me", Some(&token), None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Cross-site posts are refused before any handler runs.
+    let csrf = app
+        .send(
+            http::Request::builder()
+                .method("POST")
+                .uri("/account/tokens")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", &session)
+                .header("origin", "https://evil.example")
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::from("name=x"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(csrf.status, StatusCode::FORBIDDEN);
+
+    // Deleting the account needs the email typed out, then removes everything.
+    let r = app
+        .form(
+            "/account/delete",
+            &[("confirm", "wrong@example.com")],
+            Some(&session),
+            false,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let r = app
+        .form(
+            "/account/delete",
+            &[("confirm", "Owner@example.com")],
+            Some(&session),
+            false,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    assert_eq!(r.header("location"), "/");
+    let users = app
+        .t
+        .owner
+        .query("SELECT id FROM users", &[])
+        .await
+        .unwrap();
+    assert!(users.is_empty());
+    app.t.finish().await;
+}
+
+#[tokio::test]
+async fn library_live_new_recordings_progress_and_counts() {
+    let app = App::new().await;
+    let token = app.user("owner@example.com").await;
+    let ready = app.ready_video(&token, "Already here").await;
+    let session = app.web_login("owner@example.com").await;
+    let mut lib = open_stream(
+        &app,
+        &format!("/library/live?since={}", now()),
+        Some(&session),
+    )
+    .await;
+
+    // The Mac app starts a recording: it appears at once, then shows progress.
+    let v = app
+        .api(
+            "POST",
+            "/v1/videos",
+            Some(&token),
+            Some(json!({"title": "Live demo"})),
+        )
+        .await
+        .json();
+    let id = v["id"].as_str().unwrap().to_string();
+    let seen = read_until(&mut lib, &format!("item-{id}"), Duration::from_secs(5)).await;
+    assert!(
+        seen.contains("Live demo") && seen.contains("Recording live"),
+        "{seen}"
+    );
+
+    let (a, t, path) = (&app, &token, format!("/v1/videos/{id}/progress"));
+    let progress = |bytes: i64, recording: bool| {
+        let (path, body) = (
+            path.clone(),
+            json!({"uploaded_bytes": bytes, "recording": recording}),
+        );
+        async move { a.api("POST", &path, Some(t), Some(body)).await }
+    };
+    assert_eq!(
+        progress(6 * 1_048_576, true).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let seen = read_until(&mut lib, "6.0 MB uploaded", Duration::from_secs(5)).await;
+    assert!(seen.contains(&format!("meta-{id}")), "{seen}");
+    assert_eq!(progress(1, true).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        progress(7 * 1_048_576, false).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let seen = read_until(&mut lib, "Finishing", Duration::from_secs(5)).await;
+    assert!(seen.contains("7.0 MB"), "{seen}");
+
+    // The watch page shows the same state to viewers.
+    let page = app.get(&format!("/v/{}", slug_of(&v)), None).await;
+    assert!(
+        page.body.contains("Finishing… 7.0 MB uploaded"),
+        "{}",
+        page.body
+    );
+
+    // A viewer comments on the other recording: its count updates.
+    app.form(
+        &format!("/v/{}/comments", slug_of(&ready)),
+        &[("body", "Nice"), ("name", "Ann")],
+        None,
+        false,
+    )
+    .await;
+    let seen = read_until(&mut lib, "1 comment", Duration::from_secs(5)).await;
+    assert!(
+        seen.contains(&format!("meta-{}", ready["id"].as_str().unwrap())),
+        "{seen}"
+    );
+
+    // Renamed and deleted from the app: the card follows.
+    app.api(
+        "PATCH",
+        &format!("/v1/videos/{id}"),
+        Some(&token),
+        Some(json!({"title": "Live demo (final)"})),
+    )
+    .await;
+    let seen = read_until(&mut lib, "Live demo (final)", Duration::from_secs(5)).await;
+    assert!(seen.contains(&format!("item-{id}")), "{seen}");
+    app.api("DELETE", &format!("/v1/videos/{id}"), Some(&token), None)
+        .await;
+    let seen = read_until(&mut lib, "mode remove", Duration::from_secs(5)).await;
+    assert!(seen.contains(&format!("#item-{id}")), "{seen}");
+    app.t.finish().await;
+}
+
+#[tokio::test]
+async fn watch_page_follows_privacy_changes() {
+    let app = App::new().await;
+    let token = app.user("owner@example.com").await;
+    let v = app.ready_video(&token, "Secret plans").await;
+    let (id, slug) = (v["id"].as_str().unwrap().to_string(), slug_of(&v));
+    let mut viewer = open_stream(&app, &format!("/v/{slug}/live?since={}", now()), None).await;
+    app.api(
+        "PATCH",
+        &format!("/v1/videos/{id}"),
+        Some(&token),
+        Some(json!({"visibility": "password", "password": "letmein"})),
+    )
+    .await;
+    let seen = read_until(&mut viewer, "/unlock", Duration::from_secs(5)).await;
+    assert!(seen.contains("watch-locked"), "{seen}");
+
+    // Back to the link, then private: open viewers see it become unavailable.
+    let (a, t, path) = (&app, &token, format!("/v1/videos/{id}"));
+    let patch = |vis: &'static str| {
+        let path = path.clone();
+        async move {
+            a.api("PATCH", &path, Some(t), Some(json!({"visibility": vis})))
+                .await
+        }
+    };
+    assert_eq!(patch("link").await.status, StatusCode::OK);
+    let mut viewer = open_stream(&app, &format!("/v/{slug}/live?since={}", now()), None).await;
+    assert_eq!(patch("private").await.status, StatusCode::OK);
+    let seen = read_until(&mut viewer, "Recording unavailable", Duration::from_secs(5)).await;
+    assert!(seen.contains("Recording unavailable"), "{seen}");
     app.t.finish().await;
 }

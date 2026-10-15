@@ -550,9 +550,7 @@ pub async fn progress(
     if uploaded_bytes < v.uploaded_bytes {
         return Err(AppError::Invalid("uploaded_bytes must not decrease".into()));
     }
-    let ended = v
-        .recording_ended_at
-        .or_else(|| (!recording).then(now_ms));
+    let ended = v.recording_ended_at.or_else(|| (!recording).then(now_ms));
     if uploaded_bytes == v.uploaded_bytes && ended == v.recording_ended_at {
         return Ok(());
     }

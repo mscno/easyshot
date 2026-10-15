@@ -1158,10 +1158,10 @@ pub async fn live(cx: &Cx) -> Result<Sse<impl Stream<Item = Result<Event>> + Sen
         .unwrap_or(0);
     let slot = super::admit_stream(cx, &w.member)?;
     let sub = st.live.subscribe(&w.video.id);
-    let session = w
-        .member
-        .as_ref()
-        .map(|m| st.live.subscribe(&Hub::session_topic(&m.session_id.to_string())));
+    let session = w.member.as_ref().map(|m| {
+        st.live
+            .subscribe(&Hub::session_topic(&m.session_id.to_string()))
+    });
     let mut live = Live {
         cx: cx.clone(),
         st,
