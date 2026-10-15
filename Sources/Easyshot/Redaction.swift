@@ -62,11 +62,7 @@ enum Redaction {
     /// With "Redact secrets before upload" on, looks for secrets and lets the user redact them,
     /// upload unchanged, or cancel (nil). Images without findings pass straight through.
     @MainActor static func reviewBeforeUpload(_ upload: UploadableImage) async throws -> UploadableImage? {
-        let p = Preferences.shared
-        guard p.redactBeforeUpload,upload.contentType != "image/gif",
-              let source = CGImageSourceCreateWithData(upload.data as CFData,nil),let image = CGImageSourceCreateImageAtIndex(source,0,nil) else { return upload }
-        let secrets = try await TextAnalysis.analyze(image,scanner: p.secretScanner).secrets
-        guard !secrets.isEmpty else { return upload }
+        guard Preferences.shared.redactBeforeUpload,let (image,secrets) = try await scan(upload) else { return upload }
         let alert = NSAlert()
         alert.messageText = "This image may contain secrets"
         alert.informativeText = "Easyshot found \(summary(secrets)). Redact them before the link is created?"
@@ -74,13 +70,23 @@ enum Redaction {
         NSApp.activate()
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            // Vision boxes are bottom-left; CGContext fills use the same origin.
-            guard let redacted = apply(image,boxes: secrets.map(\.rect)) else { throw ShotError.message("Could not redact this image.") }
-            let png = try ScreenshotPixels.png(redacted)
-            guard let rep = NSBitmapImageRep(data: png) else { throw ShotError.message("Could not encode the redacted image.") }
-            return try UploadableImage.make(data: png,contentType: "image/png",rep: rep,filename: ((upload.filename as NSString).deletingPathExtension)+".png")
+            return try redacted(upload,image: image,secrets: secrets)
         case .alertSecondButtonReturn: return upload
         default: return nil
         }
+    }
+    /// The decoded image and its findings, or nil when it is a GIF, undecodable or clean.
+    @MainActor static func scan(_ upload: UploadableImage) async throws -> (CGImage,[TextAnalysis.Secret])? {
+        guard upload.contentType != "image/gif",let source = CGImageSourceCreateWithData(upload.data as CFData,nil),
+              let image = CGImageSourceCreateImageAtIndex(source,0,nil) else { return nil }
+        let secrets = try await TextAnalysis.analyze(image,scanner: Preferences.shared.secretScanner).secrets
+        return secrets.isEmpty ? nil : (image,secrets)
+    }
+    static func redacted(_ upload: UploadableImage,image: CGImage,secrets: [TextAnalysis.Secret]) throws -> UploadableImage {
+        // Vision boxes are bottom-left; CGContext fills use the same origin.
+        guard let redacted = apply(image,boxes: secrets.map(\.rect)) else { throw ShotError.message("Could not redact this image.") }
+        let png = try ScreenshotPixels.png(redacted)
+        guard let rep = NSBitmapImageRep(data: png) else { throw ShotError.message("Could not encode the redacted image.") }
+        return try UploadableImage.make(data: png,contentType: "image/png",rep: rep,filename: ((upload.filename as NSString).deletingPathExtension)+".png")
     }
 }

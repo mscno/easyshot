@@ -96,7 +96,9 @@ enum MCPMode {
                 "max_seconds": ["type": "number","minimum": 1,"maximum": 3600,"description": "Stop automatically after this many seconds. Default 300."]
             ]) { a,_ in a }),
             MCPTool("record_stop","Stop a recording and return its MP4 path and duration.",properties: ["recording_id": ["type": "string","description": "From record_start. Optional when only one recording exists."]]),
-            MCPTool("upload","Upload an image file to Easyshot Cloud and return a short share link (expires after 30 days). Requires signing in under Settings → Easyshot Cloud.",properties: path.merging(["copy": ["type": "boolean","description": "Also copy the link to the clipboard. Default false."]]) { a,_ in a },required: ["path"]),
+            MCPTool("upload","Upload an image file to Easyshot Cloud and return a short share link (expires after 30 days). Requires signing in under Settings → Easyshot Cloud.",properties: path.merging(["copy": ["type": "boolean","description": "Also copy the link to the clipboard. Default false."],
+                                     "redact": ["type": "boolean","description": "Black out detected secrets (API keys, tokens, emails, card numbers) before uploading. Default false: uploads with findings are refused."],
+                                     "allow_secrets": ["type": "boolean","description": "Upload unchanged despite findings. Only when the user has confirmed the image is safe to share."]]) { a,_ in a },required: ["path"]),
             MCPTool("open_in_editor","Open an image, recording or .easyshot.json project in the Easyshot editor for the user.",properties: path,required: ["path"])
         ]
     }()
@@ -313,12 +315,20 @@ enum MCPMode {
         guard let path = args.string("path") else { throw ShotError.message("Pass the absolute path of an image.") }
         guard CloudSession.shared.isSignedIn else { throw ShotError.message("Not signed in. Ask the user to sign in under Easyshot Settings → Easyshot Cloud.") }
         let url = URL(fileURLWithPath: path)
-        let image = try await Task.detached(priority: .userInitiated) { try UploadableImage.load(from: url) }.value
+        var image = try await Task.detached(priority: .userInitiated) { try UploadableImage.load(from: url) }.value
+        // The app's pre-upload secret check has no dialog here: refuse, or redact when the agent asks to.
+        var redactions = 0
+        if Preferences.shared.redactBeforeUpload,!args.bool("allow_secrets",default: false),let (decoded,secrets) = try await Redaction.scan(image) {
+            guard args.bool("redact",default: false) else {
+                throw ShotError.message("Not uploaded: the image may contain secrets (\(Redaction.summary(secrets))). Retry with redact: true to black them out, or allow_secrets: true only if the user confirms the image is safe to share.")
+            }
+            image = try Redaction.redacted(image,image: decoded,secrets: secrets); redactions = secrets.count
+        }
         let shot = try await CloudSession.shared.upload(image)
         if args.bool("copy",default: false),let link = ShareLink.validated(shot.shareURL) {
             NSPasteboard.general.clearContents(); NSPasteboard.general.setString(link.absoluteString,forType: .string)
         }
-        return MCP.toolResult([MCP.json(["share_url": shot.shareURL,"expires_at": ISO8601DateFormatter().string(from: shot.expiresAt)])])
+        return MCP.toolResult([MCP.json(["share_url": shot.shareURL,"expires_at": ISO8601DateFormatter().string(from: shot.expiresAt),"redacted": redactions])])
     }
     /// The editor is UI, so it opens in a normal Easyshot session rather than in this headless process.
     private func openInEditor(_ args: MCPArguments) async throws -> [String: Any] {
