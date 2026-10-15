@@ -161,7 +161,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
             queue.async {
                 self.ending = true
                 if let mixer = self.mixer,let audio = self.audio {
-                    if self.started,!mixer.drain(into: audio,final: true) { self.sampleError = writer.error }
+                    if self.started,!mixer.drain(into: audio,final: true) { self.sampleError = self.writer?.error }
                     self.mixStats = (mixer.busySeconds,mixer.mixedSeconds)
                 }
                 self.video?.markAsFinished(); self.audio?.markAsFinished(); self.mic?.markAsFinished()

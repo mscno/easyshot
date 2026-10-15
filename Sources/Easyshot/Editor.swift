@@ -518,7 +518,7 @@ struct EditorView: View {
             heading("STYLE")
             HStack {
                 ColorPicker("Color",selection: $model.color,supportsOpacity: false)
-                Button { NSColorSampler().show { if let c = $0 { model.color = Color(nsColor: c) } } } label: { Image(systemName: "eyedropper") }.help("Pick a color from the image or screen")
+                Button { let model = model; NSColorSampler().show { picked in guard let picked else { return }; let color = Color(nsColor: picked); Task { @MainActor in model.color = color } } } label: { Image(systemName: "eyedropper") }.help("Pick a color from the image or screen")
             }
             palette
             VStack(alignment: .leading) { Text("Stroke · \(Int(model.stroke)) px").font(.system(size: 12)); Slider(value: $model.stroke,in: 2...20) }
