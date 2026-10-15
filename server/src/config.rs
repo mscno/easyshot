@@ -40,6 +40,40 @@ pub struct Config {
     pub trusted_proxy_hops: usize,
     /// Where the landing page sends people to get the Mac app.
     pub download_url: String,
+    /// Per-client-address budgets for sign-in, sign-up and emailed codes (web and API share them).
+    pub auth_limits: AuthLimits,
+}
+
+/// `max` hits per `window_secs` for one client address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limit {
+    pub max: u32,
+    pub window_secs: u64,
+}
+
+/// Per-address auth budgets, applied before any password hashing or account creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthLimits {
+    /// Password sign-ins (`POST /login`, `/v1/auth/login`).
+    pub login: Limit,
+    /// Sign-up attempts (`POST /signup`, `/v1/auth/register`), each of which may mail a code.
+    pub signup: Limit,
+    /// Requests that mail a code: sign-in codes, resends, password resets, verification.
+    pub code_request: Limit,
+    /// Code submissions: verification, sign-in codes, password resets.
+    pub code_verify: Limit,
+}
+
+impl Default for AuthLimits {
+    fn default() -> Self {
+        let l = |max, window_secs| Limit { max, window_secs };
+        AuthLimits {
+            login: l(20, 600),
+            signup: l(5, 3600),
+            code_request: l(10, 600),
+            code_verify: l(20, 600),
+        }
+    }
 }
 
 pub const DEFAULT_DOWNLOAD_URL: &str = "https://github.com/mscno/easyshot/releases/latest";
@@ -130,6 +164,7 @@ impl Config {
             web_secret: get("WEB_SECRET"),
             trusted_proxy_hops: non_negative("TRUSTED_PROXY_HOPS", 0)? as usize,
             download_url: get("DOWNLOAD_URL").unwrap_or_else(|| DEFAULT_DOWNLOAD_URL.into()),
+            auth_limits: AuthLimits::default(),
         })
         .and_then(|c| {
             if c.lettermint_api_token.is_some() && c.mail_from.is_none() {
@@ -173,6 +208,7 @@ impl Config {
             web_secret: Some("test-web-secret".into()),
             trusted_proxy_hops: 0,
             download_url: DEFAULT_DOWNLOAD_URL.into(),
+            auth_limits: AuthLimits::default(),
         }
     }
 }
