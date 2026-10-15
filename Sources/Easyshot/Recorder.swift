@@ -58,7 +58,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     /// With `telemetry`, frames pass through untouched and the cursor is logged for Studio export.
     func start(filter: SCContentFilter,configuration: SCStreamConfiguration,url: URL,effects: RecordingEffects? = nil,telemetry: CursorTelemetry? = nil,spool: SegmentSpool? = nil) async throws {
         let writer = try Self.makeWriter(url: url,spool: spool)
-        writer.delegate = self
+        // A delegate switches the writer to segment delivery; a plain file writer must not have one.
+        if spool != nil { writer.delegate = self }
         let video = Self.videoInput(width: configuration.width,height: configuration.height,fragmented: spool != nil)
         guard writer.canAdd(video) else { throw ShotError.message("Video encoder unavailable at this resolution.") }
         writer.add(video)

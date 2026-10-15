@@ -61,6 +61,8 @@ struct CaptureRequest {
     @Published var shareLink: String?
     /// Seconds from stop to a ready link for the latest shared recording (diagnostics).
     var lastShareReadyLatency: Double?
+    /// Seconds from requesting the server video to having its link (diagnostics).
+    var lastShareLinkLatency: Double?
     var scrolling: (target: CaptureTarget,frames: [CGImage])?
     var scrollPanel: NSPanel?
     var scrollTask: Task<Void,Never>?

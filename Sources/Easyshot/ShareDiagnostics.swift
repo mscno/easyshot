@@ -13,6 +13,19 @@ enum ShareDiagnostics {
             Task { let result = await offline(); fflush(stdout); exit(result) }
             return true
         }
+        if let flag = arguments.firstIndex(of: "--transcribe-test"),let path = arguments[safe: flag+1] {
+            NSApp.setActivationPolicy(.accessory)
+            Task {
+                let start = Date()
+                do {
+                    let vtt = try await Transcriber.webVTT(URL(fileURLWithPath: path))
+                    print(vtt ?? "(no speech)"); print(String(format: "INFO: transcribed in %.1f s",Date().timeIntervalSince(start)))
+                    check(vtt?.hasPrefix("WEBVTT") == true,"on-device transcript")
+                } catch { check(false,"transcription: \(error.localizedDescription)") }
+                fflush(stdout); exit(failures == 0 ? 0 : 1)
+            }
+            return true
+        }
         if let flag = arguments.firstIndex(of: "--record-share-test"),arguments.count > flag+3 {
             NSApp.setActivationPolicy(.accessory)
             let seconds = arguments.firstIndex(of: "--seconds").flatMap { Double(arguments[safe: $0+1] ?? "") } ?? 10
@@ -169,15 +182,19 @@ enum ShareDiagnostics {
         guard CloudSession.shared.isSignedIn else { return 1 }
         do { try await controller.engine.refresh() } catch { check(false,"screen access: \(error.localizedDescription)"); return 1 }
         let screen = NSScreen.main ?? NSScreen.screens[0]
-        let rect = CGRect(x: screen.frame.minX+80,y: screen.frame.minY+80,width: 1280,height: 720)
+        let rect = CommandLine.arguments.contains("--full") ? screen.frame : CGRect(x: screen.frame.minX+80,y: screen.frame.minY+80,width: 1280,height: 720)
         let target = CaptureTarget.region(CaptureGeometry.quartz(rect,primaryHeight: NSScreen.primaryHeight))
         let start = Date()
         do { try await controller.startRecording(target,share: true) } catch { check(false,"recording starts: \(error.localizedDescription)"); return 1 }
+        let recordingAt = Date().timeIntervalSince(start)
         while controller.shareLink == nil,Date().timeIntervalSince(start) < 5 { try? await Task.sleep(for: .milliseconds(10)) }
-        let linkAt = Date().timeIntervalSince(start)
-        check(controller.shareLink != nil,String(format: "link available %.0f ms after start: %@",linkAt*1000,controller.shareLink ?? "none"))
+        check(controller.shareLink != nil,String(format: "link available %.0f ms after it was requested (recording running after %.0f ms): %@",(controller.lastShareLinkLatency ?? -1)*1000,recordingAt*1000,controller.shareLink ?? "none"))
         let link = controller.shareLink ?? ""
         try? await Task.sleep(for: .seconds(seconds))
+        if let share = controller.shareRecording {
+            let uploaded = await share.uploader.uploadedBytes
+            note("before stop: \(share.spool.total/1024) KiB spooled, \(uploaded/1024) KiB already uploaded")
+        }
         let stoppedAt = Date()
         await controller.stopRecording()
         let stopCall = Date().timeIntervalSince(stoppedAt)
@@ -193,7 +210,11 @@ enum ShareDiagnostics {
         if let ms = controller.lastShareReadyLatency { note(String(format: "upload finish after recorder stop: %.0f ms",ms*1000)) }
         let clip = controller.store.clips.first { $0.share?.url == link }
         let bytes = clip.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int } ?? 0
-        note("recording \(bytes/1024) KiB at \(clip?.width ?? 0)×\(clip?.height ?? 0)")
+        note("recording \(bytes/1024) KiB at \(clip?.width ?? 0)×\(clip?.height ?? 0), \(PartPlanner.whole(size: bytes).count) part(s)")
+        if let clip {
+            let duration = (try? await AVURLAsset(url: clip.url).load(.duration).seconds) ?? 0
+            check(abs(duration-seconds) < 1.5,String(format: "local recording plays: %.1f s",duration))
+        }
         // The watch page and a ranged media request (the browser's first request) against the real server.
         if let page = URL(string: link) {
             let html = (try? await URLSession.shared.data(from: page)).flatMap { String(data: $0.0,encoding: .utf8) } ?? ""
@@ -212,6 +233,16 @@ enum ShareDiagnostics {
             let result = try? await URLSession.shared.data(from: poster)
             let status = (result?.1 as? HTTPURLResponse)?.statusCode ?? 0
             check(status == 200 && (result?.0.count ?? 0) > 1000,"poster served at /thumbnail.jpg (HTTP \(status))")
+        }
+        // Captions: the same upload the app makes after transcribing, served back by the watch page.
+        if let id = controller.store.clips.first(where: { $0.share?.url == link })?.share?.videoID,let client = CloudSession.shared.client,
+           let vttURL = URL(string: link)?.appendingPathComponent("transcript.vtt") {
+            let vtt = WebVTT.document([WebVTT.Cue(start: 0,end: 2,text: "Record and share test caption")])
+            do {
+                try await client.uploadAsset(id,kind: "transcript",data: Data(vtt.utf8))
+                let served = try? await URLSession.shared.data(from: vttURL)
+                check(served.flatMap { String(data: $0.0,encoding: .utf8) }?.contains("Record and share test caption") == true,"captions upload and are served as WebVTT")
+            } catch { check(false,"transcript upload: \(error.localizedDescription)") }
         }
         print("\(failures == 0 ? "PASS" : "FAIL"): record & share live test, \(failures) failure(s)")
         return failures == 0 ? 0 : 1

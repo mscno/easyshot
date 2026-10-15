@@ -21,9 +21,10 @@ extension AppController {
     static func shareTitle(_ date: Date = Date()) -> String { "Recording · \(date.formatted(date: .abbreviated,time: .shortened))" }
     func beginShare(url: URL) throws -> ShareRecording {
         guard let client = CloudSession.shared.client else { throw CloudError.notSignedIn }
+        let requested = Date()
         let share = try ShareRecording(client: client,url: url,title: Self.shareTitle()) { [weak self] video in
             guard let self else { return }
-            self.shareLink = video.shareUrl
+            self.shareLink = video.shareUrl; self.lastShareLinkLatency = Date().timeIntervalSince(requested)
             if Preferences.shared.shareCopyLinkAtStart,self.copyLink(video.shareUrl) { self.showToast("Link copied · recording",symbol: "link",detail: video.shareUrl,hideAfter: 2.5) }
         }
         shareRecording = share
