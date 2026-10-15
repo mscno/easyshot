@@ -35,6 +35,12 @@ struct SettingsView: View {
                 Toggle("Quick Preview · 3 seconds",isOn: $preferences.showPreview)
                 Picker("Capture delay",selection: $preferences.delay) { Text("None").tag(0.0); Text("3 seconds").tag(3.0); Text("5 seconds").tag(5.0); Text("10 seconds").tag(10.0) }.frame(maxWidth: 310,alignment: .leading)
             }
+            if CloudSession.isAvailable {
+                settingsSection("Shotglass Cloud",subtitle: "Upload a screenshot and paste its link anywhere, including over SSH.") {
+                    CloudAccountForm()
+                    UploadKeyRow()
+                }
+            }
             settingsSection("Recording",subtitle: "Capture motion and sound.") {
                 Toggle("Record system audio",isOn: $preferences.systemAudio)
                 Toggle("Record microphone",isOn: $preferences.microphone)

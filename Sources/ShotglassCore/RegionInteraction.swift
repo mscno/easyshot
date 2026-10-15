@@ -66,6 +66,8 @@ public struct RegionInteraction {
 
 public enum LaunchAction: String, CaseIterable {
     case capture, draw, repeatArea = "repeat", library, settings, fullscreen, window, activeWindow = "active-window"
+    /// Capture, upload, and copy a shareable link. `pasteUpload` converts the clipboard image into a link instead.
+    case upload, pasteUpload = "paste-upload", cloud
     public init?(url: URL) {
         guard url.scheme?.lowercased() == "shotglass",url.user == nil,url.password == nil,url.port == nil,
               url.path.isEmpty || url.path == "/",url.query == nil,url.fragment == nil,

@@ -49,10 +49,14 @@ public enum CaptureGeometry {
 }
 
 public enum CaptureFiles {
-    public static func filename(date: Date = Date(), extension ext: String, token: String = String(UUID().uuidString.prefix(6))) -> String {
+    // DateFormatter is documented thread-safe; building one per capture was needless work.
+    private static let formatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss.SSS"
+        return formatter
+    }()
+    public static func filename(date: Date = Date(), extension ext: String, token: String = String(UUID().uuidString.prefix(6))) -> String {
         return "Shotglass \(formatter.string(from: date)) \(token).\(ext)"
     }
 }

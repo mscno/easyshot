@@ -39,6 +39,7 @@ struct BasicSettingsView: View {
                 #if !APP_STORE
                 Section("Updates") { UpdateSettingsView() }
                 #endif
+                if CloudSession.isAvailable { CloudSettingsSection() }
                 Section {
                     Button("Privacy Policy") { controller.openPrivacyPolicy() }
                     Text("Shotglass opens when you launch it and quits when you finish. It remembers your capture mode and area.")

@@ -16,6 +16,8 @@ import QuartzCore
     @Published var fastDraw = false
     @Published var needsPermission = false
     var drawNew: (() -> Void)?
+    var resetArea: (() -> Void)?
+    var uploadCapture: (() -> Void)?
     var openLibrary: (() -> Void)?
     var openSettings: (() -> Void)?
     var changed: (() -> Void)?
@@ -65,6 +67,19 @@ final class CaptureOverlayWindow: NSPanel {
         state.mode = .area; state.drawingNew = true; state.rect = .zero
         clickAnchor = nil; state.fastDraw = false; rememberMode(); redraw()
     }
+    /// Clears the current rectangle, any half-finished two-click corner and any drag in flight, then
+    /// arms a fresh draw. The saved "last area" stays untouched until a new capture replaces it.
+    func resetArea() {
+        views.forEach { $0.cancelInteraction() }
+        state.mode = .area; state.drawingNew = true; state.rect = .zero
+        clickAnchor = nil; state.fastDraw = false
+        rememberMode(); redraw()
+    }
+    func uploadCapture() {
+        guard CloudSession.isAvailable,state.purpose == "Screenshot" || state.purpose == "Upload" else { NSSound.beep(); return }
+        guard CloudSession.shared.isSignedIn else { close(); AppController.shared.requireSignIn(); return }
+        state.purpose = "Upload"; complete()
+    }
     init(engine: CaptureEngine,preferences: Preferences = .shared) { self.engine = engine; self.preferences = preferences }
     func show(mode: CaptureMode,purpose: String,drawImmediately: Bool = false,drawNewArea: Bool = false,onComplete: @escaping (CaptureTarget) -> Void) {
         close()
@@ -79,6 +94,8 @@ final class CaptureOverlayWindow: NSPanel {
         state.changed = { [weak self] in self?.changeMode() }
         state.capture = { [weak self] in self?.complete() }
         state.drawNew = { [weak self] in self?.drawNew() }
+        state.resetArea = { [weak self] in self?.resetArea() }
+        state.uploadCapture = { [weak self] in self?.uploadCapture() }
         state.openLibrary = { [weak self] in self?.close(); AppController.shared.openMain() }
         state.openSettings = { AppController.shared.openSettings() }
         state.cancel = { [weak self] in self?.cancel() }
@@ -96,7 +113,7 @@ final class CaptureOverlayWindow: NSPanel {
         }
         presentSelectionWindows()
         let screen = NSScreen.pointerScreen
-        let panel = CaptureToolbarPanel(contentRect: CGRect(x: screen.visibleFrame.midX-280,y: screen.visibleFrame.minY+24,width: 560,height: 62),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
+        let panel = CaptureToolbarPanel(contentRect: CGRect(x: screen.visibleFrame.midX-(CloudSession.isAvailable ? 328 : 310),y: screen.visibleFrame.minY+24,width: CloudSession.isAvailable ? 656 : 620,height: 62),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
         panel.overlay = self; panel.acceptsMouseMovedEvents = true; panel.hidesOnDeactivate = false
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue+1)
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true; panel.isReleasedWhenClosed = false
@@ -193,9 +210,13 @@ final class CaptureOverlayWindow: NSPanel {
             toolbar.animator().alphaValue = hidden ? 0 : 1
         }
     }
-    func redraw() {
+    /// Cursor rects only matter once the pointer rests; rebuilding them for every drag event is wasted work.
+    func redraw(cursors: Bool = true) {
         updateToolbarVisibility()
-        views.forEach { $0.invalidateSelection(); $0.window?.invalidateCursorRects(for: $0) }
+        for view in views {
+            view.invalidateSelection()
+            if cursors { view.window?.invalidateCursorRects(for: view) }
+        }
     }
     func savedOrDefaultRegion() -> CGRect {
         if let region = preferences.lastRegion,region.rect.width > 2,region.rect.height > 2 {
@@ -229,10 +250,12 @@ final class CaptureOverlayWindow: NSPanel {
     }
     @discardableResult func handleKeyboard(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags
-        if let action = CaptureKeyAction.resolve(event.charactersIgnoringModifiers ?? "",command: flags.contains(.command),otherModifier: flags.contains(.option) || flags.contains(.control)) {
+        if let action = CaptureKeyAction.resolve(event.charactersIgnoringModifiers ?? "",command: flags.contains(.command),otherModifier: flags.contains(.option) || flags.contains(.control),uploadKey: preferences.uploadKey) {
             switch action {
             case .mode(let mode): state.mode = mode; changeMode()
             case .drawNew: drawNew()
+            case .resetArea: resetArea()
+            case .upload: uploadCapture()
             case .library: state.openLibrary?()
             case .settings: state.openSettings?()
             }
@@ -241,7 +264,8 @@ final class CaptureOverlayWindow: NSPanel {
         guard !flags.contains(.command),!flags.contains(.option),!flags.contains(.control) else { return false }
         switch event.keyCode {
         case 53: cancel()
-        case 36,76: complete()
+        case 36,76: if flags.contains(.shift) { uploadCapture() } else { complete() }
+        case 51,117: resetArea()
         case 49: state.mode = state.mode == .window ? .area : .window; changeMode()
         case 48:
             let modes = CaptureMode.toolbarOrder
@@ -290,6 +314,10 @@ final class CaptureOverlayWindow: NSPanel {
     var anchor = CGPoint.zero
     var interaction = RegionInteraction()
     var dragging = false
+    /// Set by a keyboard reset mid-gesture so the rest of the drag cannot resurrect the cleared rectangle.
+    private var interactionCancelled = false
+    private var lastInvalidated = CGRect.null
+    func cancelInteraction() { interactionCancelled = true; dragging = false; interaction = RegionInteraction() }
     static let cameraCursor: NSCursor = {
         let image = NSImage(size: NSSize(width: 32,height: 28),flipped: false) { _ in
             NSColor.black.setFill(); NSColor.white.setStroke()
@@ -313,7 +341,29 @@ final class CaptureOverlayWindow: NSPanel {
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
     }
-    func invalidateSelection() { needsDisplay = true }
+    /// The rectangle (screen coordinates) this view paints chrome for, mirroring `draw`.
+    private var chromeSelection: CGRect {
+        let s = overlay.state
+        switch s.mode {
+        case .window,.activeWindow: return s.hoveredFrame
+        case .fullscreen: return window.map { $0.frame } ?? .zero
+        default: return s.rect
+        }
+    }
+    /// Repaint only what changed: the old and new selection plus room for handles, border and the size label.
+    /// Everything else is the uniform dim, so a large or multi-display desktop never repaints in full per mouse event.
+    func invalidateSelection(full: Bool = false) {
+        guard let window else { needsDisplay = true; return }
+        let current = chromeSelection
+        let pad = CGSize(width: 220,height: 110)
+        func chrome(_ r: CGRect) -> CGRect { r.isNull ? r : r.insetBy(dx: -pad.width,dy: -pad.height) }
+        let dirty = full ? window.frame : chrome(current).union(lastInvalidated)
+        lastInvalidated = chrome(current)
+        let local = dirty.intersection(window.frame)
+        guard !local.isNull,!local.isEmpty else { return }
+        if (overlay.state.mode == .fullscreen && current.width > 0) || full || local.width*local.height > bounds.width*bounds.height*0.6 { needsDisplay = true; return }
+        setNeedsDisplay(local.offsetBy(dx: -window.frame.minX,dy: -window.frame.minY))
+    }
     required init?(coder: NSCoder) { fatalError() }
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -346,7 +396,7 @@ final class CaptureOverlayWindow: NSPanel {
         overlay.updatePointer(at: screenPoint(event))
         if let anchor = overlay.clickAnchor,(overlay.state.mode == .area || overlay.state.mode == .lastRegion) {
             overlay.state.rect = CaptureGeometry.rectangle(from: anchor,to: screenPoint(event))
-            overlay.redraw()
+            overlay.redraw(cursors: false)
         }
         if overlay.state.mode == .window {
             if overlay.updateWindowSelection(at: screenPoint(event)) { overlay.redraw() }
@@ -356,6 +406,7 @@ final class CaptureOverlayWindow: NSPanel {
         window?.makeKey(); window?.makeFirstResponder(self)
         let s = overlay.state
         let point = screenPoint(event)
+        interactionCancelled = false
         if s.needsPermission { overlay.complete(); return }
         if s.mode == .window { overlay.updateWindowSelection(at: point); overlay.complete(); return }
         if s.mode == .fullscreen { overlay.updatePointer(at: point); overlay.complete(); return }
@@ -373,14 +424,14 @@ final class CaptureOverlayWindow: NSPanel {
         overlay.redraw()
     }
     override func mouseDragged(with event: NSEvent) {
-        guard overlay.onComplete != nil,overlay.state.mode == .area || overlay.state.mode == .lastRegion else { return }
+        guard !interactionCancelled,overlay.onComplete != nil,overlay.state.mode == .area || overlay.state.mode == .lastRegion else { return }
         dragging = true
         overlay.state.rect = interaction.update(to: screenPoint(event),bounds: overlay.selectionBounds,square: event.modifierFlags.contains(.shift))
         if interaction.operation == .move { NSCursor.closedHand.set() }
-        overlay.redraw()
+        overlay.redraw(cursors: false)
     }
     override func mouseUp(with event: NSEvent) {
-        guard overlay.onComplete != nil,overlay.state.mode == .area || overlay.state.mode == .lastRegion else { return }
+        guard !interactionCancelled,overlay.onComplete != nil,overlay.state.mode == .area || overlay.state.mode == .lastRegion else { return }
         if dragging { overlay.state.rect = interaction.update(to: screenPoint(event),bounds: overlay.selectionBounds,square: event.modifierFlags.contains(.shift)) }
         // A click starts two-corner selection. Moving/resizing never captures on release.
         if interaction.operation == .draw {
@@ -478,7 +529,7 @@ struct CaptureToolbar: View {
         if state.mode == .fullscreen { return "Move pointer to choose display · Click display or Return: capture" }
         if state.drawingNew { return (state.fastDraw || preferences.snapOnDraw) ? "Draw anywhere · Release to capture · Shift: square · Esc: cancel" : "Draw anywhere or click two corners · Return: capture · Shift: square" }
         if state.fastDraw || preferences.snapOnDraw { return "Draw a new rectangle to capture · Drag inside to move · D/N: draw anywhere" }
-        return "Drag inside to move · Drag outside to redraw · N: draw anywhere · Return: capture"
+        return "Drag inside to move · Drag outside to redraw · N: draw anywhere · X: reset · Return: capture\(CloudSession.isAvailable ? " · \(preferences.uploadKey.uppercased()): copy link" : "")"
     }
     var body: some View {
         GlassEffectContainer(spacing: 4) {
@@ -496,6 +547,9 @@ struct CaptureToolbar: View {
                         Image(systemName: "pencil.and.outline").font(.system(size: 20,weight: .regular)).frame(width: 38,height: 40)
                             .background(state.drawingNew ? Color.primary.opacity(0.12) : Color.clear,in: RoundedRectangle(cornerRadius: 7))
                     }.buttonStyle(.plain).captureHelp("Draw New Area · D or N\nDraw anywhere, including inside the old rectangle. Hold Shift to draw a square.",using: tooltips).accessibilityLabel("Draw new area")
+                    Button { tooltips.dismiss(); state.resetArea?() } label: {
+                        Image(systemName: "eraser").font(.system(size: 18,weight: .regular)).frame(width: 34,height: 40)
+                    }.buttonStyle(.plain).captureHelp("Reset Area · X or Delete\nClear the rectangle, any half-drawn corner and start drawing from scratch. Your saved last area is kept.",using: tooltips).accessibilityLabel("Reset area")
                 }
                 divider
                 Button { tooltips.dismiss(); options.toggle() } label: {
@@ -503,7 +557,12 @@ struct CaptureToolbar: View {
                         .font(.system(size: 12)).padding(.horizontal,7).frame(height: 38)
                 }.buttonStyle(.plain).captureHelp("Options\nChoose folder, clipboard, thumbnail, timer and area size. Open Settings or Library.",using: tooltips).accessibilityLabel("Capture options")
                     .popover(isPresented: $options,arrowEdge: .top) { optionsView }
-                Button(state.needsPermission ? "Allow Access" : state.purpose == "Recording" ? "Record" : "Capture") { state.capture?() }
+                if CloudSession.isAvailable {
+                    Button { tooltips.dismiss(); state.uploadCapture?() } label: {
+                        Image(systemName: "link.badge.plus").font(.system(size: 18,weight: .regular)).frame(width: 34,height: 40)
+                    }.buttonStyle(.plain).captureHelp("Capture & Copy Link · \(preferences.uploadKey.uppercased()) or ⇧Return\nUpload the capture to Shotglass Cloud and copy a shareable link, for pasting over SSH or into chat.",using: tooltips).accessibilityLabel("Capture and copy link")
+                }
+                Button(state.needsPermission ? "Allow Access" : state.purpose == "Recording" ? "Record" : state.purpose == "Upload" ? "Upload" : "Capture") { state.capture?() }
                     .buttonStyle(.glassProminent).tint(.accentColor).controlSize(.large).keyboardShortcut(.defaultAction)
                     .font(.system(size: 12,weight: .medium)).captureHelp("\(state.needsPermission ? "Allow Screen Recording Access" : state.purpose == "Recording" ? "Record · Return" : "Capture · Return")\n\(hint)",using: tooltips)
                     .accessibilityHint(hint)
@@ -565,7 +624,7 @@ struct CaptureToolbar: View {
                 .captureHelp("Settings · ⌘,\nConfigure folder, format, clipboard, previews and capture preferences.",using: tooltips)
             Button("Open Library…") { tooltips.dismiss(); options = false; state.openLibrary?() }
                 .captureHelp("Library · ⌘L\nBrowse saved captures, edit, pin, copy text and share.",using: tooltips)
-            Text("1: screen · 2: window · 3: area\n4: active window · 5: last area\nD/N: draw new · Return: capture · Esc: close").font(.caption).foregroundStyle(.secondary)
+            Text("1: screen · 2: window · 3: area\n4: active window · 5: last area\nD/N: draw new · X/Delete: reset area\n\(CloudSession.isAvailable ? "\(preferences.uploadKey.uppercased()) / ⇧Return: capture & copy link · " : "")Return: capture · Esc: close").font(.caption).foregroundStyle(.secondary)
         }.padding(20).frame(width: 310)
             .background(CapturePopoverLevel())
     }

@@ -1,9 +1,17 @@
 import Foundation
 
 public enum CaptureKeyAction: Equatable {
-    case mode(CaptureMode), drawNew, library, settings
+    case mode(CaptureMode), drawNew, resetArea, upload, library, settings
+    /// Keys with a fixed meaning. The configurable upload key may not shadow them.
+    public static let reservedKeys: Set<String> = ["1","2","3","4","5","a","f","s","w","v","r","d","n","x"]
+    public static let defaultUploadKey = "u"
+    /// Returns a usable single-character upload key, or the default when `key` is empty or reserved.
+    public static func sanitizedUploadKey(_ key: String) -> String {
+        guard let first = key.lowercased().first, first.isLetter || first.isNumber, !reservedKeys.contains(String(first)) else { return defaultUploadKey }
+        return String(first)
+    }
     /// Only the focused capture UI handles these keys. No system-wide registration.
-    public static func resolve(_ key: String,command: Bool = false,otherModifier: Bool = false) -> Self? {
+    public static func resolve(_ key: String,command: Bool = false,otherModifier: Bool = false,uploadKey: String = defaultUploadKey) -> Self? {
         guard !otherModifier else { return nil }
         if command {
             switch key.lowercased() { case "l": return .library; case ",": return .settings; default: return nil }
@@ -16,6 +24,8 @@ public enum CaptureKeyAction: Equatable {
         case "v": return .mode(.activeWindow)
         case "r": return .mode(.lastRegion)
         case "d", "n": return .drawNew
+        case "x": return .resetArea
+        case sanitizedUploadKey(uploadKey): return .upload
         default: return nil
         }
     }

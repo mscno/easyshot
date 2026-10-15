@@ -64,6 +64,8 @@ struct CaptureRequest {
     var settingsWindow: NSWindow?
     var returnToCaptureAfterSettings = false
     var idleExitTask: Task<Void,Never>?
+    var toastPanel: NSPanel?
+    var toastTask: Task<Void,Never>?
     var pendingExports = 0
     var sessionActivity: SessionActivity {
         var activity: SessionActivity = []
@@ -71,7 +73,7 @@ struct CaptureRequest {
         if busy || pendingExports > 0 || pendingCapture != nil || launcherPending { activity.insert(.processing) }
         if recording || recorder != nil { activity.insert(.recording) }
         if scrolling != nil { activity.insert(.scrolling) }
-        if previewLifetime.isActive { activity.insert(.preview) }
+        if previewLifetime.isActive || toastPanel != nil { activity.insert(.preview) }
         if mainWindow?.isVisible == true || settingsWindow?.isVisible == true || auxiliaryWindows.contains(where: { $0.isVisible }) { activity.insert(.toolWindow) }
         #if !APP_STORE
         if updates.holdsSession { activity.insert(.toolWindow) }
@@ -125,6 +127,9 @@ struct CaptureRequest {
     }
     func route(_ action: LaunchAction) {
         idleExitTask?.cancel(); launcherPending = false
+        if !CloudSession.isAvailable,[.upload,.pasteUpload,.cloud].contains(action) {
+            status = "Shotglass Cloud is not available in this edition."; finishIfIdle(); return
+        }
         switch action {
         case .capture: capture(Preferences.shared.selection.mode,unified: true,drawNewArea: Preferences.shared.selection.drawNew)
         case .draw: capture(.area,unified: true,drawImmediately: true)
@@ -134,6 +139,11 @@ struct CaptureRequest {
         case .fullscreen: capture(.fullscreen)
         case .window: capture(.window)
         case .activeWindow: capture(.activeWindow)
+        case .upload:
+            guard CloudSession.shared.isSignedIn else { requireSignIn(); return }
+            capture(.area,unified: true,purpose: "Upload",drawNewArea: Preferences.shared.selection.drawNew)
+        case .pasteUpload: pasteUpload()
+        case .cloud: openMain(); DispatchQueue.main.async { NotificationCenter.default.post(name: .showCloud,object: nil) }
         }
     }
     func application(_ application: NSApplication,open urls: [URL]) {
@@ -185,6 +195,11 @@ struct CaptureRequest {
         }
         if CommandLine.arguments.contains("--capture-test") {
             Task { let result = await Diagnostics.captureTest(controller: self); fflush(stdout); exit(result) }
+            return
+        }
+        if let flag = CommandLine.arguments.firstIndex(of: "--cloud-test"),CommandLine.arguments.indices.contains(flag+1) {
+            let base = CommandLine.arguments[flag+1]
+            Task { let result = await CloudDiagnostics.run(base: base); fflush(stdout); exit(result) }
             return
         }
         if CommandLine.arguments.contains("--self-test") {
@@ -315,13 +330,13 @@ struct CaptureRequest {
         let interactive = unified || mode == .area || mode == .window || (mode == .lastRegion && Preferences.shared.lastRegion == nil)
         if interactive {
             // Native transparent selection needs no desktop snapshot, stream, or metadata wait.
-            overlay.show(mode: mode,purpose: purpose,drawImmediately: drawImmediately,drawNewArea: drawNewArea) { [weak self] target in self?.perform(target,purpose: purpose) }
+            overlay.show(mode: mode,purpose: purpose,drawImmediately: drawImmediately,drawNewArea: drawNewArea) { [weak self] target in self?.perform(target,purpose: self?.overlay.state.purpose ?? purpose) }
             permitted = !overlay.state.needsPermission
             return
         }
         permitted = engine.permission
         guard permitted else {
-            overlay.show(mode: mode,purpose: purpose,drawImmediately: drawImmediately,drawNewArea: drawNewArea) { [weak self] target in self?.perform(target,purpose: purpose) }
+            overlay.show(mode: mode,purpose: purpose,drawImmediately: drawImmediately,drawNewArea: drawNewArea) { [weak self] target in self?.perform(target,purpose: self?.overlay.state.purpose ?? purpose) }
             return
         }
         busy = true
@@ -337,7 +352,7 @@ struct CaptureRequest {
                 } else if mode == .fullscreen,!unified { perform(.display(NSScreen.pointerScreen.displayID),purpose: purpose) }
                 else if mode == .lastRegion,!unified,Preferences.shared.lastRegion != nil { perform(.region(overlay.savedOrDefaultRegion()),purpose: purpose) }
                 else {
-                    overlay.show(mode: mode,purpose: purpose,drawImmediately: drawImmediately,drawNewArea: drawNewArea) { [weak owner = self] target in owner?.perform(target,purpose: purpose) }
+                    overlay.show(mode: mode,purpose: purpose,drawImmediately: drawImmediately,drawNewArea: drawNewArea) { [weak owner = self] target in owner?.perform(target,purpose: owner?.overlay.state.purpose ?? purpose) }
                 }
             } catch { busy = false; fail(error); drainPendingCapture(); finishIfIdle() }
         }
@@ -357,8 +372,11 @@ struct CaptureRequest {
                 else if purpose == "Scrolling capture" { try await beginScroll(target) }
                 else {
                     let image = try await engine.image(target)
-                    var clip = try store.write(image: image,kind: purpose == "Text / QR" ? "Text" : targetName(target))
-                    status = "\(Preferences.shared.saveToDisk ? "Saved" : "In history")\(Preferences.shared.copyToClipboard ? " and copied" : "") · \(image.width) × \(image.height)"
+                    let uploading = purpose == "Upload"
+                    // PNG encoding and the file write happen off the main thread; the link replaces the image on the clipboard.
+                    var clip = try await store.writeDetached(image: image,kind: purpose == "Text / QR" ? "Text" : targetName(target),copyOverride: uploading ? false : nil)
+                    status = "\(Preferences.shared.saveToDisk ? "Saved" : "In history")\(Preferences.shared.copyToClipboard && !uploading ? " and copied" : "") · \(image.width) × \(image.height)"
+                    if uploading { await uploadClip(clip) }
                     if purpose == "Text / QR" {
                         let text = try await CaptureEngine.recognize(image)
                         clip.text = text; store.update(clip)
@@ -370,6 +388,75 @@ struct CaptureRequest {
             } catch { fail(error) }
             busy = false; drainPendingCapture(); finishIfIdle()
         }
+    }
+    // MARK: Shotglass Cloud
+    func requireSignIn() {
+        status = "Sign in to Shotglass Cloud to upload screenshots."
+        openSettings()
+    }
+    func copyLink(_ link: String) -> Bool {
+        guard let url = ShareLink.validated(link) else { return false }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString,forType: .string)
+        return true
+    }
+    /// Upload a saved capture and leave its share link on the clipboard.
+    func uploadClip(_ clip: Clip) async {
+        pendingExports += 1; defer { pendingExports -= 1 }
+        showToast("Uploading…",symbol: "icloud.and.arrow.up",spinner: true,hideAfter: nil)
+        do {
+            let url = clip.url
+            let image = try await Task.detached(priority: .userInitiated) { try UploadableImage.load(from: url) }.value
+            try await finishUpload(image)
+        } catch { uploadFailed(error) }
+    }
+    /// Convert whatever image is on the clipboard into a link, for pasting into SSH sessions and chats.
+    func pasteUpload() {
+        guard CloudSession.shared.isSignedIn else { requireSignIn(); return }
+        let image: UploadableImage?
+        do { image = try UploadableImage.fromPasteboard() } catch { uploadFailed(error); return }
+        guard let image else { showToast("No image on the clipboard",symbol: "exclamationmark.triangle.fill",hideAfter: 3); return }
+        pendingExports += 1
+        showToast("Uploading…",symbol: "icloud.and.arrow.up",spinner: true,hideAfter: nil)
+        Task {
+            defer { pendingExports -= 1 }
+            do { try await finishUpload(image) } catch { uploadFailed(error) }
+        }
+    }
+    private func finishUpload(_ image: UploadableImage) async throws {
+        let shot = try await CloudSession.shared.upload(image)
+        guard copyLink(shot.shareURL) else { throw CloudError.invalidResponse }
+        status = "Link copied · \(shot.shareURL)"
+        showToast("Link copied",symbol: "link",detail: shot.shareURL,hideAfter: 2.5)
+    }
+    private func uploadFailed(_ error: Error) {
+        status = error.localizedDescription
+        if case CloudError.notSignedIn = error { hideToast(); requireSignIn(); return }
+        showToast("Upload failed",symbol: "exclamationmark.triangle.fill",detail: error.localizedDescription,hideAfter: 6)
+    }
+    func showToast(_ text: String,symbol: String,detail: String? = nil,spinner: Bool = false,hideAfter: Double?) {
+        toastTask?.cancel(); idleExitTask?.cancel()
+        let host = NSHostingView(rootView: ToastView(text: text,symbol: symbol,detail: detail,spinner: spinner))
+        let size = host.fittingSize
+        let screen = NSScreen.pointerScreen
+        let frame = CGRect(x: screen.visibleFrame.midX-size.width/2,y: screen.visibleFrame.minY+80,width: size.width,height: size.height)
+        let panel = toastPanel ?? NSPanel(contentRect: frame,styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
+        panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true; panel.level = .floating
+        panel.ignoresMouseEvents = true; panel.isReleasedWhenClosed = false
+        panel.collectionBehavior = [.canJoinAllSpaces,.fullScreenAuxiliary]
+        panel.contentView = host; panel.setFrame(frame,display: true); panel.orderFrontRegardless()
+        toastPanel = panel
+        if let hideAfter {
+            toastTask = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(hideAfter)) } catch { return }
+                self?.hideToast()
+            }
+        }
+    }
+    func hideToast() {
+        toastTask?.cancel(); toastTask = nil
+        toastPanel?.orderOut(nil); toastPanel = nil
+        finishIfIdle()
     }
     private func targetName(_ target: CaptureTarget) -> String { switch target { case .display: return "Screen"; case .window: return "Window"; case .region: return "Area" } }
     func fail(_ error: Error) {
@@ -639,4 +726,4 @@ struct CaptureRequest {
     }
 }
 
-extension Notification.Name { static let showLibrary = Notification.Name("ShotglassShowLibrary"); static let showSettings = Notification.Name("ShotglassShowSettings") }
+extension Notification.Name { static let showCloud = Notification.Name("ShotglassShowCloud"); static let showLibrary = Notification.Name("ShotglassShowLibrary"); static let showSettings = Notification.Name("ShotglassShowSettings") }

@@ -26,6 +26,10 @@ if [[ "$EDITION" == direct ]]; then
     bash scripts/sign-sparkle.sh "$APP"
 fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+# The Shotglass Cloud server address is never committed; inject it at build time.
+if [[ -n "${SHOTGLASS_CLOUD_URL:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :ShotglassCloudURL string $SHOTGLASS_CLOUD_URL" "$APP/Contents/Info.plist"
+fi
 cp Resources/PrivacyInfo.xcprivacy "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
 if [[ "$EDITION" == app-store ]]; then
     for KEY in SUFeedURL SUPublicEDKey SUEnableAutomaticChecks SUAutomaticallyUpdate SUSendProfileInfo SUVerifyUpdateBeforeExtraction SURequireSignedFeed; do /usr/libexec/PlistBuddy -c "Delete :$KEY" "$APP/Contents/Info.plist"; done

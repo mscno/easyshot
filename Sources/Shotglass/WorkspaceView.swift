@@ -1,11 +1,12 @@
 import SwiftUI
 import AppKit
+import ImageIO
 import ShotglassCore
 
 enum WorkspacePage: String,CaseIterable,Identifiable {
-    case capture = "Capture",library = "Library",presets = "Presets",settings = "Settings"
+    case capture = "Capture",library = "Library",cloud = "Cloud",presets = "Presets",settings = "Settings"
     var id: String { rawValue }
-    var symbol: String { switch self { case .capture: return "viewfinder"; case .library: return "square.stack.3d.up"; case .presets: return "rectangle.dashed"; case .settings: return "slider.horizontal.3" } }
+    var symbol: String { switch self { case .capture: return "viewfinder"; case .library: return "square.stack.3d.up"; case .cloud: return "icloud"; case .presets: return "rectangle.dashed"; case .settings: return "slider.horizontal.3" } }
 }
 
 struct WorkspaceView: View {
@@ -27,6 +28,7 @@ struct WorkspaceView: View {
                         switch page {
                         case .capture: capturePage
                         case .library: libraryPage
+                        case .cloud: CloudLibraryPage(controller: controller)
                         case .presets: presetsPage
                         case .settings: SettingsView(controller: controller)
                         }
@@ -43,6 +45,7 @@ struct WorkspaceView: View {
         }.foregroundStyle(.white.opacity(0.92)).preferredColorScheme(.dark)
             .onReceive(NotificationCenter.default.publisher(for: .showLibrary)) { _ in page = .library }
             .onReceive(NotificationCenter.default.publisher(for: .showSettings)) { _ in page = .settings }
+            .onReceive(NotificationCenter.default.publisher(for: .showCloud)) { _ in page = .cloud }
             .alert("Shotglass",isPresented: Binding(get: { store.error != nil },set: { if !$0 { store.error = nil } })) {
                 Button("OK") { store.error = nil }
             } message: { Text(store.error ?? "") }
@@ -57,7 +60,7 @@ struct WorkspaceView: View {
                 VStack(alignment: .leading,spacing: 3) { Text("shotglass").font(.system(size: 21,weight: .bold,design: .rounded)); Text("A clearer way to capture").font(.system(size: 9)).foregroundStyle(.secondary) }
             }.padding(.bottom,38)
             Text("WORKSPACE").font(.system(size: 9,weight: .semibold)).tracking(1.8).foregroundStyle(.white.opacity(0.3)).padding(.leading,12).padding(.bottom,12)
-            ForEach(WorkspacePage.allCases) { item in
+            ForEach(WorkspacePage.allCases.filter { $0 != .cloud || CloudSession.isAvailable }) { item in
                 Button { page = item } label: {
                     HStack(spacing: 12) {
                         Image(systemName: item.symbol).font(.system(size: 15)).frame(width: 18)
@@ -262,11 +265,34 @@ struct ClipCard: View {
                     Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([clip.url]) }
                     Button("Open with default app") { NSWorkspace.shared.open(clip.url) }
                     Divider()
+                    if CloudSession.isAvailable {
+                        Button("Upload & copy link") { Task { await controller.uploadClip(clip) } }.disabled(clip.isVideo)
+                        Divider()
+                    }
                     Button("Remove from history") { store.removeFromHistory(clip) }
                 } label: { Image(systemName: "ellipsis").font(.system(size: 11)) }.menuStyle(.borderlessButton).fixedSize()
             }.padding(12)
         }.background(.white.opacity(0.025),in: RoundedRectangle(cornerRadius: 10)).clipShape(RoundedRectangle(cornerRadius: 10)).overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.06)))
             .onDrag { NSItemProvider(contentsOf: clip.url) ?? NSItemProvider() }
-            .task(id: clip.path) { thumbnail = clip.isVideo ? await VideoTools.thumbnail(clip.url) : clip.image }
+            .task(id: clip.path) { thumbnail = clip.isVideo ? await VideoTools.thumbnail(clip.url) : await ThumbnailLoader.load(clip.url,maxPixel: 560) }
+    }
+}
+
+/// Decodes a downsampled thumbnail off the main thread. Library grids otherwise decode every full-size
+/// Retina PNG on the main actor each time a card appears.
+enum ThumbnailLoader {
+    private static let cache: NSCache<NSString,NSImage> = { let c = NSCache<NSString,NSImage>(); c.countLimit = 120; return c }()
+    static func load(_ url: URL,maxPixel: Int) async -> NSImage? {
+        let key = "\(url.path)#\(maxPixel)" as NSString
+        if let hit = cache.object(forKey: key) { return hit }
+        let image: NSImage? = await Task.detached(priority: .utility) {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL,nil) else { return nil }
+            let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,kCGImageSourceCreateThumbnailWithTransform: true,
+                                            kCGImageSourceShouldCacheImmediately: true,kCGImageSourceThumbnailMaxPixelSize: maxPixel]
+            guard let cg = CGImageSourceCreateThumbnailAtIndex(source,0,options as CFDictionary) else { return nil }
+            return NSImage(cgImage: cg,size: .zero)
+        }.value
+        if let image { cache.setObject(image,forKey: key) }
+        return image
     }
 }

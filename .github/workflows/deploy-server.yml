@@ -1,0 +1,42 @@
+name: Deploy server
+on:
+  push:
+    branches: [master]
+    paths: ['server/**', '.github/workflows/deploy-server.yml']
+  workflow_dispatch:
+concurrency: deploy-server
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP: ${{ vars.FLY_APP }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Sync runtime secrets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_AUTH_TOKEN: ${{ secrets.DATABASE_AUTH_TOKEN }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          PUBLIC_BASE_URL: ${{ secrets.SHOTGLASS_API_URL }}
+          # Optional email config; unset values are simply not synced.
+          LETTERMINT_API_TOKEN: ${{ secrets.LETTERMINT_API_TOKEN }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          LETTERMINT_ROUTE: ${{ vars.LETTERMINT_ROUTE }}
+          REQUIRE_EMAIL_VERIFICATION: ${{ vars.REQUIRE_EMAIL_VERIFICATION }}
+        run: |
+          set -euo pipefail
+          for v in FLY_APP DATABASE_URL DATABASE_AUTH_TOKEN CRON_SECRET PUBLIC_BASE_URL; do : "${!v:?Missing $v}"; done
+          printf 'DATABASE_URL=%s\nDATABASE_AUTH_TOKEN=%s\nCRON_SECRET=%s\nPUBLIC_BASE_URL=%s\n' \
+            "$DATABASE_URL" "$DATABASE_AUTH_TOKEN" "$CRON_SECRET" "$PUBLIC_BASE_URL" > "$RUNNER_TEMP/secrets.env"
+          for v in LETTERMINT_API_TOKEN MAIL_FROM LETTERMINT_ROUTE REQUIRE_EMAIL_VERIFICATION; do
+            [[ -n "${!v:-}" ]] && printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/secrets.env"
+          done
+          flyctl secrets import -a "$FLY_APP" --stage < "$RUNNER_TEMP/secrets.env"
+          rm -f "$RUNNER_TEMP/secrets.env"
+      - name: Deploy (single machine, scales to zero)
+        run: flyctl deploy -a "$FLY_APP" --remote-only --ha=false --strategy immediate

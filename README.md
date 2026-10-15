@@ -1,6 +1,6 @@
 # Shotglass
 
-A native Apple Silicon macOS capture utility inspired by CleanShot X, built in Swift, SwiftUI, AppKit, ScreenCaptureKit, Vision, and AVFoundation. Uses macOS Liquid Glass through native `glassEffect`, `GlassEffectContainer`, and glass button styles. No subscription or account required. Direct downloads use Sparkle for updates.
+A native Apple Silicon macOS capture utility inspired by CleanShot X, built in Swift, SwiftUI, AppKit, ScreenCaptureKit, Vision, and AVFoundation. Uses macOS Liquid Glass through native `glassEffect`, `GlassEffectContainer`, and glass button styles. No subscription required; an account is needed only for the optional Shotglass Cloud links. Direct downloads use Sparkle for updates.
 
 ![Shotglass screenshot selector](docs/screenshot.png)
 
@@ -23,6 +23,7 @@ The selector uses clear, nonopaque AppKit panels. macOS renders the actual windo
 - **Choose window:** hover to see a blue outline and tint, the app icon/name, and the window title, then click it. Window positions and front-to-back ordering update during selection. The window is captured independently, without surrounding apps.
 - **Area (default):** your last rectangle is already selected. Drag inside to move it, drag a handle to resize it, or drag outside to replace it. Press Return or click Capture when ready. Moving/resizing never captures on release. When the rectangle overlaps the bottom toolbar, the toolbar fades out in 0.16 seconds and stops intercepting clicks. Move or resize the rectangle clear of the toolbar to fade it back in over 0.2 seconds. The rectangle stays visible, keys 1–5/Return/Escape remain available, and Reduce Motion is respected.
 - **Draw new:** click Draw new or press **N**, then draw anywhere, including inside the old area. Drag or click two corners; hold Shift while dragging for a square. The bar waits for Return/Capture by default. Enable **Options → Snap on draw** to capture and close immediately after drawing a new rectangle, including drawing outside the old area or clicking two corners. The toggle is remembered across launches; moving or resizing an existing area still waits for Capture. The explicit `shotglass://draw` launcher command captures a new area immediately on release. Areas can span displays.
+- **Reset area:** press **X** (or **Delete**, or click the eraser button) to wipe the current rectangle, any half-drawn corner and any drag in progress, and start drawing from scratch. Your saved last area is untouched until a new capture replaces it.
 - **Last area:** capture your previous selection immediately. Choose Last area in the bar to recall and adjust it first. If the saved display was disconnected, the bar brings the rectangle onto the current screen.
 - **Preset area:** enter an exact size in the overlay, or save your last area as a named preset. Selection dimensions are in logical screen points; screenshots preserve the display's native pixel density.
 
@@ -48,12 +49,25 @@ Configure the destination, PNG/JPEG format, clipboard behavior, capture delay, s
 | Choose window | 2 or W |
 | Active window | 4 or V |
 | Recall last area | 5 or R |
+| Reset the draw area | X or Delete |
+| Capture, upload and copy a link | U (configurable) or ⇧Return |
 | Capture | Return |
 | Cancel and quit | Esc |
 | Basic Settings | ⌘, |
 | Library | ⌘L |
 
 There are no system-wide capture shortcuts. If you want a launch shortcut, assign one to the Shotglass command in Raycast; Shotglass itself only needs to run during a capture session. When upgrading, older global-shortcut preferences are ignored and an enabled Shotglass login item is unregistered. Quit older running Shotglass copies to release their previous global shortcuts.
+
+## Shotglass Cloud: links for SSH and chat
+
+Screenshots do not paste across SSH. Shotglass Cloud (direct-download edition only) uploads an image to your private Shotglass backend and puts a short link on the clipboard instead. Paste the link into the terminal, a coding agent, or chat; `curl -L`, browsers and Markdown image embeds all follow it. Links stop working after 30 days and uploads are deleted.
+
+1. Run the backend (see [`server/README.md`](server/README.md)) and sign in under **Settings → Shotglass Cloud**. Use *Server* to point at your deployment; sessions are stored in the macOS Keychain.
+2. Three ways to get a link:
+   - In the capture bar press **U** (change it in Settings) or **⇧Return**, or click the link button: capture → upload → link copied.
+   - **Paste as Link** (`shotglass://paste-upload`): converts the image already on your clipboard (⌃⌘⇧4, a copied file, anything) into a link. Give the Raycast command *Shotglass Paste as Link* a hotkey. The hotkey is configured in Raycast, which keeps Shotglass free of resident processes and global shortcuts.
+   - Library → ⋯ → **Upload & copy link** for an existing capture.
+3. The **Cloud** page lists everything you have uploaded, grouped by day, with expiry countdowns, copy-link and delete.
 
 ## Raycast and launcher integration
 
@@ -70,6 +84,9 @@ open 'shotglass://settings'
 open 'shotglass://fullscreen'
 open 'shotglass://window'
 open 'shotglass://active-window'
+open 'shotglass://upload'        # capture, upload, copy a link
+open 'shotglass://paste-upload'  # upload the clipboard image, copy a link
+open 'shotglass://cloud'         # Library, Cloud page
 ```
 
 The app remembers the foreground application while running and ignores launcher activation, so opening the bar through Raycast preserves the application you were working in for Active Window. URL routing handles both first launch and an already running app. Scripts require the packaged app to be registered with macOS; opening the installed app once does this.

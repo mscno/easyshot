@@ -90,4 +90,47 @@ final class CaptureSessionTests: XCTestCase {
         XCTAssertFalse(SessionActivity.scrolling.shouldExit)
         XCTAssertFalse(SessionActivity([.processing,.recording]).shouldExit)
     }
+    func testResetKeyClearsDrawArea() {
+        XCTAssertEqual(CaptureKeyAction.resolve("x"),.resetArea)
+        XCTAssertEqual(CaptureKeyAction.resolve("X"),.resetArea)
+        XCTAssertNil(CaptureKeyAction.resolve("x",command: true))
+    }
+    func testUploadKeyIsConfigurableButNeverShadowsBuiltInKeys() {
+        XCTAssertEqual(CaptureKeyAction.resolve("u"),.upload)
+        XCTAssertEqual(CaptureKeyAction.resolve("g",uploadKey: "g"),.upload)
+        XCTAssertNil(CaptureKeyAction.resolve("u",uploadKey: "g"))
+        XCTAssertEqual(CaptureKeyAction.resolve("d",uploadKey: "d"),.drawNew)
+        XCTAssertEqual(CaptureKeyAction.sanitizedUploadKey("D"),"u")
+        XCTAssertEqual(CaptureKeyAction.sanitizedUploadKey(""),"u")
+        XCTAssertEqual(CaptureKeyAction.sanitizedUploadKey("G"),"g")
+        XCTAssertEqual(CaptureKeyAction.sanitizedUploadKey(" "),"u")
+    }
+    func testRFC3339ParsesMicrosecondAndPlainTimestamps() {
+        XCTAssertNotNil(RFC3339.parse("2026-10-14T12:30:45.123456Z"))
+        XCTAssertNotNil(RFC3339.parse("2026-10-14T12:30:45Z"))
+        XCTAssertNotNil(RFC3339.parse("2026-10-14T12:30:45.5+02:00"))
+        XCTAssertNil(RFC3339.parse("yesterday"))
+        XCTAssertEqual(RFC3339.parse("2026-10-14T12:30:45.123456Z")?.timeIntervalSince1970 ?? 0,RFC3339.parse("2026-10-14T12:30:45.123Z")?.timeIntervalSince1970 ?? 1,accuracy: 0.001)
+    }
+    func testCloudLibraryGroupsByDay() {
+        var calendar = Calendar(identifier: .gregorian); calendar.timeZone = TimeZone(identifier: "UTC")!
+        let now = RFC3339.parse("2026-10-14T12:00:00Z")!
+        let items = ["2026-10-14T09:00:00Z","2026-10-14T01:00:00Z","2026-10-13T23:00:00Z","2026-10-01T10:00:00Z"].map { RFC3339.parse($0)! }
+        let sections = CloudLibrary.sections(items,date: { $0 },now: now,calendar: calendar)
+        XCTAssertEqual(sections.map(\.title).prefix(2),["Today","Yesterday"])
+        XCTAssertEqual(sections.map(\.items.count),[2,1,1])
+    }
+    func testExpiryText() {
+        let now = Date()
+        XCTAssertEqual(CloudLibrary.expiryText(now.addingTimeInterval(-5),now: now),"Expired")
+        XCTAssertEqual(CloudLibrary.expiryText(now.addingTimeInterval(86_400*12+60),now: now),"Expires in 12 days")
+        XCTAssertEqual(CloudLibrary.expiryText(now.addingTimeInterval(86_400+60),now: now),"Expires in 1 day")
+        XCTAssertEqual(CloudLibrary.expiryText(now.addingTimeInterval(3 * 3_600),now: now),"Expires in 3 hours")
+    }
+    func testShareLinksMustBeHTTP() {
+        XCTAssertNotNil(ShareLink.validated("https://example.com/s/abc.png"))
+        XCTAssertNil(ShareLink.validated("javascript:alert(1)"))
+        XCTAssertNil(ShareLink.validated("file:///etc/passwd"))
+        XCTAssertNil(ShareLink.validated("not a url"))
+    }
 }

@@ -39,6 +39,8 @@ final class Preferences: ObservableObject {
     @Published var lastRegion: SavedRegion? { didSet { save() } }
     @Published var presets: [RegionPreset] { didSet { save() } }
     @Published var selection: CaptureSelection { didSet { save() } }
+    @Published var uploadKey: String { didSet { save() } }
+    @Published var cloudBaseURL: String { didSet { save() } }
 
     private let defaults: UserDefaults
     private let folderAccess: CaptureFolderAccess
@@ -66,6 +68,15 @@ final class Preferences: ObservableObject {
         lastRegion = d.data(forKey: "region").flatMap { try? JSONDecoder().decode(SavedRegion.self,from: $0) }
         presets = d.data(forKey: "presets").flatMap { try? JSONDecoder().decode([RegionPreset].self,from: $0) } ?? []
         selection = d.data(forKey: "captureSelection").flatMap { try? JSONDecoder().decode(CaptureSelection.self,from: $0) } ?? CaptureSelection()
+        uploadKey = CaptureKeyAction.sanitizedUploadKey(d.string(forKey: "uploadKey") ?? "")
+        cloudBaseURL = d.string(forKey: "cloudBaseURL") ?? Bundle.main.object(forInfoDictionaryKey: "ShotglassCloudURL") as? String ?? "http://localhost:8080"
+    }
+    /// Only http(s) server addresses are accepted; plain http is for local development.
+    static func validatedServerURL(_ text: String) -> URL? {
+        var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.hasSuffix("/") { trimmed.removeLast() }
+        guard let url = URL(string: trimmed),let scheme = url.scheme?.lowercased(),scheme == "https" || scheme == "http",url.host != nil else { return nil }
+        return url
     }
     func save() {
         let d = defaults
@@ -78,6 +89,7 @@ final class Preferences: ObservableObject {
         d.set(try? JSONEncoder().encode(lastRegion),forKey: "region")
         d.set(try? JSONEncoder().encode(presets),forKey: "presets")
         d.set(try? JSONEncoder().encode(selection),forKey: "captureSelection")
+        d.set(uploadKey,forKey: "uploadKey"); d.set(cloudBaseURL,forKey: "cloudBaseURL")
     }
     var folderURL: URL {
         folderAccess.restore() ?? URL(fileURLWithPath: (folder as NSString).expandingTildeInPath, isDirectory: true)
@@ -143,19 +155,38 @@ struct Clip: Codable, Identifiable, Equatable {
     func add(_ clip: Clip) { clips.insert(clip,at: 0); persist() }
     func update(_ clip: Clip) { if let i = clips.firstIndex(where: { $0.id == clip.id }) { clips[i] = clip; persist() } }
     func removeFromHistory(_ clip: Clip) { clips.removeAll { $0.id == clip.id }; persist() }
+    nonisolated static func encode(_ image: CGImage,as ext: String) throws -> Data {
+        if ext == "jpg" {
+            guard let jpeg = NSBitmapImageRep(cgImage: image).representation(using: .jpeg,properties: [.compressionFactor: 0.95]) else { throw ShotError.message("Unable to encode screenshot.") }
+            return jpeg
+        }
+        return try ScreenshotPixels.png(image)
+    }
+    /// Same result as `write`, but PNG/JPEG encoding and the disk write run off the main thread so a
+    /// Retina capture never freezes the UI or delays the clipboard.
+    func writeDetached(image: CGImage,kind: String,copyOverride: Bool? = nil) async throws -> Clip {
+        let p = Preferences.shared
+        let ext = p.format
+        let folder = try p.saveToDisk ? p.captureFolder() : support.appendingPathComponent("Captures",isDirectory: true)
+        let url = folder.appendingPathComponent(CaptureFiles.filename(extension: ext))
+        let data = try await Task.detached(priority: .userInitiated) {
+            try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
+            let data = try Self.encode(image,as: ext)
+            try data.write(to: url,options: .atomic)
+            return data
+        }.value
+        let clip = Clip(path: url.path,kind: kind,width: image.width,height: image.height)
+        add(clip)
+        if copyOverride ?? p.copyToClipboard { copy(clip,image: NSImage(cgImage: image,size: .zero),encodedPNG: ext == "png" ? data : nil) }
+        return clip
+    }
     func write(image: CGImage,kind: String,destination: URL? = nil,copyOverride: Bool? = nil) throws -> Clip {
         let p = Preferences.shared
         let ext = p.format
         let folder = try destination ?? (p.saveToDisk ? p.captureFolder() : support.appendingPathComponent("Captures",isDirectory: true))
         try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
         let url = folder.appendingPathComponent(CaptureFiles.filename(extension: ext))
-        let data: Data
-        if ext == "jpg" {
-            guard let jpeg = NSBitmapImageRep(cgImage: image).representation(using: .jpeg,properties: [.compressionFactor: 0.95]) else { throw ShotError.message("Unable to encode screenshot.") }
-            data = jpeg
-        } else {
-            data = try ScreenshotPixels.png(image)
-        }
+        let data = try Self.encode(image,as: ext)
         try data.write(to: url,options: .atomic)
         let clip = Clip(path: url.path,kind: kind,width: image.width,height: image.height)
         add(clip)

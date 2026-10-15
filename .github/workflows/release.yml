@@ -87,6 +87,7 @@ jobs:
         env:
           SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
           NOTARY_TIMEOUT: 90m
+          SHOTGLASS_CLOUD_URL: ${{ secrets.SHOTGLASS_API_URL }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           set -euo pipefail

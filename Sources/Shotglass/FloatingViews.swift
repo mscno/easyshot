@@ -130,3 +130,23 @@ struct VideoEditorView: View {
         }
     }
 }
+
+/// A brief, click-through confirmation for background work such as uploads.
+struct ToastView: View {
+    let text: String
+    let symbol: String
+    var detail: String?
+    var spinner = false
+    var body: some View {
+        HStack(spacing: 10) {
+            if spinner { ProgressView().controlSize(.small) }
+            else { Image(systemName: symbol).font(.system(size: 16,weight: .medium)) }
+            VStack(alignment: .leading,spacing: 2) {
+                Text(text).font(.system(size: 13,weight: .semibold))
+                if let detail { Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle).frame(maxWidth: 340,alignment: .leading) }
+            }
+        }.padding(.horizontal,16).padding(.vertical,11).fixedSize()
+            .glassEffect(.regular,in: RoundedRectangle(cornerRadius: 16)).padding(8)
+            .accessibilityElement(children: .combine)
+    }
+}

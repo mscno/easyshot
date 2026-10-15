@@ -22,6 +22,7 @@
     <key>NSMicrophoneUsageDescription</key><string>Shotglass records your microphone when you enable voice recording.</string>
     <key>NSCameraUsageDescription</key><string>Shotglass adds your webcam to recordings when you enable the camera bubble.</string>
     <key>NSScreenCaptureUsageDescription</key><string>Shotglass captures screenshots and recordings you choose, saving them locally.</string>
+    <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
     <key>NSHumanReadableCopyright</key><string>Shotglass · 2026</string>
 
     <key>SUFeedURL</key><string>https://github.com/mscno/shotglass/releases/latest/download/appcast.xml</string>
