@@ -10,7 +10,7 @@ A native Apple Silicon macOS capture utility inspired by CleanShot X, built in S
 
 Source repository: [mscno/shotglass](https://github.com/mscno/shotglass) (public).
 
-Open `dist/Easyshot.app`. Launching or reopening the app shows a compact Liquid Glass capture bar at the bottom of the current display. The capture bar and transparent selector open together, without waiting for desktop frames. Escape works throughout startup. The last capture mode and area are remembered across launches. There is no Dock icon, persistent menu-bar item, global hotkey registration, or login launch. Capture or cancel ends the session and exits the process. Settings and Library open only when requested. If you enable the optional thumbnail, Easyshot exits after it disappears; explicitly opened editors, pins, recordings, and library windows keep the session active until finished.
+Open `dist/Easyshot.app`. Launching or reopening the app shows a compact Liquid Glass capture bar at the bottom of the current display. The capture bar and transparent selector open together, without waiting for desktop frames. Escape works throughout startup. The last capture mode and area are remembered across launches. There is no Dock icon, persistent menu-bar item, global hotkey registration, or login launch. Capture or cancel ends the session and exits the process. Settings and Library open only when requested. Quick Access cards keep the session until the last one closes; explicitly opened editors, pins, recordings, and library windows keep it active until finished.
 
 For a permanent installation, copy the app to `/Applications` or `~/Applications` before enabling permissions. Requires an Apple Silicon Mac (M1 or newer) running macOS 26 or later. Intel builds are intentionally excluded.
 
@@ -28,16 +28,21 @@ The selector uses clear, nonopaque AppKit panels. macOS renders the actual windo
 - **Reset area:** press **X** (or **Delete**, or click the eraser button) to wipe the current rectangle, any half-drawn corner and any drag in progress, and start drawing from scratch. Your saved last area is untouched until a new capture replaces it.
 - **Last area:** capture your previous selection immediately. Choose Last area in the bar to recall and adjust it first. If the saved display was disconnected, the bar brings the rectangle onto the current screen.
 - **Preset area:** enter an exact size in the overlay, or save your last area as a named preset. Selection dimensions are in logical screen points; screenshots preserve the display's native pixel density.
+- **Aspect lock:** **Options → Aspect** keeps drawn, two-corner and resized areas at 16:9, 4:3, 1:1 or 9:16. Corners keep the opposite corner fixed; edges grow symmetrically. Shift still draws a square.
+- **Capture Text:** press **T** (or the text button, `easyshot://capture-text`, or the *Capture Text* App Intent) to switch the bar to text. Return recognizes text and QR codes on device, in reading order, copies them and shows a toast. No file or history entry is made unless **Settings → Keep a screenshot when capturing text** is on.
+- **Magnifier:** press **M** for a crosshair and pixel loupe with display coordinates in points and pixels, the selection size and the sRGB hex color under the pointer; **C** copies the color. The setting is remembered. While it is on, Easyshot takes 21×21-pixel captures of the area under the pointer, one at a time and at most once per display frame, with Easyshot's own windows excluded. While it is off, nothing is sampled.
+- **Freeze screen:** **Options → Freeze screen** takes one still of each display as the selector opens and shows it instead of the live desktop, so menus, hover states and tooltips stay put. Area and screen captures use those stills; window captures stay live. A capture timer ignores the stills.
+- **Window backgrounds:** **Settings → Window background** wraps window captures in padding over the desktop wallpaper, a gradient, a solid color or transparency, at the capture's native pixels. The window shadow toggle applies as before. Composition runs off the main thread.
 
 Open Easyshot from Applications, Spotlight, or Raycast. The numbered mode icons match **1–5 from left to right: Full screen, Choose window, Area, Active window, Last area**. While the capture bar is focused, press **A** for area, **D/N** to draw a new rectangle, **F/S** for full screen, **W** for a window, **V** for the active window, or **R** to recall the last area. **Return** captures; **Esc** cancels and quits. **Tab/Shift-Tab** cycles modes and **Space** toggles area/window. **⌘L** opens Library; **⌘,** opens basic Settings. Arrow keys move an existing region by one point; Shift-arrow moves it by ten. These keys never intercept typing in another application.
 
-The compact icon toolbar follows [Apple's Screenshot panel](https://support.apple.com/guide/mac-help/mh26782/mac): screen/window/area first, additional tools in a second group, then Options and Capture. It uses system light/dark appearance, native Liquid Glass, neutral selection highlights, and alternating black/white dashed region borders with larger circular resize handles, and a camera pointer for window capture. Options contains the timer, exact size, saved areas, clipboard and folder toggles, Snap on draw, Quick Preview, Settings, and Library. Hover a mode or button for its name, shortcut and a short explanation. Tooltips appear after a brief delay above the capture overlay, follow the currently hovered control, and never steal focus or intercept clicks.
+The compact icon toolbar follows [Apple's Screenshot panel](https://support.apple.com/guide/mac-help/mh26782/mac): screen/window/area first, additional tools in a second group, then Options and Capture. It uses system light/dark appearance, native Liquid Glass, neutral selection highlights, and alternating black/white dashed region borders with larger circular resize handles, and a camera pointer for window capture. Options contains the timer, exact size, aspect lock, saved areas, clipboard and folder toggles, Snap on draw, After capture, Magnifier, Freeze screen, Settings, and Library. Hover a mode or button for its name, shortcut and a short explanation. Tooltips appear after a brief delay above the capture overlay, follow the currently hovered control, and never steal focus or intercept clicks.
 
 Every screenshot saves as **PNG** to **`~/Documents/Screenshots`** and copies to the clipboard by default. The clipboard includes both the image and its file URL, allowing image pasting and file pasting. Recordings use a file URL; GIFs also include their animated GIF data. Filenames include milliseconds and a unique suffix to prevent rapid captures from overwriting each other.
 
 Still captures use macOS's native screenshot dimensions. Area captures crop integer pixels from the native display image without resizing; window captures retain the full window and optional shadow without fitting them into a smaller video surface. PNG exports preserve the original pixel dimensions, transparency and color profile. A selection measured in points produces twice as many pixels on a 2× Retina display. Mixed-density captures use the highest density among the captured displays, with no smoothing when combining them. JPEG export and an explicit editor Resize remain separate choices. Existing blurred captures must be taken again; PNG encoding cannot restore detail lost during an earlier capture.
 
-Enable **Options → Quick Preview · 3 seconds** to show a small thumbnail sliding into the bottom right. It stays for three seconds, slides out in 0.14 seconds, and then the app quits when the session is otherwise idle. Click the thumbnail to open the editor. Rapid captures replace the thumbnail and restart its timer; every completed capture keeps its own file, while the clipboard holds the latest. Relaunching during an active capture queues the newest request until the current write finishes. No background service, daemon, or login item is used.
+After each capture a **Quick Access** card slides into the corner of the display you captured. This is the default, under **Options → After capture**. Each card is a nonactivating Liquid Glass panel. Its actions are Copy, Save As, Annotate, Upload & copy link (when signed in to Easyshot Cloud), Pin and Copy Text. Recordings show their duration and offer Trim and GIF instead. Drag the thumbnail into any app to drop the file, or click it to annotate or trim. Up to five cards stack upward; older ones close. Cards close after 5 seconds by default; choose 3 or 10 seconds or Never in Settings. Hovering any card pauses every timer. A horizontal trackpad swipe dismisses a card. `easyshot://restore-overlay`, the *Restore Last Quick Access Card* App Intent or the Raycast command brings back the most recently closed card, even from an earlier session. The app quits when the last card closes and nothing else is open. Choose **Thumbnail · 3 seconds** for the previous small click-to-edit preview, or **Nothing**. Every completed capture keeps its own file, while the clipboard holds the latest. Relaunching during an active capture queues the newest request until the current write finishes. No background service, daemon, or login item is used.
 
 Configure the destination, PNG/JPEG format, clipboard behavior, capture delay, shadows, cursor, and recording settings in Settings. With folder saving disabled, captures remain in an internal history directory. Removing an item from history preserves its file.
 
@@ -52,13 +57,20 @@ Configure the destination, PNG/JPEG format, clipboard behavior, capture delay, s
 | Active window | 4 or V |
 | Recall last area | 5 or R |
 | Reset the draw area | X or Delete |
+| Capture Text on/off | T |
+| Magnifier on/off | M |
+| Copy the color under the magnifier | C |
 | Capture, upload and copy a link | U (configurable) or ⇧Return |
 | Capture | Return |
 | Cancel and quit | Esc |
 | Basic Settings | ⌘, |
 | Library | ⌘L |
 
-There are no system-wide capture shortcuts. If you want a launch shortcut, assign one to the Easyshot command in Raycast; Easyshot itself only needs to run during a capture session. When upgrading, older global-shortcut preferences are ignored and an enabled Easyshot login item is unregistered. Quit older running Easyshot copies to release their previous global shortcuts.
+### Global shortcuts without a resident process
+
+Easyshot registers no global hotkeys and keeps no process running. Instead it ships **App Intents**: Capture Area, Capture Window, Capture Full Screen, Capture Text, Repeat Last Area, Record Screen, Open Library, and Restore Last Quick Access Card. They appear in the Shortcuts app and in Spotlight once the app has been opened. To bind a key, add one to a shortcut in **Shortcuts → (shortcut) → Details → Add Keyboard Shortcut**, or to the action in Spotlight's quick-key settings. macOS launches Easyshot for the action, and it quits afterwards as usual. Raycast hotkeys on the script commands work the same way. Each intent takes the same route as its launcher URL. `scripts/build-app.sh` extracts the intents' `Metadata.appintents` with Xcode's `appintentsmetadataprocessor`, because SwiftPM does not.
+
+When upgrading, older global-shortcut preferences are ignored and an enabled Easyshot login item is unregistered. Quit older running Easyshot copies to release their previous global shortcuts.
 
 ## Easyshot Cloud: links for SSH and chat
 
@@ -73,7 +85,7 @@ Screenshots do not paste across SSH. Easyshot Cloud (direct-download edition onl
 
 ## Raycast and launcher integration
 
-Install Easyshot in `~/Applications` or `/Applications`. Add **`integrations/raycast`** through **Raycast Settings → Extensions → + → Add Script Directory**, then type **shot** to find the capture bar, Draw New Area, Repeat Area, and Library commands. See [Raycast's Script Commands instructions](https://github.com/raycast/script-commands#install-script-commands-from-this-repository). The main Easyshot command opens the bottom bar with your last mode selected. You can assign it the alias `shot` in Raycast.
+Install Easyshot in `~/Applications` or `/Applications`. Add **`integrations/raycast`** through **Raycast Settings → Extensions → + → Add Script Directory**, then type **shot** to find the capture bar, Draw New Area, Repeat Area, Capture Text, Restore Last Capture, and Library commands. See [Raycast's Script Commands instructions](https://github.com/raycast/script-commands#install-script-commands-from-this-repository). The main Easyshot command opens the bottom bar with your last mode selected. You can assign it the alias `shot` in Raycast.
 
 The app also handles these URLs, usable from Raycast Quicklinks, Shortcuts, or `open`:
 
@@ -89,6 +101,9 @@ open 'easyshot://active-window'
 open 'easyshot://upload'        # capture, upload, copy a link
 open 'easyshot://paste-upload'  # upload the clipboard image, copy a link
 open 'easyshot://cloud'         # Library, Cloud page
+open 'easyshot://capture-text'  # select an area, copy its text and QR codes
+open 'easyshot://record'        # select an area to record, or stop recording
+open 'easyshot://restore-overlay' # reopen the last closed Quick Access card
 open 'easyshot://edit?path=/absolute/file.png'  # open a file in the editor
 ```
 
@@ -106,7 +121,7 @@ See [docs/MCP.md](docs/MCP.md) for Codex and Claude Desktop configuration, tools
 
 ## Included tools
 
-- Optional three-second animated thumbnail with click-to-edit. Copy, pin, OCR, sharing, and Finder reveal are available in the Library.
+- Quick Access cards after every capture (or an optional three-second thumbnail). Copy, pin, OCR, sharing, and Finder reveal are also available in the Library.
 - Searchable persistent local history, including recognized text, screenshot/recording filters, and import.
 - Named reusable region presets and a capture timer.
 - Annotation editor: arrows, lines, rectangles, ellipses, freehand drawing, highlights, text, numbered steps, solid redaction, pixelation, blur, spotlight, crop, proportional resize, rotation, flip, and undo/redo.
@@ -118,14 +133,14 @@ See [docs/MCP.md](docs/MCP.md) for Codex and Claude Desktop configuration, tools
 - MP4 recording of a screen, window, or region, with selectable frame rate, cursor, system audio, microphone, webcam bubble, click highlights, and command shortcut captions.
 - **Studio recordings** (Settings → Recording → Studio): the cursor is hidden while recording and its position, clicks, keystroke timing (never key identities) and shape are logged to a hidden `.<name>.mp4.easyshot-cursor.json` sidecar; frames stay a passthrough, so capture costs the same as a plain recording. No Accessibility or Input Monitoring access is needed. Opening the recording adds a Studio panel: automatic zooms on clicks and typing bursts, a timeline strip (drag to add a zoom, click one to remove it), a spring-smoothed, enlarged cursor that dips on click, optional zoom motion blur, gradient/colour/wallpaper/custom-image backgrounds with padding, rounded corners and shadow. Preview and export use the same Core Image graph on the GPU; static layers render once per plan. Export at source, 1080p or 4K (never upscaled) in H.264 or HEVC, keeping audio and the trim range. Edits save to a `.easyshot-studio.json` sidecar.
 - Microphone/system-audio mixing for playback, trimming, GIF export, and native video sharing. GIFs export at 10 fps and a maximum dimension of 960 pixels, with a two-minute duration limit.
-- Scrolling screenshots with overlap detection and duplicate rejection. Select only the moving content, excluding fixed headers. Scroll manually and add frames, or enable automatic scrolling. Finish saves and copies the combined image. Auto scrolling is bounded to avoid unbounded captures.
+- Scrolling screenshots, vertical or horizontal (choose the direction before the second frame), with overlap detection and duplicate rejection. Horizontal frames are turned a quarter turn through the same matcher. Select only the moving content, excluding fixed headers. Scroll manually and add frames, or enable automatic scrolling. Finish saves and copies the combined image. Auto scrolling is bounded to avoid unbounded captures.
 - Desktop-icon exclusion from display captures.
 
 ## Scope and limitations
 
 This is an independent local implementation, with its own interface and assets. It does not connect to CleanShot accounts or copy CleanShot's private services or proprietary project format.
 
-CleanShot Cloud hosting, team comments, transcripts, SSO/SCIM, and domain management are not implemented. Sharing uses the native macOS share sheet or file drag and drop. The video editor supports trim, GIF export and Studio zoom/cursor/background export; it has no multi-clip timeline, cuts, speed changes or 3D scenes. Studio typing zooms aim at the last click because the caret position is not recorded. Window recordings map the cursor to the window's frame at the start, so moving the window during a Studio recording offsets the cursor. Studio recordings saved without Studio export have no cursor. The capture overlay does not yet provide a magnifier. Image combination currently stacks images vertically. Scrolling capture currently supports vertical content and depends on sufficient overlap; animations and fixed elements can prevent matching. Recording a region spanning several monitors records the display containing the largest part of that region; screenshots can span monitors.
+CleanShot Cloud hosting, team comments, transcripts, SSO/SCIM, and domain management are not implemented. Sharing uses the native macOS share sheet or file drag and drop. The video editor supports trim, GIF export and Studio zoom/cursor/background export; it has no multi-clip timeline, cuts, speed changes or 3D scenes. Studio typing zooms aim at the last click because the caret position is not recorded. Window recordings map the cursor to the window's frame at the start, so moving the window during a Studio recording offsets the cursor. Studio recordings saved without Studio export have no cursor. Image combination currently stacks images vertically. Scrolling capture depends on sufficient overlap; animations and fixed elements can prevent matching. Horizontal scrolling captures are limited to 19,000 pixels wide. Recording a region spanning several monitors records the display containing the largest part of that region; screenshots can span monitors.
 
 ## Build from source
 

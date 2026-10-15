@@ -212,6 +212,11 @@ import ScreenCaptureKit
         check(fresh.copyToClipboard && fresh.saveToDisk && fresh.format == "png","fresh install saves PNG and copies to clipboard")
         check(fresh.selection == CaptureSelection() && !fresh.showPreview,"fresh install starts in area mode and exits without preview")
         check(!fresh.snapOnDraw,"snap on draw is off by default")
+        check(fresh.postCapture == .overlay && fresh.quickAccessAutoClose == 5 && !fresh.magnifier && !fresh.freezeScreen && fresh.aspectLock == .free && fresh.windowBackground == .none && !fresh.saveCapturedText,"fresh install shows Quick Access cards; magnifier, freeze, aspect lock, window background and text screenshots are off")
+        fresh.aspectLock = .wide; fresh.postCapture = .thumbnail; fresh.quickAccessAutoClose = 0
+        let reloaded = Preferences(defaults: defaults)
+        check(reloaded.aspectLock == .wide && reloaded.postCapture == .thumbnail && reloaded.quickAccessAutoClose == 0,"capture preferences persist across launches")
+        fresh.aspectLock = .free; fresh.postCapture = .overlay
         fresh.snapOnDraw = true
         check(Preferences(defaults: defaults).snapOnDraw,"snap on draw persists across launches")
         fresh.selection = CaptureSelection(mode: .window)
@@ -328,6 +333,47 @@ import ScreenCaptureKit
             view.mouseDown(with: event(.leftMouseDown,100,100))
             view.mouseDragged(with: event(.leftMouseDragged,102,102)); view.mouseUp(with: event(.leftMouseUp,102,102))
             check(captures == 3 && selector.onComplete != nil,"tiny invalid rectangles never snap or dismiss the selector")
+            fresh.snapOnDraw = false; fresh.aspectLock = .wide; armDraw(); selector.drawNew()
+            view.mouseDown(with: event(.leftMouseDown,500,400))
+            view.mouseDragged(with: event(.leftMouseDragged,660,430)); view.mouseUp(with: event(.leftMouseUp,660,430))
+            check(abs(selector.state.rect.width/selector.state.rect.height-16.0/9) < 0.01 && selector.state.rect.width == 160,"aspect lock keeps a dragged rectangle at 16:9")
+            fresh.aspectLock = .free
+            let textKey = NSEvent.keyEvent(with: .keyDown,location: .zero,modifierFlags: [],timestamp: 0,windowNumber: bar.windowNumber,context: nil,characters: "t",charactersIgnoringModifiers: "t",isARepeat: false,keyCode: 17)!
+            _ = bar.performKeyEquivalent(with: textKey); let textOn = selector.state.isText
+            _ = bar.performKeyEquivalent(with: textKey)
+            check(textOn && selector.state.purpose == "Screenshot","T toggles Capture Text and back")
+            fresh.snapOnDraw = true
+            // Freeze + magnifier offscreen: a synthetic still stands in for the display, so nothing is captured.
+            let scale = screen.backingScaleFactor
+            if let still = CGContext(data: nil,width: Int(screen.frame.width*scale),height: Int(screen.frame.height*scale),bitsPerComponent: 8,bytesPerRow: 0,space: CGColorSpace(name: CGColorSpace.sRGB)!,bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                still.setFillColor(CGColor(srgbRed: 0.2,green: 0.4,blue: 0.8,alpha: 1)); still.fill(CGRect(x: 0,y: 0,width: still.width,height: still.height))
+                selector.frozen = [screen.displayID: still.makeImage()!]
+                fresh.magnifier = true; selector.state.mode = .area
+                selector.pointer = CGPoint(x: screen.frame.midX,y: screen.frame.midY)
+                selector.sampler.request(selector.pointer)
+                check(selector.magnifierActive && selector.sampler.hex == "#3366CC","magnifier samples the frozen still and reports the sRGB color under the crosshair")
+                if let drawing = EditorModel.context(width: Int(view.bounds.width),height: Int(view.bounds.height)) {
+                    NSGraphicsContext.current = NSGraphicsContext(cgContext: drawing,flipped: false)
+                    let started = ProcessInfo.processInfo.systemUptime
+                    for _ in 0..<10 { view.draw(view.bounds) }
+                    let perDraw = (ProcessInfo.processInfo.systemUptime-started)*100
+                    NSGraphicsContext.current = nil
+                    let rep = NSBitmapImageRep(cgImage: drawing.makeImage()!)
+                    let inside = selector.state.rect.offsetBy(dx: -screen.frame.minX,dy: -screen.frame.minY)
+                    let sample = rep.colorAt(x: Int(inside.midX)+7,y: Int(view.bounds.height-inside.midY)+7)?.usingColorSpace(.sRGB)
+                    check(abs((sample?.blueComponent ?? 0)-0.8) < 0.03 && (sample?.alphaComponent ?? 0) > 0.99,"frozen still fills the selection with its own pixels")
+                    print(String(format: "PERF: full-display redraw with frozen still, crosshair and loupe: %.2f ms",perDraw))
+                    // A pointer move repaints two thin crosshair strips and the loupe, mirroring invalidatePointer.
+                    let p = CGPoint(x: selector.pointer.x-screen.frame.minX,y: selector.pointer.y-screen.frame.minY)
+                    let dirty = [CGRect(x: p.x-2,y: 0,width: 5,height: view.bounds.height),CGRect(x: 0,y: p.y-2,width: view.bounds.width,height: 5),PixelLoupe.placement(pointer: p,size: MagnifierChrome.loupeSize,in: view.bounds).insetBy(dx: -3,dy: -3)]
+                    NSGraphicsContext.current = NSGraphicsContext(cgContext: drawing,flipped: false)
+                    let moveStarted = ProcessInfo.processInfo.systemUptime
+                    for _ in 0..<50 { drawing.saveGState(); drawing.clip(to: dirty); view.draw(dirty.reduce(CGRect.null) { $0.union($1) }); drawing.restoreGState() }
+                    NSGraphicsContext.current = nil
+                    print(String(format: "PERF: pointer-move repaint with magnifier on: %.2f ms",(ProcessInfo.processInfo.systemUptime-moveStarted)*20))
+                }
+                fresh.magnifier = false; selector.frozen = [:]; selector.sampler.reset()
+            }
             selector.state.mode = .fullscreen; selector.changeMode()
             selector.state.mode = .area; selector.changeMode()
             check(selector.captureOnDraw,"changing modes preserves the snap-on-draw preference")
@@ -355,6 +401,22 @@ import ScreenCaptureKit
         ("Easyshot 2026" as NSString).draw(at: CGPoint(x: 45,y: 170),withAttributes: [.font: NSFont.systemFont(ofSize: 45,weight: .semibold),.foregroundColor: NSColor.black])
         NSGraphicsContext.current = nil
         let image = context.makeImage()!
+        if let screen = NSScreen.screens.first,(try? FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)) != nil,let png = try? ScreenshotPixels.png(image) {
+            let first = Clip(path: folder.appendingPathComponent("card-1.png").path,kind: "Test",width: 500,height: 320)
+            let second = Clip(path: folder.appendingPathComponent("card-2.png").path,kind: "Test",width: 500,height: 320)
+            try? png.write(to: first.url); try? png.write(to: second.url)
+            let cards = QuickAccess(controller: app); app.quickAccess = cards
+            cards.show(first,on: screen); cards.show(second,on: screen)
+            check(cards.cardCount == 2 && app.sessionActivity.contains(.preview) && !app.sessionActivity.shouldExit,"Quick Access cards keep the on-demand session alive")
+            try? await Task.sleep(for: .milliseconds(400))
+            if let a = cards.frame(of: first.id),let b = cards.frame(of: second.id) {
+                check(b.maxX <= screen.visibleFrame.maxX && b.minY < a.minY && screen.visibleFrame.contains(a),"newest card sits in the display corner with older cards stacked above")
+            } else { check(false,"Quick Access cards have panels") }
+            cards.close(second.id); cards.close(first.id)
+            check(!cards.isActive && !app.sessionActivity.contains(.preview),"closing the last card releases the session so Easyshot can quit")
+            check(cards.restore() && cards.cardCount == 1 && cards.frame(of: first.id) != nil,"the most recently closed card can be restored")
+            cards.closeAll(); app.quickAccess = nil
+        } else { check(false,"Quick Access test files") }
         let original = Clip(path: folder.appendingPathComponent("original.png").path,kind: "Test",width: 500,height: 320)
         let editor = EditorModel(image: image,clip: original,store: store)
         editor.add(Mark(tool: .redact,points: [CGPoint(x: 30,y: 30),CGPoint(x: 130,y: 80)],color: [1,0,0,1],width: 6))

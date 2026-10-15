@@ -18,6 +18,7 @@ import EasyshotCore
     init(controller: AppController) { self.controller = controller }
     var isActive: Bool { !stack.isEmpty }
     var cardCount: Int { stack.cards.count }
+    func frame(of id: UUID) -> CGRect? { panels[id]?.frame }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
     private var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
     private func syncAutoClose() {
