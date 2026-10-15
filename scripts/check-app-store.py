@@ -28,7 +28,7 @@ require(not args.ready or args.app is not None, "--ready also requires --app for
 for field, limit in (("name", 30), ("subtitle", 30), ("keywords", 100)):
     require(0 < len(metadata[field]) <= limit, f"{field} must contain 1–{limit} characters")
 require(len((draft / "description.txt").read_text()) <= 4000, "Description exceeds 4,000 characters")
-require(metadata["bundleId"] == "no.paraply.shotglass", "Unexpected bundle ID")
+require(metadata["bundleId"] == "no.paraply.easyshot", "Unexpected bundle ID")
 require(metadata["price"] == "FREE", "Listing must be free")
 require(metadata["architecture"] == "arm64", "Only Apple Silicon is supported")
 require(metadata["minimumMacOS"] == "26.0", "Expected macOS 26 minimum")
@@ -81,7 +81,7 @@ for filename in screenshots:
 manifest = plistlib.loads((ROOT / "Resources/PrivacyInfo.xcprivacy").read_bytes())
 require(manifest["NSPrivacyTracking"] is False, "Manifest enables tracking")
 require(not manifest["NSPrivacyCollectedDataTypes"], "Manifest declares data collection")
-entitlements = plistlib.loads((ROOT / "Resources/Shotglass-AppStore.entitlements").read_bytes())
+entitlements = plistlib.loads((ROOT / "Resources/Easyshot-AppStore.entitlements").read_bytes())
 require(entitlements.get("com.apple.security.app-sandbox") is True, "Missing App Sandbox entitlement")
 allowed = {"com.apple.security.app-sandbox", "com.apple.security.files.user-selected.read-write", "com.apple.security.files.bookmarks.app-scope", "com.apple.security.device.audio-input", "com.apple.security.device.camera"}
 require(set(entitlements) == allowed, "Unexpected Store entitlements; review permissions")

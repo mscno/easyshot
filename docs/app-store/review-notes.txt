@@ -1,4 +1,4 @@
-Shotglass is an on-demand screenshot and screen-recording utility. No login or account is needed.
+Easyshot is an on-demand screenshot and screen-recording utility. No login or account is needed.
 
 Requires an Apple Silicon Mac running macOS 26 or later. Launching the app opens a small capture toolbar; it intentionally has no Dock icon and exits when the capture session is finished. Relaunch from Applications or Spotlight. Escape closes the capture session. The library and Settings remain available from the toolbar.
 

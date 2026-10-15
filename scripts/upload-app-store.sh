@@ -13,7 +13,7 @@ if [[ "${1:-}" == --upload ]]; then ACTION=--upload-app; shift; fi
 SIGNATURE="$(pkgutil --check-signature "$1")"
 [[ "$SIGNATURE" == *"3rd Party Mac Developer Installer:"* && "$SIGNATURE" == *"(93627F7C77)"* ]] || { echo 'Expected a Paraply-signed Mac App Store installer package.' >&2; exit 1; }
 umask 077
-KEY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shotglass-store-key.XXXXXX")"
+KEY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easyshot-store-key.XXXXXX")"
 trap 'rm -rf "$KEY_DIR"' EXIT
 cp "$APP_STORE_API_KEY_PATH" "$KEY_DIR/AuthKey_$APP_STORE_API_KEY_ID.p8"
 API_PRIVATE_KEYS_DIR="$KEY_DIR" xcrun altool "$ACTION" -f "$1" -t macos \

@@ -1,4 +1,4 @@
-# Shotglass 1.6.0 performance review
+# Easyshot 1.6.0 performance review
 
 Focus: native rendering over video/games, selector startup, window hover and capture completion. Apple Silicon only; macOS 26.6.1; two connected displays. No resident service was added.
 
@@ -6,7 +6,7 @@ Focus: native rendering over video/games, selector startup, window hover and cap
 
 The previous opaque selector replayed the desktop through 30 fps ScreenCaptureKit streams. Capturing, converting and displaying desktop frames introduced latency, limited visible frame rate and could show black/stale frames or affect the underlying application's visibility. It was the wrong architecture for a selection overlay.
 
-1.6.0 removes `LiveDesktop.swift`, selector snapshots, preview streams, retained desktop images and Refresh Desktop. The selector uses nonopaque, clear, nonactivating AppKit panels. macOS composes the actual underlying windows directly. Shotglass renders borders, handles, a translucent window tint and outside dimming; selected area/screen interiors have zero alpha. Native input acceptance remains enabled independently of visual alpha. Nonactivating panels accept local keys while leaving the underlying application active.
+1.6.0 removes `LiveDesktop.swift`, selector snapshots, preview streams, retained desktop images and Refresh Desktop. The selector uses nonopaque, clear, nonactivating AppKit panels. macOS composes the actual underlying windows directly. Easyshot renders borders, handles, a translucent window tint and outside dimming; selected area/screen interiors have zero alpha. Native input acceptance remains enabled independently of visual alpha. Nonactivating panels accept local keys while leaving the underlying application active.
 
 Screen/area startup neither enumerates shareable content nor captures pixels. Window modes refresh metadata to identify targets. ScreenCaptureKit is still used when a screenshot or recording is explicitly requested.
 

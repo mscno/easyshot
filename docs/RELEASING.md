@@ -1,19 +1,19 @@
-# Releasing Shotglass
+# Releasing Easyshot
 
 The release path builds an Apple Silicon app, signs with **Developer ID Application** and Hardened Runtime, notarizes and staples the app, builds a Finder disk image with the app and an Applications shortcut, then signs, notarizes and staples the DMG. Final signature, ticket and Gatekeeper checks must pass before the DMG and checksum are uploaded as an Actions artifact. Creating a versioned draft release is optional. No Mac App Store submission or installer package is involved.
 
-Shotglass's bundle ID is `no.paraply.shotglass`. The app bundle, code-signing identifier and Raycast launch commands use this ID. Changing the bundle ID does not require a new Developer ID certificate or notarization API key.
+Easyshot's bundle ID is `no.paraply.easyshot`. The app bundle, code-signing identifier and Raycast launch commands use this ID. Changing the bundle ID does not require a new Developer ID certificate or notarization API key.
 
-Shotglass releases use **Paraply Ventures AS**, Apple developer team `93627F7C77`, with signing identity `Developer ID Application: Paraply Ventures AS (93627F7C77)`. The GitHub secrets are configured for this team.
+Easyshot releases use **Paraply Ventures AS**, Apple developer team `93627F7C77`, with signing identity `Developer ID Application: Paraply Ventures AS (93627F7C77)`. The GitHub secrets are configured for this team.
 
-On the configured Mac, signing credentials are stored outside the repository in `$HOME/Library/Application Support/Shotglass/Signing/Paraply-93627F7C77`. The notarization profile is `shotglass-paraply` in that directory's `shotglass-signing.keychain-db`. For a local release, unlock this dedicated keychain, then set:
+On the configured Mac, signing credentials are stored outside the repository in `$HOME/Library/Application Support/Easyshot/Signing/Paraply-93627F7C77`. The notarization profile is `easyshot-paraply` in that directory's `easyshot-signing.keychain-db`. For a local release, unlock this dedicated keychain, then set:
 
 ```sh
-SHOTGLASS_SIGNING_DIR="$HOME/Library/Application Support/Shotglass/Signing/Paraply-93627F7C77"
-security unlock-keychain -p "$(cat "$SHOTGLASS_SIGNING_DIR/keychain-password")" \
-  "$SHOTGLASS_SIGNING_DIR/shotglass-signing.keychain-db"
+EASYSHOT_SIGNING_DIR="$HOME/Library/Application Support/Easyshot/Signing/Paraply-93627F7C77"
+security unlock-keychain -p "$(cat "$EASYSHOT_SIGNING_DIR/keychain-password")" \
+  "$EASYSHOT_SIGNING_DIR/easyshot-signing.keychain-db"
 export SIGNING_IDENTITY='Developer ID Application: Paraply Ventures AS (93627F7C77)'
-export SIGNING_KEYCHAIN="$SHOTGLASS_SIGNING_DIR/shotglass-signing.keychain-db"
+export SIGNING_KEYCHAIN="$EASYSHOT_SIGNING_DIR/easyshot-signing.keychain-db"
 export NOTARY_KEYCHAIN="$SIGNING_KEYCHAIN"
 export NOTARY_PROFILE=shotglass-paraply
 ```
@@ -40,7 +40,7 @@ Signing and notarization avoid the unidentified-developer/cannot-check-for-malic
      --team-id 'YOUR_TEAM_ID'
    ```
 
-   `notarytool` prompts for the app-specific password and validates it. Your normal Apple Account password is not used. The profile name `shotglass` contains the notarization credentials, not the signing certificate. [Apple's command-line guide](https://developer.apple.com/documentation/technotes/tn3147-migrating-to-the-latest-notarization-tool) describes this setup.
+   `notarytool` prompts for the app-specific password and validates it. Your normal Apple Account password is not used. The profile name `easyshot` contains the notarization credentials, not the signing certificate. [Apple's command-line guide](https://developer.apple.com/documentation/technotes/tn3147-migrating-to-the-latest-notarization-tool) describes this setup.
 
 3. Install the DMG layout tool and run the release:
 
@@ -54,7 +54,7 @@ Signing and notarization avoid the unidentified-developer/cannot-check-for-malic
    bash scripts/release.sh
    ```
 
-   This uses the signing identity already in your keychain. It creates `dist/release/Shotglass.app`, `dist/release/Shotglass-<version>-AppleSilicon.dmg` and `SHA256SUMS.txt`. Your installed app and the normal `dist/Shotglass.app` development build are not replaced. The app is notarized first so its ticket travels with it when dragged out of the DMG, including offline installation. Each submission can wait up to **90 minutes** by default; override with `NOTARY_TIMEOUT` if needed. The script records each submission ID before waiting and retains public status/log JSON files in `dist/release`. If a submission is rejected, inspect the log; if it times out, check that existing ID with `xcrun notarytool info ID --keychain-profile shotglass` before submitting again. A timeout does not cancel Apple's processing.
+   This uses the signing identity already in your keychain. It creates `dist/release/Easyshot.app`, `dist/release/Easyshot-<version>-AppleSilicon.dmg` and `SHA256SUMS.txt`. Your installed app and the normal `dist/Easyshot.app` development build are not replaced. The app is notarized first so its ticket travels with it when dragged out of the DMG, including offline installation. Each submission can wait up to **90 minutes** by default; override with `NOTARY_TIMEOUT` if needed. The script records each submission ID before waiting and retains public status/log JSON files in `dist/release`. If a submission is rejected, inspect the log; if it times out, check that existing ID with `xcrun notarytool info ID --keychain-profile shotglass` before submitting again. A timeout does not cancel Apple's processing.
 
    The DMG builder refuses to overwrite an existing image. Move an earlier DMG aside to retry the same version. `Resources/Info.plist` supplies the version and build number.
 
@@ -62,10 +62,10 @@ Signing and notarization avoid the unidentified-developer/cannot-check-for-malic
 
    ```sh
    gh release create v1.6.2 \
-     dist/release/Shotglass-1.6.2-AppleSilicon.dmg \
+     dist/release/Easyshot-1.6.2-AppleSilicon.dmg \
      dist/release/SHA256SUMS.txt \
      --repo mscno/shotglass --target master \
-     --title 'Shotglass 1.6.2' --draft
+     --title 'Easyshot 1.6.2' --draft
    ```
 
    Use the actual app version for future releases. Test the downloaded DMG on another Mac, review the release, then click **Publish release**. This repository is public: published stable releases and their update feeds are available without signing in. [GitHub's release guide](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) explains draft and repository visibility.
@@ -74,7 +74,7 @@ Signing and notarization avoid the unidentified-developer/cannot-check-for-malic
 
 The **Release signed DMG** workflow runs on pushes to `master` and manually from the Actions tab, on an Apple Silicon `macos-26` runner. It runs Swift unit tests and notarization control-flow tests, imports signing credentials into a temporary keychain, runs the same release script, uploads the verified DMG and checksum as an Actions artifact, and removes the temporary credentials. It does not sign pull requests or other branches. There is no path filter: rewriting the single-commit `master` history prevents GitHub from reliably comparing changed files. The DMG layout uses [dmgbuild](https://github.com/dmgbuild/dmgbuild), which writes Finder settings without automating Finder.
 
-Open a successful run and download **Shotglass-<version>-AppleSilicon** from its Artifacts section or its summary link. Extract the artifact ZIP, verify `SHA256SUMS.txt`, open the DMG, and drag the app into Applications. Artifacts are retained for 30 days and require a GitHub account. A failed notarization publishes only available public diagnostic JSON, never a release DMG or signing credentials. [GitHub's artifact guide](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts) explains downloading them.
+Open a successful run and download **Easyshot-<version>-AppleSilicon** from its Artifacts section or its summary link. Extract the artifact ZIP, verify `SHA256SUMS.txt`, open the DMG, and drag the app into Applications. Artifacts are retained for 30 days and require a GitHub account. A failed notarization publishes only available public diagnostic JSON, never a release DMG or signing credentials. [GitHub's artifact guide](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts) explains downloading them.
 
 The job allows 210 minutes for the two notarization waits and packaging. Artifact builds can repeat the same version; they do not create a tag or GitHub release. A separate optional job creates a **draft** release only when requested by the manual workflow input.
 
@@ -91,7 +91,7 @@ Set these repository secrets in **Settings → Secrets and variables → Actions
 
 Export the signing identity in **Keychain Access → login → My Certificates**: expand Developer ID Application to confirm the private key is present, select the certificate and private key, then export as `.p12` with a password. A `.cer` alone cannot sign on a GitHub runner. [GitHub's certificate guide](https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications) covers the temporary-keychain approach.
 
-For notarization, go to **App Store Connect → Users and Access → Integrations → App Store Connect API → Team Keys**, generate a key named Shotglass Notarization with Developer access, and download the `.p8` once. Record its Key ID and Issuer ID. The workflow uses a team key so it also works with older `notarytool` versions. [Apple's API key instructions](https://developer.apple.com/help/app-store-connect/get-started/app-store-connect-api/) cover access and key generation. No App Store listing is required.
+For notarization, go to **App Store Connect → Users and Access → Integrations → App Store Connect API → Team Keys**, generate a key named Easyshot Notarization with Developer access, and download the `.p8` once. Record its Key ID and Issuer ID. The workflow uses a team key so it also works with older `notarytool` versions. [Apple's API key instructions](https://developer.apple.com/help/app-store-connect/get-started/app-store-connect-api/) cover access and key generation. No App Store listing is required.
 
 Upload files directly to GitHub secrets through the CLI without printing their contents:
 
@@ -117,7 +117,7 @@ To check the Finder layout without publishing or claiming notarization:
 ```sh
 bash scripts/build-app.sh release
 source .release-venv/bin/activate
-bash scripts/make-dmg.sh dist/Shotglass.app dist/Shotglass-preview.dmg
+bash scripts/make-dmg.sh dist/Easyshot.app dist/Easyshot-preview.dmg
 ```
 
 This is a preview DMG containing the locally signed development build. It is not suitable for warning-free distribution. `release.sh` never skips notarization and only copies the final release DMG into `dist/release` after all checks pass.

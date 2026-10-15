@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-    <key>CFBundleName</key><string>Shotglass</string>
-    <key>CFBundleDisplayName</key><string>Shotglass</string>
-    <key>CFBundleIdentifier</key><string>no.paraply.shotglass</string>
-    <key>CFBundleExecutable</key><string>Shotglass</string>
+    <key>CFBundleName</key><string>Easyshot</string>
+    <key>CFBundleDisplayName</key><string>Easyshot</string>
+    <key>CFBundleIdentifier</key><string>no.paraply.easyshot</string>
+    <key>CFBundleExecutable</key><string>Easyshot</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.8.0</string>
@@ -12,18 +12,18 @@
     <key>LSMinimumSystemVersion</key><string>26.0</string>
     <key>LSUIElement</key><true/>
     <key>CFBundleURLTypes</key><array><dict>
-        <key>CFBundleURLName</key><string>no.paraply.shotglass.capture</string>
-        <key>CFBundleURLSchemes</key><array><string>shotglass</string></array>
+        <key>CFBundleURLName</key><string>no.paraply.easyshot.capture</string>
+        <key>CFBundleURLSchemes</key><array><string>easyshot</string></array>
         <key>CFBundleTypeRole</key><string>Editor</string>
 
 </dict></array>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>
-    <key>NSMicrophoneUsageDescription</key><string>Shotglass records your microphone when you enable voice recording.</string>
-    <key>NSCameraUsageDescription</key><string>Shotglass adds your webcam to recordings when you enable the camera bubble.</string>
-    <key>NSScreenCaptureUsageDescription</key><string>Shotglass captures screenshots and recordings you choose, saving them locally.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Easyshot records your microphone when you enable voice recording.</string>
+    <key>NSCameraUsageDescription</key><string>Easyshot adds your webcam to recordings when you enable the camera bubble.</string>
+    <key>NSScreenCaptureUsageDescription</key><string>Easyshot captures screenshots and recordings you choose, saving them locally.</string>
     <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
-    <key>NSHumanReadableCopyright</key><string>Shotglass · 2026</string>
+    <key>NSHumanReadableCopyright</key><string>Easyshot · 2026</string>
 
     <key>SUFeedURL</key><string>https://github.com/mscno/shotglass/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key><string>JShYvnOt9ECJHGuzc9epe+OPd27vAJFRcp/FuoNJn6k=</string>

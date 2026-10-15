@@ -5,10 +5,10 @@ CONFIG="${1:-release}"
 EDITION="${APP_EDITION:-direct}"
 [[ "$EDITION" == direct || "$EDITION" == app-store ]] || { echo 'APP_EDITION must be direct or app-store.' >&2; exit 1; }
 BUILD_ARGS=(-c "$CONFIG" --arch arm64)
-ENTITLEMENTS=Resources/Shotglass.entitlements
+ENTITLEMENTS=Resources/Easyshot.entitlements
 if [[ "$EDITION" == app-store ]]; then
     BUILD_ARGS+=(--scratch-path .build-app-store -Xswiftc -DAPP_STORE)
-    ENTITLEMENTS=Resources/Shotglass-AppStore.entitlements
+    ENTITLEMENTS=Resources/Easyshot-AppStore.entitlements
     if [[ -n "${SIGNING_IDENTITY:-}" && "$SIGNING_IDENTITY" != "Apple Distribution:"* && "$SIGNING_IDENTITY" != "3rd Party Mac Developer Application:"* && "$SIGNING_IDENTITY" != "Apple Development:"* ]]; then
         echo 'Use an Apple Distribution identity for Store distribution, or Apple Development for local testing.' >&2; exit 1
     fi
@@ -18,22 +18,22 @@ fi
 # requirement. Ad-hoc signatures use the binary's cdhash, which changes on every build,
 # so they would re-prompt after each rebuild or version bump. Sign with a stable keychain
 # identity instead, and use a separate bundle ID so they never replace the grants of the installed release.
-BUNDLE_ID=no.paraply.shotglass
+BUNDLE_ID=no.paraply.easyshot
 LOCAL_IDENTITY=""
 if [[ "$EDITION" == direct && -z "${SIGNING_IDENTITY:-}" ]]; then
     LOCAL_IDENTITY="${LOCAL_SIGNING_IDENTITY:-}"
     for KIND in 'Apple Development:' 'Developer ID Application:'; do
         [[ -n "$LOCAL_IDENTITY" ]] || LOCAL_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | awk -v k="\"$KIND" 'index($0,k){print $2; exit}')"
     done
-    [[ "${DEV_BUNDLE:-1}" == 0 ]] || BUNDLE_ID=no.paraply.shotglass.dev
+    [[ "${DEV_BUNDLE:-1}" == 0 ]] || BUNDLE_ID=no.paraply.easyshot.dev
     [[ -n "$LOCAL_IDENTITY" ]] || echo 'warning: no code-signing identity found; ad-hoc builds lose privacy permissions after every rebuild.' >&2
 fi
 swift build "${BUILD_ARGS[@]}"
 BIN_PATH="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)"
-APP="${APP_OUTPUT_DIR:-$PWD/dist}/Shotglass.app"
+APP="${APP_OUTPUT_DIR:-$PWD/dist}/Easyshot.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN_PATH/Shotglass" "$APP/Contents/MacOS/Shotglass"
+cp "$BIN_PATH/Easyshot" "$APP/Contents/MacOS/Easyshot"
 if [[ "$EDITION" == direct ]]; then
     SPARKLE_ROOT="$(bash scripts/fetch-sparkle.sh)"
     mkdir -p "$APP/Contents/Frameworks"
@@ -42,16 +42,16 @@ if [[ "$EDITION" == direct ]]; then
     else bash scripts/sign-sparkle.sh "$APP"; fi
 fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
-# The Shotglass Cloud server address is never committed; inject it at build time.
-if [[ -n "${SHOTGLASS_CLOUD_URL:-}" ]]; then
-    /usr/libexec/PlistBuddy -c "Add :ShotglassCloudURL string $SHOTGLASS_CLOUD_URL" "$APP/Contents/Info.plist"
+# The Easyshot Cloud server address is never committed; inject it at build time.
+if [[ -n "${EASYSHOT_CLOUD_URL:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :EasyshotCloudURL string $EASYSHOT_CLOUD_URL" "$APP/Contents/Info.plist"
 fi
-if [[ "$BUNDLE_ID" != no.paraply.shotglass ]]; then
+if [[ "$BUNDLE_ID" != no.paraply.easyshot ]]; then
     # Separate name, URL scheme and no Sparkle feed: a development build never updates
-    # itself to the release or captures shotglass:// launches meant for the installed app.
+    # itself to the release or captures easyshot:// launches meant for the installed app.
     PLIST="$APP/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" -c 'Set :CFBundleName Shotglass Dev' -c 'Set :CFBundleDisplayName Shotglass Dev' \
-        -c "Set :CFBundleURLTypes:0:CFBundleURLName $BUNDLE_ID.capture" -c 'Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 shotglass-dev' -c 'Delete :SUFeedURL' "$PLIST"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" -c 'Set :CFBundleName Easyshot Dev' -c 'Set :CFBundleDisplayName Easyshot Dev' \
+        -c "Set :CFBundleURLTypes:0:CFBundleURLName $BUNDLE_ID.capture" -c 'Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 easyshot-dev' -c 'Delete :SUFeedURL' "$PLIST"
 fi
 cp Resources/PrivacyInfo.xcprivacy "$APP/Contents/Resources/PrivacyInfo.xcprivacy"
 if [[ "$EDITION" == app-store ]]; then

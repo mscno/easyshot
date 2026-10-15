@@ -1,12 +1,12 @@
-Shotglass Support
+Easyshot Support
 
-Shotglass requires an Apple Silicon Mac running macOS 26 or later.
+Easyshot requires an Apple Silicon Mac running macOS 26 or later.
 
 Getting started
-Open Shotglass to show the capture toolbar. Select a mode with the icons or keys 1–5. Move or resize your rectangle, or draw a new one. Press Return or Capture to take the screenshot; Escape cancels. With Snap on draw enabled, a completed new rectangle captures automatically.
+Open Easyshot to show the capture toolbar. Select a mode with the icons or keys 1–5. Move or resize your rectangle, or draw a new one. Press Return or Capture to take the screenshot; Escape cancels. With Snap on draw enabled, a completed new rectangle captures automatically.
 
 Permissions
-Allow Screen Recording when macOS asks. If access was denied, enable Shotglass in System Settings → Privacy & Security → Screen Recording, then reopen the app. Camera and microphone permissions are optional and used only for recording features you enable.
+Allow Screen Recording when macOS asks. If access was denied, enable Easyshot in System Settings → Privacy & Security → Screen Recording, then reopen the app. Camera and microphone permissions are optional and used only for recording features you enable.
 
 Saving files
 In the Mac App Store edition, choose a screenshots folder in Settings or when prompted on your first capture. The macOS folder picker grants permission to save there. If a folder moves, disappears or becomes unavailable, choose it again. Captures copy to the clipboard and save to disk by default. Settings lets you change both behaviors.
@@ -15,18 +15,18 @@ Capture modes
 1: Full Screen. 2: Window under the pointer. 3: Area. 4: Active Window. 5: Last Area. D or N draws a new area. The last mode is remembered.
 
 Long screenshots
-The Mac App Store edition uses manual scrolling: scroll the content yourself, then choose Add Frame. Include overlapping content between frames so Shotglass can stitch them.
+The Mac App Store edition uses manual scrolling: scroll the content yourself, then choose Add Frame. Include overlapping content between frames so Easyshot can stitch them.
 
 Recording
 A visible recording bar remains while recording. Stop recording there. Screen, microphone, system audio and webcam settings control what is included.
 
 Privacy
-Shotglass does not send captures or analytics to Paraply. Sharing, clipboard access and cloud-synced folders are controlled by the apps and services you choose. Removing a capture from history keeps its file on disk.
+Easyshot does not send captures or analytics to Paraply. Sharing, clipboard access and cloud-synced folders are controlled by the apps and services you choose. Removing a capture from history keeps its file on disk.
 
 Reporting a problem
-Include your macOS version, Shotglass version, capture mode and steps to reproduce. Share a screenshot or recording only if you are comfortable sending its contents. Never send credentials or private screenshots unnecessarily.
+Include your macOS version, Easyshot version, capture mode and steps to reproduce. Share a screenshot or recording only if you are comfortable sending its contents. Never send credentials or private screenshots unnecessarily.
 
 Publication notes (remove before hosting):
-Suggested URL: https://mscno.com/shotglass/support/
-Add a monitored support email after the mailbox is configured. Suggested public alias: hello@mscno.com.
+Suggested URL: https://easyshot.app/support/
+Add a monitored support email after the mailbox is configured. Suggested public alias: hello@easyshot.app.
 Link to the privacy policy and app homepage.

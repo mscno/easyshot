@@ -1,4 +1,4 @@
-Shotglass
+Easyshot
 Screenshots, made simple.
 
 A small, native screenshot tool for your Mac. Open it, choose your capture, and get back to what you were doing.
@@ -14,7 +14,7 @@ Free. No account, ads or analytics. Built for Apple Silicon and macOS 26 or late
 Published by Paraply Ventures AS.
 
 Publication notes (remove before hosting):
-Suggested URL: https://mscno.com/shotglass/ — domain choice is not yet configured.
+Suggested URL: https://easyshot.app/
 Add the actual Mac App Store link after the app becomes available.
 Link to the published support and privacy pages.
 Use a real app screenshot; docs/screenshot.png is suitable for the website, not the Store listing dimensions.

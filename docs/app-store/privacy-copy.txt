@@ -1,10 +1,10 @@
-Shotglass Privacy Policy
+Easyshot Privacy Policy
 Last updated: October 2, 2026
 
-Shotglass is published by Paraply Ventures AS.
+Easyshot is published by Paraply Ventures AS.
 
 Data collection
-Shotglass does not require an account, include advertising or analytics, track you across apps or websites, or send screenshots, recordings, recognized text or settings to our servers. The app does not collect personal data for Paraply.
+Easyshot does not require an account, include advertising or analytics, track you across apps or websites, or send screenshots, recordings, recognized text or settings to our servers. The app does not collect personal data for Paraply.
 
 Screen, camera and microphone access
 You choose what to capture. macOS requests Screen Recording permission before capture. Camera and microphone permissions are optional and requested when you enable those recording features. A visible recording bar shows when recording is active. You can revoke these permissions in System Settings → Privacy & Security.
@@ -13,10 +13,10 @@ Files and settings
 Captures are saved in the folder you choose or in the app's local storage. The app keeps local preferences and capture history. Folder permissions are stored as local macOS security-scoped bookmarks in the Mac App Store edition. Text recognition and QR-code recognition run on your Mac.
 
 Clipboard and sharing
-When clipboard copying is enabled, the app places captures on the macOS clipboard. Other apps may access clipboard content, and Apple's clipboard features may transfer it between your devices according to your settings. Files saved in a cloud-synced folder, pasted into another app or shared with a service are handled by that provider. Shotglass does not operate a cloud upload service.
+When clipboard copying is enabled, the app places captures on the macOS clipboard. Other apps may access clipboard content, and Apple's clipboard features may transfer it between your devices according to your settings. Files saved in a cloud-synced folder, pasted into another app or shared with a service are handled by that provider. Easyshot does not operate a cloud upload service.
 
 Your choices
-Change your save folder, clipboard behavior and recording options in Settings. Delete captures in Finder when you no longer need them. Removing a capture from Shotglass history does not delete the underlying file. The Library provides history removal; app preferences and internal files are stored locally in the app container.
+Change your save folder, clipboard behavior and recording options in Settings. Delete captures in Finder when you no longer need them. Removing a capture from Easyshot history does not delete the underlying file. The Library provides history removal; app preferences and internal files are stored locally in the app container.
 
 Support
 If you email us for support, we receive the email address, message and any attachments you choose to send. This is separate from the app, which has no automatic data collection. Send only information you want us to receive.
@@ -25,5 +25,5 @@ Changes
 We will update this page when the app's privacy practices change.
 
 Publication notes (remove before hosting):
-Suggested URL: https://mscno.com/shotglass/privacy/
+Suggested URL: https://easyshot.app/privacy/
 Add the monitored support contact before publishing. Confirm that the deployed app and policy still match.

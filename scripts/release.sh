@@ -8,26 +8,26 @@ command -v dmgbuild >/dev/null || { echo 'Install dmgbuild==1.6.7 first.' >&2; e
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Expected a numeric x.y.z app version.' >&2; exit 1; }
 RELEASE_DIR="$PWD/dist/release"
-APP="$RELEASE_DIR/Shotglass.app"
-DMG="$RELEASE_DIR/Shotglass-$VERSION-AppleSilicon.dmg"
+APP="$RELEASE_DIR/Easyshot.app"
+DMG="$RELEASE_DIR/Easyshot-$VERSION-AppleSilicon.dmg"
 [[ ! -e "$DMG" ]] || { echo "Release DMG already exists: $DMG. Move it aside to rebuild." >&2; exit 1; }
 AUTH_ARGS=(--keychain-profile "$NOTARY_PROFILE")
 if [[ -n "${NOTARY_KEYCHAIN:-}" ]]; then AUTH_ARGS+=(--keychain "$NOTARY_KEYCHAIN"); fi
 # Fail before building or touching artifacts if notarization credentials are not ready.
 xcrun notarytool history "${AUTH_ARGS[@]}" --output-format json >/dev/null
 APP_EDITION=direct APP_OUTPUT_DIR="$RELEASE_DIR" bash scripts/build-app.sh release
-[[ "$(lipo -archs "$APP/Contents/MacOS/Shotglass")" == arm64 ]] || { echo 'Expected Apple Silicon only.' >&2; exit 1; }
+[[ "$(lipo -archs "$APP/Contents/MacOS/Easyshot")" == arm64 ]] || { echo 'Expected Apple Silicon only.' >&2; exit 1; }
 SIGNATURE="$(codesign -dv --verbose=2 "$APP" 2>&1)"
 [[ "$SIGNATURE" == *"Authority=Developer ID Application:"* ]] || { echo 'A Developer ID Application certificate is required.' >&2; exit 1; }
-[[ "$SIGNATURE" == *"TeamIdentifier=93627F7C77"* ]] || { echo 'Shotglass must be signed by Paraply Ventures AS.' >&2; exit 1; }
+[[ "$SIGNATURE" == *"TeamIdentifier=93627F7C77"* ]] || { echo 'Easyshot must be signed by Paraply Ventures AS.' >&2; exit 1; }
 # All artifacts produced for upload contain signatures and public tickets, never keys.
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/shotglass-notary.XXXXXX")"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easyshot-notary.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
-ditto -c -k --sequesterRsrc --keepParent "$APP" "$WORK_DIR/Shotglass.zip"
-bash scripts/notarize.sh "$WORK_DIR/Shotglass.zip" app "$RELEASE_DIR"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$WORK_DIR/Easyshot.zip"
+bash scripts/notarize.sh "$WORK_DIR/Easyshot.zip" app "$RELEASE_DIR"
 xcrun stapler staple "$APP"
 xcrun stapler validate "$APP"
-STAGED_DMG="$WORK_DIR/Shotglass-$VERSION-AppleSilicon.dmg"
+STAGED_DMG="$WORK_DIR/Easyshot-$VERSION-AppleSilicon.dmg"
 bash scripts/make-dmg.sh "$APP" "$STAGED_DMG"
 SIGN_ARGS=(--force --sign "$SIGNING_IDENTITY" --timestamp)
 if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then SIGN_ARGS+=(--keychain "$SIGNING_KEYCHAIN"); fi

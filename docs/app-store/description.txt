@@ -1,6 +1,6 @@
 Capture your screen with a compact toolbar that stays out of your way.
 
-Shotglass opens when you need it, remembers your last capture mode and area, and quits when your session ends. Your screenshots save as PNG files and copy to the clipboard by default.
+Easyshot opens when you need it, remembers your last capture mode and area, and quits when your session ends. Your screenshots save as PNG files and copy to the clipboard by default.
 
 CHOOSE YOUR CAPTURE
 Capture a full display, point at a window, capture the active window, draw an area, or reuse your last rectangle. Switch modes with keys 1–5. Move or resize the selection, draw a fresh area, and optionally capture as soon as you finish drawing.

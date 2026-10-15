@@ -41,7 +41,7 @@ class NotarizationTests(unittest.TestCase):
         stub = binary / "xcrun"
         stub.write_text(STUB)
         stub.chmod(0o755)
-        archive = folder / "Shotglass.zip"
+        archive = folder / "Easyshot.zip"
         archive.write_bytes(b"local test fixture")
         log = folder / "calls.txt"
         env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"],

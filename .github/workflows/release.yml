@@ -11,7 +11,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: shotglass-release
+  group: easyshot-release
   cancel-in-progress: false
 jobs:
   release:
@@ -45,7 +45,7 @@ jobs:
             fi
           fi
           echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
-          printf 'version=%s\nartifact_name=Shotglass-%s-AppleSilicon\n' "$VERSION" "$VERSION" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\nartifact_name=Easyshot-%s-AppleSilicon\n' "$VERSION" "$VERSION" >> "$GITHUB_OUTPUT"
           xcodebuild -version
           [[ "$(uname -m)" == arm64 ]]
           python3 -m pip install 'dmgbuild==1.6.7'
@@ -70,24 +70,24 @@ jobs:
           : "${NOTARY_KEY_ID:?Missing API key ID secret}"
           : "${NOTARY_ISSUER_ID:?Missing API issuer ID secret}"
           umask 077
-          KEYCHAIN_PATH="$RUNNER_TEMP/shotglass-signing.keychain-db"
+          KEYCHAIN_PATH="$RUNNER_TEMP/easyshot-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
           echo "::add-mask::$KEYCHAIN_PASSWORD"
-          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/shotglass-signing.p12"
-          printf '%s' "$NOTARY_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/shotglass-notary.p8"
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/easyshot-signing.p12"
+          printf '%s' "$NOTARY_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/easyshot-notary.p8"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 14400 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
-          security import "$RUNNER_TEMP/shotglass-signing.p12" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -k "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/easyshot-signing.p12" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -k "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
-          xcrun notarytool store-credentials shotglass --keychain "$KEYCHAIN_PATH" --key "$RUNNER_TEMP/shotglass-notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID"
+          xcrun notarytool store-credentials shotglass --keychain "$KEYCHAIN_PATH" --key "$RUNNER_TEMP/easyshot-notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID"
           printf 'SIGNING_KEYCHAIN=%s\nNOTARY_KEYCHAIN=%s\nNOTARY_PROFILE=shotglass\n' "$KEYCHAIN_PATH" "$KEYCHAIN_PATH" >> "$GITHUB_ENV"
       - name: Sign, notarize, staple and build DMG
         env:
           SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
           NOTARY_TIMEOUT: 90m
-          SHOTGLASS_CLOUD_URL: ${{ secrets.SHOTGLASS_API_URL }}
+          EASYSHOT_CLOUD_URL: ${{ secrets.SHOTGLASS_API_URL }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           set -euo pipefail
@@ -103,7 +103,7 @@ jobs:
         with:
           name: ${{ steps.version.outputs.artifact_name }}
           path: |
-            dist/release/Shotglass-*-AppleSilicon.dmg
+            dist/release/Easyshot-*-AppleSilicon.dmg
             dist/release/SHA256SUMS.txt
             dist/release/appcast.xml
           if-no-files-found: error
@@ -125,8 +125,8 @@ jobs:
       - name: Delete temporary credentials
         if: always()
         run: |
-          security delete-keychain "$RUNNER_TEMP/shotglass-signing.keychain-db" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/shotglass-signing.p12" "$RUNNER_TEMP/shotglass-notary.p8"
+          security delete-keychain "$RUNNER_TEMP/easyshot-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/easyshot-signing.p12" "$RUNNER_TEMP/easyshot-notary.p8"
   draft-release:
     if: github.event_name == 'workflow_dispatch' && inputs.create_draft_release
     needs: release
@@ -146,7 +146,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
-          Download the Apple Silicon DMG, open it, and drag Shotglass into Applications.
+          Download the Apple Silicon DMG, open it, and drag Easyshot into Applications.
           Requires macOS 26 or later. Signed with Developer ID and notarized by Apple.
           Screen Recording permission is requested when you capture; camera/microphone access is optional.
           NOTES
@@ -154,4 +154,4 @@ jobs:
             echo 'The release tag was created during this build; refusing to publish mismatched artifacts.' >&2
             exit 1
           fi
-          gh release create "v$RELEASE_VERSION" "dist/release/Shotglass-$RELEASE_VERSION-AppleSilicon.dmg" dist/release/SHA256SUMS.txt dist/release/appcast.xml --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Shotglass $RELEASE_VERSION" --notes-file "$RUNNER_TEMP/release-notes.md" --draft
+          gh release create "v$RELEASE_VERSION" "dist/release/Easyshot-$RELEASE_VERSION-AppleSilicon.dmg" dist/release/SHA256SUMS.txt dist/release/appcast.xml --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Easyshot $RELEASE_VERSION" --notes-file "$RUNNER_TEMP/release-notes.md" --draft

@@ -1,9 +1,9 @@
 {
   "status": "local-draft",
-  "name": "Shotglass",
+  "name": "Easyshot",
   "subtitle": "Screenshots, made simple",
-  "bundleId": "no.paraply.shotglass",
-  "sku": "shotglass-macos",
+  "bundleId": "no.paraply.easyshot",
+  "sku": "easyshot-macos",
   "platform": "MAC_OS",
   "primaryLocale": "en-US",
   "category": "UTILITIES",

@@ -1,22 +1,22 @@
-# Shotglass MCP server
+# Easyshot MCP server
 
-AI agents can capture, read and record the screen through Shotglass using the [Model Context Protocol](https://modelcontextprotocol.io). The agent starts `Shotglass --mcp` as a stdio server; it exits when the agent closes the connection. There is no daemon, Dock icon, capture bar or update check in this mode, and stdout carries only protocol JSON.
+AI agents can capture, read and record the screen through Easyshot using the [Model Context Protocol](https://modelcontextprotocol.io). The agent starts `Easyshot --mcp` as a stdio server; it exits when the agent closes the connection. There is no daemon, Dock icon, capture bar or update check in this mode, and stdout carries only protocol JSON.
 
 ## Setup
 
-Install Shotglass in `/Applications` and grant Screen Recording once (open the app normally and capture anything). The server runs as its own responsible process, so the Shotglass permission applies, not your terminal's or the agent's.
+Install Easyshot in `/Applications` and grant Screen Recording once (open the app normally and capture anything). The server runs as its own responsible process, so the Easyshot permission applies, not your terminal's or the agent's.
 
 **Claude Code**
 
 ```sh
-claude mcp add --scope user shotglass -- /Applications/Shotglass.app/Contents/MacOS/Shotglass --mcp
+claude mcp add --scope user easyshot -- /Applications/Easyshot.app/Contents/MacOS/Easyshot --mcp
 ```
 
 **Codex** (`~/.codex/config.toml`)
 
 ```toml
-[mcp_servers.shotglass]
-command = "/Applications/Shotglass.app/Contents/MacOS/Shotglass"
+[mcp_servers.easyshot]
+command = "/Applications/Easyshot.app/Contents/MacOS/Easyshot"
 args = ["--mcp"]
 ```
 
@@ -25,8 +25,8 @@ args = ["--mcp"]
 ```json
 {
   "mcpServers": {
-    "shotglass": {
-      "command": "/Applications/Shotglass.app/Contents/MacOS/Shotglass",
+    "easyshot": {
+      "command": "/Applications/Easyshot.app/Contents/MacOS/Easyshot",
       "args": ["--mcp"]
     }
   }
@@ -45,8 +45,8 @@ Other clients that support local stdio servers use the same command and argument
 | `ocr` | Text and QR/barcodes from a capture or an image `path`, with a frame for each line. |
 | `record_start` | Start an MP4 recording of a display, window, area or the active window. Returns `recording_id`. |
 | `record_stop` | Finish a recording; returns its path, duration and size. |
-| `upload` | Upload an image to Shotglass Cloud and return its share link (direct-download edition, signed in). |
-| `open_in_editor` | Open an image, recording or `.shotglass.json` project in the Shotglass editor for the user. |
+| `upload` | Upload an image to Easyshot Cloud and return its share link (direct-download edition, signed in). |
+| `open_in_editor` | Open an image, recording or `.easyshot.json` project in the Easyshot editor for the user. |
 
 **Coordinates.** All frames and `rect` arguments are global points with the origin at the top left of the main display, the same space as `list_displays` and `list_windows`. A display to the left of the main display has negative `x`. Capture files keep native pixels; `scale` relates the two.
 
@@ -56,7 +56,7 @@ Other clients that support local stdio servers use the same command and argument
 
 **OCR.** Line frames are global points for screen targets (`coordinate_space: "screen_points"`), so the centre of a line is a click target, and image pixels for files (`"image_pixels"`). Recognition runs on device with Vision.
 
-**Recording.** Frame rate (`fps`) and pointer (`cursor`) are per call; system audio and microphone follow Shotglass Settings. Recordings stop on `record_stop`, after `max_seconds` (default 300, at most 3600), or when the server exits, and are always finalized. A recording that stopped on its own is still returned by `record_stop`.
+**Recording.** Frame rate (`fps`) and pointer (`cursor`) are per call; system audio and microphone follow Easyshot Settings. Recordings stop on `record_stop`, after `max_seconds` (default 300, at most 3600), or when the server exits, and are always finalized. A recording that stopped on its own is still returned by `record_stop`.
 
 ## Permissions and errors
 
@@ -65,5 +65,5 @@ Tool failures return `isError: true` with a message the agent can relay. Without
 ## Implementation notes
 
 - Requests are processed concurrently; screen enumeration is shared between calls within 250 ms. Window captures use ScreenCaptureKit's still-image API at native resolution; PNG/JPEG encoding of the file and the preview run in parallel off the main thread.
-- The server never creates an `NSApplication` and avoids AppKit calls that register with LaunchServices, so `shotglass://` launcher URLs keep reaching a normal capture session while an agent is connected. `open_in_editor` launches that normal session with `shotglass://edit?path=…`.
-- Launched by a terminal or agent, `--mcp` respawns itself once with disclaimed responsibility (the mechanism Chromium uses for its helpers), so macOS attributes privacy checks to Shotglass.
+- The server never creates an `NSApplication` and avoids AppKit calls that register with LaunchServices, so `easyshot://` launcher URLs keep reaching a normal capture session while an agent is connected. `open_in_editor` launches that normal session with `easyshot://edit?path=…`.
+- Launched by a terminal or agent, `--mcp` respawns itself once with disclaimed responsibility (the mechanism Chromium uses for its helpers), so macOS attributes privacy checks to Easyshot.
