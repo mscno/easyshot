@@ -34,12 +34,13 @@ impl AppState {
                 k
             }
         };
+        let database_url = config.database_url.clone();
         Self {
             db,
             store,
             config: Arc::new(config),
             mailer: Arc::new(DisabledMailer),
-            live: Arc::new(Hub::default()),
+            live: Arc::new(Hub::new(Some(database_url))),
             limiter: Arc::new(RateLimiter::default()),
             secret: Arc::new(secret),
         }

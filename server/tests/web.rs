@@ -251,6 +251,86 @@ fn slug_of(v: &Value) -> String {
     v["slug"].as_str().unwrap().to_string()
 }
 
+/// Read SSE frames until one contains `needle` or `limit` passes; returns what was read.
+async fn read_until(body: &mut Body, needle: &str, limit: Duration) -> String {
+    let mut seen = String::new();
+    let deadline = tokio::time::Instant::now() + limit;
+    while !seen.contains(needle) {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, body.frame()).await {
+            Ok(Some(Ok(f))) => {
+                if let Some(d) = f.data_ref() {
+                    seen.push_str(&String::from_utf8_lossy(d));
+                }
+            }
+            _ => break,
+        }
+    }
+    seen
+}
+
+#[tokio::test]
+async fn live_updates_cross_server_instances() {
+    // Instance A serves the writer; instance B, with its own pool and LISTEN connection,
+    // serves a viewer. Nothing is shared between them but the database.
+    let a = App::new().await;
+    let pool_b = easyshot_server::db::Db::connect_url(&a.t.app_url, 3)
+        .await
+        .unwrap();
+    let b = web::router(AppState::new(pool_b, a.store.clone(), a.t.config()));
+    let token = a.user("owner@example.com").await;
+    let v = a.ready_video(&token, "Cross").await;
+    let slug = slug_of(&v);
+
+    // `since` = now: no snapshot on open, so everything below arrives through NOTIFY.
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = b
+        .handle(
+            http::Request::builder()
+                .uri(format!("/v/{slug}/live?since={now}"))
+                .header("datastar-request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(live.status(), StatusCode::OK);
+    let mut body = live.into_body();
+    // B's listener connects and sends one resync render.
+    let resync = read_until(&mut body, "datastar-patch-elements", Duration::from_secs(5)).await;
+    assert!(resync.contains("datastar-patch-elements"), "{resync}");
+
+    let started = std::time::Instant::now();
+    let r = a
+        .form(
+            &format!("/v/{slug}/comments"),
+            &[("body", "from instance A"), ("name", "Ann")],
+            None,
+            true,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let seen = read_until(&mut body, "from instance A", Duration::from_secs(5)).await;
+    assert!(seen.contains("from instance A"), "{seen}");
+    eprintln!("cross-instance comment latency: {:?}", started.elapsed());
+
+    // Renames reach B too, and deletion ends B's stream with a notice.
+    let id = v["id"].as_str().unwrap().to_string();
+    a.api(
+        "PATCH",
+        &format!("/v1/videos/{id}"),
+        Some(&token),
+        Some(json!({"title": "Renamed on A"})),
+    )
+    .await;
+    let seen = read_until(&mut body, "Renamed on A", Duration::from_secs(5)).await;
+    assert!(seen.contains("Renamed on A"), "{seen}");
+    a.api("DELETE", &format!("/v1/videos/{id}"), Some(&token), None)
+        .await;
+    let seen = read_until(&mut body, "no longer available", Duration::from_secs(5)).await;
+    assert!(seen.contains("no longer available"), "{seen}");
+    a.t.finish().await;
+}
+
 #[tokio::test]
 async fn landing_assets_and_mounted_api() {
     let app = App::new().await;
