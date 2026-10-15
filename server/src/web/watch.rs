@@ -172,14 +172,7 @@ pub async fn watch(cx: &Cx) -> Result<impl View> {
                     <p id="live-notice" class="notice" role="status" hidden=""></p>
                 </div>
                 <aside class="watch-side">
-                    if has_transcript {
-                        <section class="card transcript-card">
-                            <h2>"Transcript"</h2>
-                            <ol id="transcript" class="transcript" data-transcript="">
-                                <li class="muted">"Loading transcript…"</li>
-                            </ol>
-                        </section>
-                    }
+                    transcript_region(available: has_transcript)
                     <section class="card comments-card" id="comments-card">
                         <h2>"Comments"</h2>
                         comments_region(comments: data.comments.clone(), now: now)
@@ -209,13 +202,7 @@ impl Snapshot {
     async fn load(st: &AppState, scope: &Scope, v: &Video) -> crate::error::AppResult<Snapshot> {
         let (owner, views, comments, reactions) = tokio::try_join!(
             owner_name(st, v),
-            async {
-                Ok(service::view_counts(st, scope.share(v), &[v.id.as_str()])
-                    .await?
-                    .get(&v.id)
-                    .copied()
-                    .unwrap_or(0))
-            },
+            view_count(st, scope, v),
             service::comments(st, scope, v),
             service::reactions(st, scope, v),
         )?;
@@ -227,6 +214,14 @@ impl Snapshot {
             markers: reactions.1,
         })
     }
+}
+
+async fn view_count(st: &AppState, scope: &Scope, v: &Video) -> crate::error::AppResult<i64> {
+    Ok(service::view_counts(st, scope.share(v), &[v.id.as_str()])
+        .await?
+        .get(&v.id)
+        .copied()
+        .unwrap_or(0))
 }
 
 async fn owner_name(st: &AppState, v: &Video) -> crate::error::AppResult<String> {
@@ -284,11 +279,20 @@ pub async fn player_region(
     let media_url = format!("/v/{}/media", v.slug);
     let track_url = format!("/v/{}/transcript.vtt", v.slug);
     let poster = v.thumbnail_key.is_some().then(|| thumb_url(&v));
+    let captions = v.transcript_key.is_some().then(|| track_url.clone());
     let ready = v.status == "ready";
+    // The <video> keeps its playback across live patches (data-ignore-morph), so a poster
+    // or transcript published later reaches it through the host's data-poster and
+    // data-captions attributes, which <easyshot-player> applies (static/app.js).
     Ok(view! {
         <section id="player-region" class="player-region">
             if ready {
-                <easyshot-player id="player" class="player">
+                <easyshot-player
+                    id="player"
+                    class="player"
+                    data-poster=(poster.as_deref())
+                    data-captions=(captions.as_deref())
+                >
                     <video
                         id="video"
                         controls=""
@@ -323,6 +327,26 @@ pub async fn player_region(
                     </p>
                 </div>
             }
+        </section>
+    })
+}
+
+/// Always on the page, hidden without a transcript, so one published later appears live.
+/// `<easyshot-player>` fills the list from the captions track; the list is client-owned
+/// (`data-ignore-morph`), so live patches show or hide the card without clearing it.
+#[component]
+pub async fn transcript_region(available: bool) -> Result<impl View> {
+    Ok(view! {
+        <section id="transcript-card" class="card transcript-card" hidden=(!available)>
+            <h2>"Transcript"</h2>
+            <ol
+                id="transcript"
+                class="transcript"
+                data-transcript=""
+                data-ignore-morph=""
+            >
+                <li class="muted">"Loading transcript…"</li>
+            </ol>
         </section>
     })
 }
@@ -854,8 +878,11 @@ pub async fn post_comment(cx: &Cx, Form(f): Form<CommentForm>) -> Result<Respons
     if failed {
         return patches(cx, vec![patch(form)]).await;
     }
-    let comments = service::comments(st, &w.scope, v).await.web()?;
-    let (_, markers) = service::reactions(st, &w.scope, v).await.web()?;
+    let (comments, markers) = tokio::try_join!(
+        service::comments(st, &w.scope, v),
+        service::reaction_markers(st, &w.scope, v)
+    )
+    .web()?;
     let listed = comments.clone();
     let duration = v.duration_ms;
     let list = view! { cx => comments_region(comments: listed, now: now_ms()) }
@@ -900,8 +927,11 @@ pub async fn post_reaction(cx: &Cx, Form(f): Form<ReactionForm>) -> Result<Respo
     if !datastar_request(cx) {
         return see_other(format!("/v/{}", v.slug)).into_response(cx);
     }
-    let (totals, markers) = service::reactions(st, &w.scope, v).await.web()?;
-    let comments = service::comments(st, &w.scope, v).await.web()?;
+    let ((totals, markers), comments) = tokio::try_join!(
+        service::reactions(st, &w.scope, v),
+        service::comments(st, &w.scope, v)
+    )
+    .web()?;
     let slug = v.slug.clone();
     let duration = v.duration_ms;
     let bar = view! { cx => reactions_region(slug: slug, totals: totals) }
@@ -943,11 +973,14 @@ struct Live {
     opened: Instant,
 }
 
-/// What to re-render.
+/// What to re-render. `video` only asks to re-read the row: the regions that depend on
+/// what changed in it are decided by comparing it with the last render.
 #[derive(Default, Clone, Copy)]
 struct Dirty {
+    video: bool,
     head: bool,
     player: bool,
+    transcript: bool,
     comments: bool,
     reactions: bool,
 }
@@ -955,11 +988,16 @@ struct Dirty {
 impl Dirty {
     fn all() -> Dirty {
         Dirty {
+            video: true,
             head: true,
             player: true,
+            transcript: true,
             comments: true,
             reactions: true,
         }
+    }
+    fn any(&self) -> bool {
+        self.video || self.head || self.player || self.transcript || self.comments || self.reactions
     }
 }
 
@@ -1003,6 +1041,12 @@ impl Live {
             }
         }
         let old = &self.video;
+        if fresh.title != old.title
+            || fresh.status != old.status
+            || fresh.duration_ms != old.duration_ms
+        {
+            d.head = true;
+        }
         if fresh.status != old.status
             || fresh.transcript_key != old.transcript_key
             || fresh.thumbnail_key != old.thumbnail_key
@@ -1012,21 +1056,47 @@ impl Live {
         {
             d.player = true;
         }
+        if fresh.transcript_key.is_some() != old.transcript_key.is_some() {
+            d.transcript = true;
+        }
         self.video = fresh;
         let v = self.video.clone();
-        let snap = Snapshot::load(st, &self.scope, &v).await.web()?;
+        // Load only what the dirty regions show: a progress tick re-reads the row and
+        // nothing else; markers need comments and reactions, the head owner and views.
+        let scope = &self.scope;
+        let conversation = d.comments || d.reactions || (d.player && v.status == "ready");
+        let (head, comments, markers, totals) = tokio::try_join!(
+            async {
+                if !d.head {
+                    return Ok(None);
+                }
+                tokio::try_join!(owner_name(st, &v), view_count(st, scope, &v)).map(Some)
+            },
+            async {
+                if !conversation {
+                    return Ok(Vec::new());
+                }
+                service::comments(st, scope, &v).await
+            },
+            async {
+                if !conversation {
+                    return Ok(Vec::new());
+                }
+                service::reaction_markers(st, scope, &v).await
+            },
+            async {
+                if !d.reactions {
+                    return Ok(Vec::new());
+                }
+                service::reaction_totals(st, scope, &v).await
+            },
+        )
+        .web()?;
         let cx = &self.cx;
         let url = service::share_url(st, &v.slug);
         let mut out = Vec::new();
-        let Snapshot {
-            owner,
-            views,
-            comments,
-            totals,
-            markers,
-        } = snap;
-        if d.head {
-            let (video, owner) = (v.clone(), owner.clone());
+        if let Some((owner, views)) = head {
+            let video = v.clone();
             out.push(
                 view! {
                     cx =>
@@ -1061,6 +1131,15 @@ impl Live {
                 .single()
                 .await?
                 .render(cx),
+            );
+        }
+        if d.transcript {
+            let available = v.transcript_key.is_some();
+            out.push(
+                view! { cx => transcript_region(available: available) }
+                    .single()
+                    .await?
+                    .render(cx),
             );
         }
         if d.comments {
@@ -1131,14 +1210,15 @@ impl Live {
                 match p.change {
                     Change::Comments => dirty.comments = true,
                     Change::Reactions => dirty.reactions = true,
-                    Change::Video | Change::Views => dirty.head = true,
+                    Change::Video => dirty.video = true,
+                    Change::Views => dirty.head = true,
                     // Gone, a session change or a resync: re-check access and render it all.
                     Change::Gone | Change::Session | Change::Resync => dirty = Dirty::all(),
                     _ => {}
                 }
                 ping = try_ping(&mut self.sub, self.session.as_mut());
             }
-            if !(dirty.head || dirty.player || dirty.comments || dirty.reactions) {
+            if !dirty.any() {
                 continue;
             }
             if let Err(e) = self.render(dirty).await {

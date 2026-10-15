@@ -15,15 +15,19 @@ const clock = (ms) => {
 // playback position to inputs marked [data-player-time] / [data-player-clock] (comment and
 // reaction forms), seeks when anything marked [data-seek-ms] is clicked, fills the
 // transcript list from the captions track and highlights the current line.
+//
+// Live patches never touch the <video> (data-ignore-morph keeps playback going), so a
+// poster or transcript published later arrives as the host's data-poster / data-captions
+// attributes, which this applies to the video: poster, and a <track> it adds.
 rocket('easyshot-player', {
   mode: 'light',
   onFirstRender({ host, cleanup }) {
     const video = host.querySelector('video')
     if (!video) return
     const strip = host.querySelector('.markers')
-    const list = document.querySelector('[data-transcript]')
     let lines = []
     let active = null
+    let trackEl = null
 
     const highlight = (ms) => {
       const line = lines.find((l) => ms >= l.start && ms < l.end) ?? null
@@ -63,6 +67,8 @@ rocket('easyshot-player', {
     }
 
     const buildTranscript = (track) => {
+      // Looked up each time: the transcript card may be shown after the player started.
+      const list = document.querySelector('[data-transcript]')
       if (!list || !track.cues) return
       lines = [...track.cues].map((cue) => {
         const li = document.createElement('li')
@@ -82,16 +88,44 @@ rocket('easyshot-player', {
       if (!lines.length) list.innerHTML = '<li class="muted">No speech was transcribed.</li>'
     }
 
-    const trackEl = video.querySelector('track')
-    if (trackEl) {
-      const track = trackEl.track
+    const attachTrack = (el) => {
+      trackEl = el
+      const track = el.track
       // Load cues without drawing captions; viewers can still turn captions on.
       if (track.mode === 'disabled') track.mode = 'hidden'
       const onLoad = () => buildTranscript(track)
-      trackEl.addEventListener('load', onLoad)
-      cleanup(() => trackEl.removeEventListener('load', onLoad))
-      if (trackEl.readyState === 2) onLoad()
+      el.addEventListener('load', onLoad)
+      cleanup(() => el.removeEventListener('load', onLoad))
+      if (el.readyState === 2) onLoad()
     }
+
+    const sync = () => {
+      const poster = host.dataset.poster
+      if (poster && video.getAttribute('poster') !== poster) video.setAttribute('poster', poster)
+      if (!poster && video.hasAttribute('poster')) video.removeAttribute('poster')
+      const captions = host.dataset.captions
+      if (captions && !trackEl) {
+        const el = document.createElement('track')
+        el.kind = 'captions'
+        el.srclang = 'en'
+        el.label = 'Transcript'
+        el.src = captions
+        video.append(el)
+        attachTrack(el)
+      } else if (!captions && trackEl) {
+        trackEl.remove()
+        trackEl = null
+        lines = []
+        active = null
+      }
+    }
+
+    const existing = video.querySelector('track')
+    if (existing) attachTrack(existing)
+    sync()
+    const observer = new MutationObserver(sync)
+    observer.observe(host, { attributes: true, attributeFilter: ['data-poster', 'data-captions'] })
+    cleanup(() => observer.disconnect())
 
     video.addEventListener('timeupdate', publish)
     video.addEventListener('seeked', publish)
