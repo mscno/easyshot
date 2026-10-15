@@ -1,21 +1,26 @@
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::ApiJson;
+use super::codes::{send_attempt_code, sign_up_attempt};
 use crate::auth::{
-    AuthUser, SESSION_PREFIX, SESSION_TTL_MS, dummy_hash, generate_token, hash_password_blocking,
-    verify_password_blocking,
+    AuthUser, Bucket, ClientAddr, SESSION_PREFIX, SESSION_TTL_MS, check_password, generate_token,
+    hash_password_blocking, throttle,
 };
 use crate::db::DbError;
 use crate::error::{AppError, AppResult};
-use crate::mailer::CodePurpose;
-use crate::repo::{self, now_ms, ts};
+use crate::repo::{self, LoginUser, now_ms, ts};
 use crate::state::AppState;
+
+/// Failed password sign-ins per email within [`LOGIN_WINDOW_MS`] before password sign-in
+/// is refused (web and API).
+pub const LOGIN_MAX_FAILED: i64 = 10;
+pub const LOGIN_WINDOW_MS: i64 = 15 * 60_000;
 
 #[derive(Deserialize)]
 pub struct Credentials {
@@ -74,8 +79,12 @@ pub async fn issue_session(
     ))
 }
 
+/// With mail on: always `202 {"verification_required": true}` and no session (nothing
+/// tells whether the address had an account). Without mail: `201` with a session, or
+/// `409 EMAIL_TAKEN`.
 pub async fn register(
     State(st): State<AppState>,
+    addr: ClientAddr,
     ApiJson(body): ApiJson<Credentials>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
     if !st.config.allow_signups {
@@ -88,8 +97,19 @@ pub async fn register(
             "password must be between 10 and 256 characters".into(),
         ));
     }
-    let hash = hash_password_blocking(body.password).await?;
+    throttle(&st, Bucket::Signup, &addr)?;
+    let hash = hash_password_blocking(body.password.clone()).await?;
 
+    if st.mailer.enabled() {
+        // Uniform for new, unverified and verified addresses; the session comes from the
+        // mailed code (`otp/verify`).
+        sign_up_attempt(&st, &email, body.password, hash).await?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({"verification_required": true})),
+        ));
+    }
+    // Without mail (local development) nothing can be verified: sign straight in.
     let id = Uuid::new_v4();
     let now = now_ms();
     match repo::create_user(&st.db, id, &email, &hash, now).await {
@@ -98,54 +118,70 @@ pub async fn register(
         Err(e) => return Err(e.into()),
     }
     let user = user_json(id, &email, "free", ts(now), false);
-    if st.mailer.enabled() {
-        super::codes::send_code(&st, id, &email, CodePurpose::VerifyEmail);
-    }
     let json = issue_session(&st, user, id, clean_device(body.device_name)).await?;
     Ok((StatusCode::CREATED, json))
 }
 
-fn client_ip(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().chars().take(64).collect())
-        .filter(|s: &String| !s.is_empty())
+pub enum PasswordLogin {
+    SignedIn(LoginUser),
+    /// Right password, unverified account, mail on: a verification code carrying this
+    /// password was mailed; sign-in finishes with that code.
+    VerifyFirst,
+    Invalid,
+    /// Too many failures for this email recently.
+    Locked,
+}
+
+/// Password sign-in shared by the web and the API; the caller has already spent the
+/// per-address `Bucket::Login` budget. The attempt is recorded as failed before the
+/// password is checked (and marked succeeded after), so concurrent guesses are all counted.
+pub async fn password_login(
+    st: &AppState,
+    email: &str,
+    password: String,
+    addr: &str,
+) -> AppResult<PasswordLogin> {
+    let now = now_ms();
+    let (attempt, failed) =
+        repo::begin_login_attempt(&st.db, email, Some(addr), now, now - LOGIN_WINDOW_MS).await?;
+    if failed > LOGIN_MAX_FAILED {
+        return Ok(PasswordLogin::Locked);
+    }
+    let row = repo::find_user_for_login(&st.db, email).await?;
+    let ok = check_password(
+        password.clone(),
+        row.as_ref().map(|r| r.password_hash.clone()),
+    )
+    .await?;
+    let Some(u) = row.filter(|r| ok && !r.disabled) else {
+        return Ok(PasswordLogin::Invalid);
+    };
+    repo::login_succeeded(&st.db, attempt).await?;
+    if st.mailer.enabled() && !u.email_verified {
+        send_attempt_code(st, u.id, email, password, u.password_hash);
+        return Ok(PasswordLogin::VerifyFirst);
+    }
+    repo::touch_user(&st.db, u.id, now).await?;
+    Ok(PasswordLogin::SignedIn(u))
 }
 
 pub async fn login(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    addr: ClientAddr,
     ApiJson(body): ApiJson<Credentials>,
 ) -> AppResult<Json<Value>> {
+    throttle(&st, Bucket::Login, &addr)?;
     // Anything that can't be a valid email still counts as a failed credential, not a 400.
     let email = body.email.trim().to_lowercase();
-    let ip = client_ip(&headers);
-
-    let now = now_ms();
-    let failed = repo::count_failed_logins(&st.db, &email, now - 15 * 60_000).await?;
-    if failed >= 10 {
-        return Err(AppError::RateLimited);
+    match password_login(&st, &email, body.password, addr.as_str()).await? {
+        PasswordLogin::SignedIn(r) => {
+            let user = user_json(r.id, &email, &r.plan, ts(r.created_at), r.email_verified);
+            issue_session(&st, user, r.id, clean_device(body.device_name)).await
+        }
+        PasswordLogin::VerifyFirst => Err(AppError::EmailNotVerified),
+        PasswordLogin::Invalid => Err(AppError::InvalidCredentials),
+        PasswordLogin::Locked => Err(AppError::RateLimited),
     }
-
-    let row = repo::find_user_for_login(&st.db, &email).await?;
-    let (hash, row) = match row {
-        Some(r) => (r.password_hash.clone(), Some(r)),
-        None => (dummy_hash().to_string(), None),
-    };
-    let ok = verify_password_blocking(body.password, hash).await?;
-    let valid = match row {
-        Some(r) if ok && !r.disabled => Some(r),
-        _ => None,
-    };
-
-    repo::record_login_attempt(&st.db, &email, ip, valid.is_some(), now).await?;
-
-    let r = valid.ok_or(AppError::InvalidCredentials)?;
-    repo::touch_user(&st.db, r.id, now).await?;
-    let user = user_json(r.id, &email, &r.plan, ts(r.created_at), r.email_verified);
-    issue_session(&st, user, r.id, clean_device(body.device_name)).await
 }
 
 pub async fn logout(State(st): State<AppState>, user: AuthUser) -> AppResult<StatusCode> {

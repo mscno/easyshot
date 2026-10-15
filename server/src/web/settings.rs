@@ -29,10 +29,12 @@ use topcoat::{
 };
 use uuid::Uuid;
 
-use super::auth::password_problem;
+use super::auth::{password_problem, throttle};
 use super::layout::{Meta, ago, shell};
 use super::{Member, WebResult, admit_stream, member, signed_out_patch, start_session, state};
-use crate::auth::{API_PREFIX, generate_token, hash_password_blocking, verify_password_blocking};
+use crate::auth::{
+    API_PREFIX, Bucket, generate_token, hash_password_blocking, verify_password_blocking,
+};
 use crate::mailer::CodePurpose;
 use crate::repo::{self, SessionRow, TokenRow, now_ms};
 use crate::routes::codes::{check_code, send_code};
@@ -433,7 +435,7 @@ async fn patch_profile(
 pub async fn verify_send(cx: &Cx) -> Result<Response> {
     let m = require(cx).await?;
     let st = state(cx);
-    super::limit(cx, "verify-send", 5, Duration::from_secs(600))?;
+    throttle(cx, Bucket::CodeRequest)?;
     let notice = if !st.mailer.enabled() {
         "Email is not configured on this server."
     } else {
@@ -452,7 +454,8 @@ pub struct CodeForm {
 pub async fn verify(cx: &Cx, Form(f): Form<CodeForm>) -> Result<Response> {
     let m = require(cx).await?;
     let st = state(cx);
-    super::limit(cx, "verify", 20, Duration::from_secs(600))?;
+    // From an existing session, so not a claim: credentials stay as they are.
+    throttle(cx, Bucket::CodeVerify)?;
     if check_code(st, m.user_id, CodePurpose::VerifyEmail, &f.code)
         .await
         .is_err()
@@ -593,6 +596,21 @@ pub async fn create_token(cx: &Cx, Form(f): Form<TokenForm>) -> Result<Response>
     let m = require(cx).await?;
     let st = state(cx);
     super::limit(cx, "token", 20, Duration::from_secs(3600))?;
+    // Like `POST /v1/tokens`: no lasting credentials before the mailbox is proven.
+    if st.mailer.enabled() && !m.email_verified {
+        let notice = "Confirm your email address before creating API tokens.";
+        if datastar_request(cx) {
+            return patch_profile(cx, &m, false, Some(notice.into())).await;
+        }
+        let n = Notices {
+            profile: Some(notice.into()),
+            ..Notices::default()
+        };
+        return Ok(page_response(
+            account_view(cx, m, n).await?,
+            StatusCode::FORBIDDEN,
+        ));
+    }
     let name = f.name.trim().to_string();
     if name.is_empty() || name.chars().count() > 100 {
         return Err(topcoat::router::error::bad_request("name must be 1-100 characters").into());

@@ -123,6 +123,8 @@ impl App {
         self.send(r.body(Body::from(body)).unwrap()).await
     }
 
+    /// Register (202, no session), then confirm with the mailed code; returns the session
+    /// token of the verified account.
     async fn user(&self, email: &str) -> String {
         let r = self
             .api(
@@ -132,7 +134,17 @@ impl App {
                 Some(json!({"email": email, "password": "supersecret123"})),
             )
             .await;
-        assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+        assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
+        let code = self.mailed_code(email, "Confirm").await;
+        let r = self
+            .api(
+                "POST",
+                "/v1/auth/otp/verify",
+                None,
+                Some(json!({"email": email, "code": code})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
         r.json()["token"].as_str().unwrap().to_string()
     }
 
@@ -1386,4 +1398,210 @@ async fn watch_page_follows_privacy_changes() {
     let seen = read_until(&mut viewer, "Recording unavailable", Duration::from_secs(5)).await;
     assert!(seen.contains("Recording unavailable"), "{seen}");
     app.t.finish().await;
+}
+
+impl App {
+    /// Make the resend cooldown elapse.
+    async fn age_codes(&self) {
+        self.t
+            .owner
+            .execute("UPDATE auth_codes SET created_at = created_at - 60000", &[])
+            .await
+            .unwrap();
+    }
+
+    /// Post an email and password form (sign-up or sign-in) without a session.
+    async fn credentials(&self, path: &str, email: &str, password: &str) -> Res {
+        self.form(
+            path,
+            &[("email", email), ("password", password)],
+            None,
+            false,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn unverified_sign_in_and_competing_sign_ups() {
+    let app = App::new().await;
+    let email = "fresh@example.com";
+    let signup = |pw| app.credentials("/signup", email, pw);
+    let r = signup("first password").await;
+    assert!(r.body.contains("action=\"/verify\""), "{}", r.body);
+    let code = app.mailed_code(email, "Confirm").await;
+
+    // The right password before verification: the code form again, no session.
+    let r = app
+        .form(
+            "/login",
+            &[("email", email), ("password", "first password")],
+            None,
+            false,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("action=\"/verify\"") && r.cookie("sg_session").is_none());
+
+    // A competing sign-up with another password inside the resend cooldown mails nothing
+    // and retires the code that carries the first password.
+    app.mail.clear();
+    signup("second password").await;
+    for _ in 0..100 {
+        let live = app
+            .t
+            .owner
+            .query_one(
+                "SELECT count(*) FROM auth_codes WHERE consumed_at IS NULL",
+                &[],
+            )
+            .await
+            .unwrap()
+            .i64(0)
+            .unwrap();
+        if live == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let r = app
+        .form("/verify", &[("email", email), ("code", &code)], None, false)
+        .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // After the cooldown the latest attempt gets its own code and its password.
+    app.age_codes().await;
+    signup("second password").await;
+    let code = app.mailed_code(email, "Confirm").await;
+    let r = app
+        .form("/verify", &[("email", email), ("code", &code)], None, false)
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    let login = |pw| app.credentials("/login", email, pw);
+    assert_eq!(
+        login("first password").await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(login("second password").await.status, StatusCode::SEE_OTHER);
+    app.t.finish().await;
+}
+
+#[tokio::test]
+async fn unverified_session_cannot_create_tokens() {
+    let app = App::new().await;
+    // A browser session of an unverified account, as made while mail was off.
+    let no_mail = web::router(AppState::new(
+        app.t.app.clone(),
+        app.store.clone(),
+        app.t.config(),
+    ));
+    let body = "email=legacy%40example.com&password=supersecret123";
+    let res = no_mail
+        .handle(
+            http::Request::builder()
+                .method("POST")
+                .uri("/signup")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    let cookie = res
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.contains("sg_session"))
+        .map(|c| c.split(';').next().unwrap().to_string())
+        .unwrap();
+    let r = app
+        .form("/account/tokens", &[("name", "CI")], Some(&cookie), false)
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+    assert!(
+        r.body
+            .contains("Confirm your email address before creating API tokens.")
+    );
+    let r = app
+        .form("/account/tokens", &[("name", "CI")], Some(&cookie), true)
+        .await;
+    assert!(!r.body.contains("sgp_"), "{}", r.body);
+    let n = app
+        .t
+        .owner
+        .query_one("SELECT count(*) FROM api_tokens", &[])
+        .await
+        .unwrap()
+        .i64(0)
+        .unwrap();
+    assert_eq!(n, 0);
+    app.t.finish().await;
+}
+
+/// Behind `TRUSTED_PROXY_HOPS=1` the API and the web pages count sign-ins against the
+/// address the proxy appended, not the client-written leftmost `X-Forwarded-For` entry,
+/// and share one budget per address.
+#[tokio::test]
+async fn auth_budgets_follow_the_trusted_proxy_address() {
+    use topcoat::router::RemoteAddr;
+    let t = common::database().await;
+    let mut cfg = t.config();
+    cfg.trusted_proxy_hops = 1;
+    let router = web::router(
+        AppState::new(t.app.clone(), Arc::new(MemoryStore::new()), cfg)
+            .with_mailer(MemoryMailer::new()),
+    );
+    let peer = RemoteAddr("10.0.0.2:5000".parse().unwrap());
+    let api = |i: usize, xff: String| {
+        let body = json!({"email": format!("x{i}@example.test"), "password": "wrong-password"});
+        http::Request::builder()
+            .method("POST")
+            .uri("/v1/auth/login")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", xff)
+            .extension(peer)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    for i in 0..19 {
+        let xff = format!("192.0.2.{i}, 203.0.113.5");
+        assert_eq!(
+            router.handle(api(i, xff)).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    // The 20th sign-in from that address is a web form; the 21st is refused on the API.
+    let web = http::Request::builder()
+        .method("POST")
+        .uri("/login")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("x-forwarded-for", "203.0.113.5")
+        .extension(peer)
+        .body(Body::from("email=y%40example.test&password=wrong-password"))
+        .unwrap();
+    assert_eq!(
+        router.handle(web).await.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let spoofed = "198.18.0.1, 203.0.113.5".to_string();
+    assert_eq!(
+        router.handle(api(30, spoofed)).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Another client behind the same proxy has its own budget.
+    assert_eq!(
+        router.handle(api(31, "203.0.113.6".into())).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let ips: Vec<String> = t
+        .owner
+        .query("SELECT DISTINCT ip FROM login_attempts ORDER BY ip", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.text(0).unwrap())
+        .collect();
+    assert_eq!(ips, ["203.0.113.5", "203.0.113.6"]);
+    t.finish().await;
 }

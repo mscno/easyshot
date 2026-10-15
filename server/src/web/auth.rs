@@ -4,7 +4,6 @@
 //! the shared `sessions` table. Every successful sign-in starts a fresh session token.
 
 use std::future::Future;
-use std::time::Duration;
 
 use serde::Deserialize;
 use topcoat::{
@@ -13,7 +12,7 @@ use topcoat::{
     router::{
         HeaderValue, StatusCode,
         content::Form,
-        error::{redirect, see_other},
+        error::{redirect, see_other, too_many_requests},
         header, page, query_params,
         response::{IntoResponse, Response},
         route,
@@ -24,13 +23,14 @@ use topcoat::{
 use uuid::Uuid;
 
 use super::layout::{Meta, shell};
-use super::{WebResult, fingerprint, hex, limit, member, start_session, state};
-use crate::auth::{dummy_hash, hash_password_blocking, verify_password_blocking};
+use super::{WebResult, fingerprint, hex, member, start_session, state};
+use crate::auth::{Bucket, allow, hash_password_blocking};
 use crate::db::DbError;
+use crate::error::AppError;
 use crate::mailer::CodePurpose;
 use crate::repo::{self, now_ms};
-use crate::routes::auth::normalize_email;
-use crate::routes::codes::{check_code, send_code};
+use crate::routes::auth::{PasswordLogin, normalize_email, password_login};
+use crate::routes::codes::{reset_password, send_code, sign_in_with_code, sign_up_attempt};
 
 pub const MIN_PASSWORD: usize = 10;
 pub const MAX_PASSWORD: usize = 256;
@@ -72,6 +72,16 @@ fn query(cx: &Cx) -> (String, String) {
         .take(254)
         .collect();
     (next, email)
+}
+
+/// Spend one hit of this client address's auth budget (shared with the API); 429 when spent.
+pub fn throttle(cx: &Cx, bucket: Bucket) -> Result<()> {
+    let st = state(cx);
+    if allow(st, bucket, &fingerprint(cx).0) {
+        Ok(())
+    } else {
+        Err(too_many_requests(bucket.limit(st).window_secs).into())
+    }
 }
 
 /// Signed-in visitors skip the sign-in pages.
@@ -213,38 +223,31 @@ pub async fn signup_submit(cx: &Cx, Form(f): Form<SignupForm>) -> Result<Respons
     if let Some(p) = password_problem(&f.password) {
         return fail(email, p, StatusCode::UNPROCESSABLE_ENTITY).await;
     }
-    limit(cx, "signup", 5, Duration::from_secs(3600))?;
-    let hash = hash_password_blocking(f.password).await.web()?;
-    let id = Uuid::new_v4();
-    let mail = st.mailer.enabled();
-    match repo::create_user(&st.db, id, &email, &hash, now_ms()).await {
-        Ok(()) if mail => send_code(st, id, &email, CodePurpose::VerifyEmail),
-        Ok(()) => {
-            // No mail configured (local development): nothing to verify with.
-            start_session(cx, id).await?;
-            return see_other(next).into_response(cx);
-        }
-        Err(DbError::UniqueViolation) if mail => {
-            // Same answer as a new account, so sign-up does not reveal who has one; the
-            // emailed code signs the existing owner in.
-            if let Some(u) = repo::find_user_for_login(&st.db, &email)
-                .await
-                .map_err(Into::into)
-                .web()?
-                && !u.disabled
-            {
-                send_code(st, u.id, &email, CodePurpose::LoginOtp);
+    throttle(cx, Bucket::Signup)?;
+    let hash = hash_password_blocking(f.password.clone()).await.web()?;
+    if st.mailer.enabled() {
+        // Same answer whether or not the address has an account (see `sign_up_attempt`):
+        // the mailed code confirms a new or unverified account with this password, or signs
+        // a verified owner in.
+        sign_up_attempt(st, &email, f.password, hash).await.web()?;
+    } else {
+        // No mail configured (local development): nothing to verify with.
+        let id = Uuid::new_v4();
+        match repo::create_user(&st.db, id, &email, &hash, now_ms()).await {
+            Ok(()) => {
+                start_session(cx, id).await?;
+                return see_other(next).into_response(cx);
             }
+            Err(DbError::UniqueViolation) => {
+                return fail(
+                    email,
+                    "An account with this email already exists. Sign in instead.".into(),
+                    StatusCode::CONFLICT,
+                )
+                .await;
+            }
+            Err(e) => return Err(AppError::from(e)).web(),
         }
-        Err(DbError::UniqueViolation) => {
-            return fail(
-                email,
-                "An account with this email already exists. Sign in instead.".into(),
-                StatusCode::CONFLICT,
-            )
-            .await;
-        }
-        Err(e) => return Err(crate::error::AppError::from(e)).web(),
     }
     let body = view! {
         cx =>
@@ -316,51 +319,34 @@ pub struct CodeForm {
 }
 
 /// Accepts a verification code (new accounts) or a sign-in code (existing accounts, or the
-/// "email me a code" sign-in), then signs in with a fresh session.
+/// "email me a code" sign-in), then signs in with a fresh session. The first code for an
+/// account that was never verified claims it (`sign_in_with_code`): every earlier session
+/// and API token ends.
 #[route(POST "/verify")]
 pub async fn verify_submit(cx: &Cx, Form(f): Form<CodeForm>) -> Result<Response> {
     let next = safe_next(f.next.as_deref());
     let st = state(cx);
     let email = f.email.trim().to_lowercase();
-    limit(cx, "verify", 20, Duration::from_secs(600))?;
-    let user = repo::find_user_for_login(&st.db, &email)
-        .await
-        .map_err(Into::into)
-        .web()?
-        .filter(|u| !u.disabled);
-    let mut ok = false;
-    if let Some(u) = &user {
-        if !u.email_verified {
-            ok = check_code(st, u.id, CodePurpose::VerifyEmail, &f.code)
-                .await
-                .is_ok();
+    throttle(cx, Bucket::CodeVerify)?;
+    let u = match sign_in_with_code(st, &email, &f.code).await {
+        Ok(u) => u,
+        Err(AppError::InvalidCode) => {
+            let body = view! {
+                cx =>
+                code_form(
+                    next: next,
+                    email: email,
+                    error: Some("That code is not valid or has expired.".into()),
+                    resent: false
+                )
+            }
+            .single()
+            .await?
+            .render(cx);
+            return Ok(html(body, StatusCode::UNPROCESSABLE_ENTITY));
         }
-        if !ok {
-            ok = check_code(st, u.id, CodePurpose::LoginOtp, &f.code)
-                .await
-                .is_ok();
-        }
-    }
-    let (Some(u), true) = (user, ok) else {
-        let body = view! {
-            cx =>
-            code_form(
-                next: next,
-                email: email,
-                error: Some("That code is not valid or has expired.".into()),
-                resent: false
-            )
-        }
-        .single()
-        .await?
-        .render(cx);
-        return Ok(html(body, StatusCode::UNPROCESSABLE_ENTITY));
+        Err(e) => return Err(e).web(),
     };
-    // Knowing the emailed code proves the address.
-    repo::set_email_verified(&st.db, u.id, now_ms())
-        .await
-        .map_err(Into::into)
-        .web()?;
     start_session(cx, u.id).await?;
     see_other(next).into_response(cx)
 }
@@ -376,7 +362,9 @@ pub async fn verify_resend(cx: &Cx, Form(f): Form<EmailForm>) -> Result<Response
     let next = safe_next(f.next.as_deref());
     let st = state(cx);
     let email = f.email.trim().to_lowercase();
-    limit(cx, "resend", 10, Duration::from_secs(600))?;
+    throttle(cx, Bucket::CodeRequest)?;
+    // A resent verification code carries no password: if it claims the account, the
+    // password is set again through a reset.
     if st.mailer.enabled()
         && let Some(u) = repo::find_user_for_login(&st.db, &email)
             .await
@@ -461,23 +449,21 @@ pub async fn login_page(cx: &Cx) -> Result<impl View> {
 }
 
 #[derive(Deserialize)]
-pub struct PasswordLogin {
+pub struct LoginForm {
     email: String,
     password: String,
     next: Option<String>,
 }
 
-/// Failed attempts per email within this window before sign-in is refused (same as the API).
-const LOGIN_WINDOW_MS: i64 = 15 * 60_000;
-const LOGIN_MAX_FAILED: i64 = 10;
-
+/// Same rules as the API (`password_login`): the per-address budget, then the per-email
+/// lockout. An unverified account (mail on) gets a verification code instead of a session.
 #[route(POST "/login")]
-pub async fn login_submit(cx: &Cx, Form(f): Form<PasswordLogin>) -> Result<Response> {
+pub async fn login_submit(cx: &Cx, Form(f): Form<LoginForm>) -> Result<Response> {
     let next = safe_next(f.next.as_deref());
     let st = state(cx);
     let email = f.email.trim().to_lowercase();
     let mail = st.mailer.enabled();
-    limit(cx, "login", 20, Duration::from_secs(600))?;
+    throttle(cx, Bucket::Login)?;
     let fail = |msg: &str, status| {
         let (next, email, msg) = (next.clone(), email.clone(), msg.to_string());
         async move {
@@ -491,39 +477,33 @@ pub async fn login_submit(cx: &Cx, Form(f): Form<PasswordLogin>) -> Result<Respo
             Ok::<Response, topcoat::Error>(html(body, status))
         }
     };
-    let now = now_ms();
-    let failed = repo::count_failed_logins(&st.db, &email, now - LOGIN_WINDOW_MS)
-        .await
-        .map_err(Into::into)
-        .web()?;
-    if failed >= LOGIN_MAX_FAILED {
-        return fail(
-            "Too many attempts. Try again in 15 minutes, or sign in with an emailed code.",
-            StatusCode::TOO_MANY_REQUESTS,
-        )
-        .await;
-    }
-    let row = repo::find_user_for_login(&st.db, &email)
-        .await
-        .map_err(Into::into)
-        .web()?;
-    let hash = row
-        .as_ref()
-        .map(|r| r.password_hash.clone())
-        .unwrap_or_else(|| dummy_hash().to_string());
-    let ok = verify_password_blocking(f.password, hash).await.web()?;
-    let user = row.filter(|r| ok && !r.disabled);
     let (ip, _) = fingerprint(cx);
-    repo::record_login_attempt(&st.db, &email, Some(ip), user.is_some(), now)
-        .await
-        .map_err(Into::into)
-        .web()?;
-    let Some(u) = user else {
-        return fail(
-            "That email and password do not match.",
-            StatusCode::UNPROCESSABLE_ENTITY,
-        )
-        .await;
+    let u = match password_login(st, &email, f.password, &ip).await.web()? {
+        PasswordLogin::SignedIn(u) => u,
+        PasswordLogin::VerifyFirst => {
+            let body = view! {
+                cx =>
+                code_form(next: next, email: email, error: None, resent: false)
+            }
+            .single()
+            .await?
+            .render(cx);
+            return Ok(html(body, StatusCode::OK));
+        }
+        PasswordLogin::Invalid => {
+            return fail(
+                "That email and password do not match.",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            )
+            .await;
+        }
+        PasswordLogin::Locked => {
+            return fail(
+                "Too many attempts. Try again in 15 minutes, or sign in with an emailed code.",
+                StatusCode::TOO_MANY_REQUESTS,
+            )
+            .await;
+        }
     };
     start_session(cx, u.id).await?;
     see_other(next).into_response(cx)
@@ -588,7 +568,7 @@ pub async fn code_submit(cx: &Cx, Form(f): Form<EmailForm>) -> Result<Response> 
         .render(cx);
         return Ok(html(body, StatusCode::UNPROCESSABLE_ENTITY));
     };
-    limit(cx, "login-code", 10, Duration::from_secs(600))?;
+    throttle(cx, Bucket::CodeRequest)?;
     if st.mailer.enabled()
         && let Some(u) = repo::find_user_for_login(&st.db, &email)
             .await
@@ -698,7 +678,7 @@ pub async fn forgot_submit(cx: &Cx, Form(f): Form<EmailForm>) -> Result<Response
         .render(cx);
         return Ok(html(body, StatusCode::UNPROCESSABLE_ENTITY));
     };
-    limit(cx, "forgot", 5, Duration::from_secs(600))?;
+    throttle(cx, Bucket::CodeRequest)?;
     if st.mailer.enabled()
         && let Some(u) = repo::find_user_for_login(&st.db, &email)
             .await
@@ -726,7 +706,7 @@ pub struct ResetForm {
 pub async fn reset_submit(cx: &Cx, Form(f): Form<ResetForm>) -> Result<Response> {
     let st = state(cx);
     let email = f.email.trim().to_lowercase();
-    limit(cx, "reset", 20, Duration::from_secs(600))?;
+    throttle(cx, Bucket::CodeVerify)?;
     let fail = |msg: String| {
         let email = email.clone();
         async move {
@@ -740,36 +720,15 @@ pub async fn reset_submit(cx: &Cx, Form(f): Form<ResetForm>) -> Result<Response>
     if let Some(p) = password_problem(&f.password) {
         return fail(p).await;
     }
-    let user = repo::find_user_for_login(&st.db, &email)
-        .await
-        .map_err(Into::into)
-        .web()?
-        .filter(|u| !u.disabled);
-    let checked = match &user {
-        Some(u) => check_code(st, u.id, CodePurpose::ResetPassword, &f.code)
-            .await
-            .is_ok(),
-        None => false,
+    // Every existing session (including other devices) and API token ends with a reset.
+    let user_id = match reset_password(st, &email, &f.code, f.password).await {
+        Ok(id) => id,
+        Err(AppError::InvalidCode) => {
+            return fail("That code is not valid or has expired.".into()).await;
+        }
+        Err(e) => return Err(e).web(),
     };
-    let (Some(u), true) = (user, checked) else {
-        return fail("That code is not valid or has expired.".into()).await;
-    };
-    let hash = hash_password_blocking(f.password).await.web()?;
-    let now = now_ms();
-    repo::set_password(&st.db, u.id, &hash, now)
-        .await
-        .map_err(Into::into)
-        .web()?;
-    repo::set_email_verified(&st.db, u.id, now)
-        .await
-        .map_err(Into::into)
-        .web()?;
-    // Every existing session (including other devices) ends with a reset.
-    repo::delete_user_sessions(&st.db, u.id)
-        .await
-        .map_err(Into::into)
-        .web()?;
-    start_session(cx, u.id).await?;
+    start_session(cx, user_id).await?;
     see_other("/library").into_response(cx)
 }
 

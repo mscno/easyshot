@@ -8,8 +8,9 @@
 use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
-use crate::db::{Context, Db, DbResult, Row, placeholders};
-use crate::vals;
+use crate::db::{Context, Db, DbError, DbResult, Row, placeholders, tx_execute, tx_query};
+use crate::error::AppResult;
+use crate::{orm, vals};
 
 /// Rows per `IN (...)` / `DELETE` statement.
 const IN_CHUNK: usize = 200;
@@ -104,50 +105,97 @@ pub async fn delete_user_sessions(db: &Db, user_id: Uuid) -> DbResult<()> {
 
 // ---------- one-time email codes ----------
 
-pub struct CodeIssueState {
-    pub last_created_at: Option<i64>,
-    pub sent_since: i64,
+pub struct NewCode<'a> {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub purpose: &'a str,
+    pub code_hash: &'a str,
+    /// The sign-up attempt's password, installed if this code claims an unverified account.
+    pub password_hash: Option<&'a str>,
+    pub now: i64,
+    pub expires_at: i64,
 }
 
-/// Rate-limit inputs: newest code time and how many were issued since `since`.
-pub async fn code_issue_state(
-    db: &Db,
-    user_id: Uuid,
-    purpose: &str,
-    since: i64,
-) -> DbResult<CodeIssueState> {
-    let r = db
-        .query_one(
-            "SELECT MAX(created_at), COUNT(*) FROM auth_codes \
-             WHERE user_id = $1 AND purpose = $2 AND created_at >= $3",
-            &vals![user_id, purpose, since],
-        )
-        .await?;
-    Ok(CodeIssueState {
-        last_created_at: r.opt_i64(0)?,
-        sent_since: r.i64(1)?,
-    })
+pub enum Issued {
+    /// Stored, superseding every earlier live code of this purpose: mail it.
+    Stored,
+    /// Refused by the resend cooldown or the hourly cap. `live` is the newest still-usable
+    /// code, if any, with the password it carries.
+    Throttled { live: Option<LiveCode> },
 }
 
-/// Supersede any live code of this purpose, then store the new one.
-pub async fn insert_code(
+/// Issue a code under the per-(user, purpose) rate limits, in one transaction that holds a
+/// transaction-level advisory lock on (user, purpose), so concurrent requests are counted
+/// one after another: at most one code per `cooldown_ms`, `per_hour` per hour.
+pub async fn issue_code(
     db: &Db,
-    id: Uuid,
-    user_id: Uuid,
-    purpose: &str,
-    code_hash: &str,
-    now: i64,
-    expires_at: i64,
-) -> DbResult<()> {
-    db.execute(
-        "UPDATE auth_codes SET consumed_at = $3 WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL",
-        &vals![user_id, purpose, now],
+    c: &NewCode<'_>,
+    cooldown_ms: i64,
+    per_hour: i64,
+) -> AppResult<Issued> {
+    let mut orm = db.toasty();
+    let mut tx = orm::begin(&mut orm, &Context::default()).await?;
+    tx_execute(
+        &mut tx,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        &vals![format!("auth_code:{}:{}", c.user_id, c.purpose)],
     )
     .await?;
+    let rows = tx_query(
+        &mut tx,
+        "SELECT MAX(created_at), COUNT(*) FROM auth_codes \
+         WHERE user_id = $1 AND purpose = $2 AND created_at >= $3",
+        &vals![c.user_id, c.purpose, c.now - 3_600_000],
+    )
+    .await?;
+    let r = rows
+        .first()
+        .ok_or_else(|| DbError::Other("no aggregate row".into()))?;
+    let (last, sent) = (r.opt_i64(0)?, r.i64(1)?);
+    if sent >= per_hour || last.is_some_and(|t| c.now - t < cooldown_ms) {
+        let live = tx_query(
+            &mut tx,
+            &format!("{LIVE_CODE} LIMIT 1"),
+            &vals![c.user_id, c.purpose, c.now],
+        )
+        .await?
+        .first()
+        .map(live_code_row)
+        .transpose()?;
+        tx.commit().await.map_err(orm::orm_err)?;
+        return Ok(Issued::Throttled { live });
+    }
+    tx_execute(
+        &mut tx,
+        "UPDATE auth_codes SET consumed_at = $3 \
+         WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL",
+        &vals![c.user_id, c.purpose, c.now],
+    )
+    .await?;
+    tx_execute(
+        &mut tx,
+        "INSERT INTO auth_codes (id, user_id, purpose, code_hash, password_hash, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        &vals![
+            c.id,
+            c.user_id,
+            c.purpose,
+            c.code_hash,
+            c.password_hash,
+            c.now,
+            c.expires_at
+        ],
+    )
+    .await?;
+    tx.commit().await.map_err(orm::orm_err)?;
+    Ok(Issued::Stored)
+}
+
+/// Retire one code early (it carries a password other than the latest attempt's).
+pub async fn supersede_code(db: &Db, id: Uuid, now: i64) -> DbResult<()> {
     db.execute(
-        "INSERT INTO auth_codes (id, user_id, purpose, code_hash, created_at, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
-        &vals![id, user_id, purpose, code_hash, now, expires_at],
+        "UPDATE auth_codes SET consumed_at = $2 WHERE id = $1 AND consumed_at IS NULL",
+        &vals![id, now],
     )
     .await?;
     Ok(())
@@ -156,6 +204,19 @@ pub async fn insert_code(
 pub struct LiveCode {
     pub id: Uuid,
     pub code_hash: String,
+    pub password_hash: Option<String>,
+}
+
+const LIVE_CODE: &str = "SELECT id, code_hash, password_hash FROM auth_codes \
+     WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL AND expires_at > $3 \
+     ORDER BY created_at DESC";
+
+fn live_code_row(r: &Row) -> DbResult<LiveCode> {
+    Ok(LiveCode {
+        id: r.uuid(0)?,
+        code_hash: r.text(1)?,
+        password_hash: r.opt_text(2)?,
+    })
 }
 
 pub async fn live_code(
@@ -165,18 +226,12 @@ pub async fn live_code(
     now: i64,
 ) -> DbResult<Option<LiveCode>> {
     db.query_opt(
-        "SELECT id, code_hash FROM auth_codes \
-         WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL AND expires_at > $3 \
-         ORDER BY created_at DESC LIMIT 1",
+        &format!("{LIVE_CODE} LIMIT 1"),
         &vals![user_id, purpose, now],
     )
     .await?
-    .map(|r| {
-        Ok(LiveCode {
-            id: r.uuid(0)?,
-            code_hash: r.text(1)?,
-        })
-    })
+    .as_ref()
+    .map(live_code_row)
     .transpose()
 }
 
@@ -192,15 +247,61 @@ pub async fn spend_code_attempt(db: &Db, id: Uuid, max: i64) -> DbResult<bool> {
         == 1)
 }
 
-/// True for exactly one caller, so a code can't be used twice concurrently.
+/// True for exactly one caller, so a code can't be used twice concurrently. The password a
+/// code carried is not kept once it is used.
 pub async fn consume_code(db: &Db, id: Uuid, now: i64) -> DbResult<bool> {
     Ok(db
         .execute(
-            "UPDATE auth_codes SET consumed_at = $2 WHERE id = $1 AND consumed_at IS NULL",
+            "UPDATE auth_codes SET consumed_at = $2, password_hash = NULL \
+             WHERE id = $1 AND consumed_at IS NULL",
             &vals![id, now],
         )
         .await?
         == 1)
+}
+
+/// Replace an account's credentials in one transaction: set `password_hash`, confirm the
+/// email, end every session and revoke every API token. Used when an emailed code proves
+/// the mailbox anonymously: password reset (`only_unverified = false`) and the first
+/// verification of an account that was never verified, its claim (`only_unverified =
+/// true`: nothing changes, and false is returned, if the account was verified meanwhile).
+pub async fn replace_credentials(
+    db: &Db,
+    user_id: Uuid,
+    password_hash: &str,
+    now: i64,
+    only_unverified: bool,
+) -> AppResult<bool> {
+    let mut orm = db.toasty();
+    let mut tx = orm::begin(&mut orm, &Context::default()).await?;
+    let row = tx_query(
+        &mut tx,
+        "SELECT email_verified_at FROM users WHERE id = $1 FOR UPDATE",
+        &vals![user_id],
+    )
+    .await?;
+    let Some(r) = row.first() else {
+        return Ok(false);
+    };
+    if only_unverified && r.opt_i64(0)?.is_some() {
+        return Ok(false);
+    }
+    tx_execute(
+        &mut tx,
+        "UPDATE users SET password_hash = $2, email_verified_at = COALESCE(email_verified_at, $3), \
+         updated_at = $3 WHERE id = $1",
+        &vals![user_id, password_hash, now],
+    )
+    .await?;
+    tx_execute(
+        &mut tx,
+        "DELETE FROM sessions WHERE user_id = $1",
+        &vals![user_id],
+    )
+    .await?;
+    tx_execute(&mut tx, REVOKE_USER_TOKENS, &vals![user_id, now]).await?;
+    tx.commit().await.map_err(orm::orm_err)?;
+    Ok(true)
 }
 
 pub async fn delete_old_codes(db: &Db, expired_before: i64) -> DbResult<u64> {
@@ -440,6 +541,14 @@ pub async fn revoke_api_token(db: &Db, id: Uuid, user_id: Uuid, now: i64) -> DbR
         > 0)
 }
 
+const REVOKE_USER_TOKENS: &str =
+    "UPDATE api_tokens SET revoked_at = $2 WHERE user_id = $1 AND revoked_at IS NULL";
+
+/// Revoke every API token of a user; returns how many.
+pub async fn revoke_user_api_tokens(db: &Db, user_id: Uuid, now: i64) -> DbResult<u64> {
+    db.execute(REVOKE_USER_TOKENS, &vals![user_id, now]).await
+}
+
 // ---------- login attempts ----------
 
 pub async fn count_failed_logins(db: &Db, email: &str, since: i64) -> DbResult<i64> {
@@ -451,16 +560,30 @@ pub async fn count_failed_logins(db: &Db, email: &str, since: i64) -> DbResult<i
     .i64(0)
 }
 
-pub async fn record_login_attempt(
+/// Record a password sign-in attempt as failed *before* checking it, then count the
+/// failures since `since` including it. Every concurrent guess is counted by the time any
+/// of them is checked, so a burst cannot exceed the per-account limit. Returns the
+/// attempt's id (see [`login_succeeded`]) and the failure count.
+pub async fn begin_login_attempt(
     db: &Db,
     email: &str,
-    ip: Option<String>,
-    succeeded: bool,
+    ip: Option<&str>,
     now: i64,
-) -> DbResult<()> {
+    since: i64,
+) -> DbResult<(Uuid, i64)> {
+    let id = Uuid::new_v4();
     db.execute(
-        "INSERT INTO login_attempts (id, email, ip, succeeded, created_at) VALUES ($1, $2, $3, $4, $5)",
-        &vals![Uuid::new_v4(), email, ip, succeeded, now],
+        "INSERT INTO login_attempts (id, email, ip, succeeded, created_at) VALUES ($1, $2, $3, 0, $4)",
+        &vals![id, email, ip, now],
+    )
+    .await?;
+    Ok((id, count_failed_logins(db, email, since).await?))
+}
+
+pub async fn login_succeeded(db: &Db, id: Uuid) -> DbResult<()> {
+    db.execute(
+        "UPDATE login_attempts SET succeeded = 1 WHERE id = $1",
+        &vals![id],
     )
     .await?;
     Ok(())

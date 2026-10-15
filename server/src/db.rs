@@ -424,6 +424,30 @@ impl Db {
     }
 }
 
+/// Raw SQL inside a caller's transaction (`orm::begin`), with the same parameter handling
+/// as [`Db::execute`]; for units of work that span several statements.
+pub async fn tx_execute(
+    tx: &mut dyn toasty::Executor,
+    sql: &str,
+    params: &[Value],
+) -> DbResult<u64> {
+    Ok(statement(sql, params).exec(tx).await?)
+}
+
+/// [`Db::query`] inside a caller's transaction.
+pub async fn tx_query(
+    tx: &mut dyn toasty::Executor,
+    sql: &str,
+    params: &[Value],
+) -> DbResult<Vec<Row>> {
+    query(sql, params)
+        .exec(tx)
+        .await?
+        .into_iter()
+        .map(to_row)
+        .collect()
+}
+
 // ---------- migrations (owner role, one tokio-postgres connection) ----------
 
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
