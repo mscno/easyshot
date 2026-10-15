@@ -55,8 +55,7 @@ extension CloudClient {
                 let (_,response) = try await session.upload(for: request,from: data)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 guard (200..<300).contains(status) else { throw CloudError.uploadFailed(status) }
-                do { _ = try await send(makeRequest("POST","v1/videos/\(id)/\(kind)/complete")) }
-                catch CloudError.server(let status,_,_) where status == 404 || status == 405 {} // servers before publish-on-complete
+                _ = try await send(makeRequest("POST","v1/videos/\(id)/\(kind)/complete"))
                 return
             } catch {
                 guard attempt < 3,let status = CloudError.retryStatus(error),Backoff.retryable(status: status) else { throw error }
