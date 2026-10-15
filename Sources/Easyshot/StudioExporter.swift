@@ -14,19 +14,13 @@ final class StudioRenderer: @unchecked Sendable {
         if let device = MTLCreateSystemDefaultDevice() { return CIContext(mtlDevice: device, options: options) }
         return CIContext(options: options)
     }()
-    static let gradients: [(CIColor, CIColor)] = [
-        (CIColor(red: 0.42, green: 0.31, blue: 0.95), CIColor(red: 0.15, green: 0.55, blue: 0.98)),
-        (CIColor(red: 0.98, green: 0.45, blue: 0.35), CIColor(red: 0.85, green: 0.22, blue: 0.55)),
-        (CIColor(red: 0.20, green: 0.80, blue: 0.65), CIColor(red: 0.10, green: 0.42, blue: 0.75)),
-        (CIColor(red: 1.00, green: 0.78, blue: 0.55), CIColor(red: 0.93, green: 0.48, blue: 0.62)),
-        (CIColor(red: 0.05, green: 0.20, blue: 0.45), CIColor(red: 0.10, green: 0.62, blue: 0.80)),
-        (CIColor(red: 0.24, green: 0.25, blue: 0.29), CIColor(red: 0.07, green: 0.07, blue: 0.09)),
-    ]
     private struct State {
         var timeline: StudioTimeline
         var inner: CGRect
         var background: CIImage?
         var mask: CIImage?
+        /// Highlight halo or dot sprite for the non-macOS cursor styles, at cursor scale 1.
+        var marker: CIImage?
     }
     let track: CursorTrack
     let video: CGSize
@@ -53,11 +47,14 @@ final class StudioRenderer: @unchecked Sendable {
     private static func build(track: CursorTrack, plan: StudioPlan, duration: Double, video: CGSize, canvas: CGSize) -> State {
         let timeline = StudioTimeline(track: track, plan: plan, duration: duration)
         let bounds = CGRect(origin: .zero, size: canvas)
-        guard plan.background != .none else { return State(timeline: timeline, inner: bounds) }
+        let marker = cursorMarker(plan.cursorStyle, scale: track.scale)
+        guard plan.background != .none else { return State(timeline: timeline, inner: bounds, marker: marker) }
         let pad = plan.padding*min(canvas.width, canvas.height)
         let available = bounds.insetBy(dx: pad, dy: pad)
-        let fit = min(available.width/video.width, available.height/video.height)
-        let size = CGSize(width: (video.width*fit).rounded(), height: (video.height*fit).rounded())
+        // The visible content has the framed viewport's aspect, which differs from the video when reframed.
+        let content = timeline.base
+        let fit = min(available.width/content.width, available.height/content.height)
+        let size = CGSize(width: (content.width*fit).rounded(), height: (content.height*fit).rounded())
         let inner = CGRect(x: ((canvas.width-size.width)/2).rounded(), y: ((canvas.height-size.height)/2).rounded(), width: size.width, height: size.height)
         let radius = plan.cornerRadius*min(size.width, size.height)
         var layer = backgroundImage(plan.background, canvas: canvas)
@@ -72,7 +69,21 @@ final class StudioRenderer: @unchecked Sendable {
         // Rasterize once so per-frame work is a texture read, not a blur.
         let background = context.createCGImage(layer, from: bounds).map { CIImage(cgImage: $0) }
         let maskImage = mask.outputImage.flatMap { context.createCGImage($0, from: inner) }.map { CIImage(cgImage: $0).transformed(by: CGAffineTransform(translationX: inner.minX, y: inner.minY)) }
-        return State(timeline: timeline, inner: inner, background: background, mask: maskImage)
+        return State(timeline: timeline, inner: inner, background: background, mask: maskImage, marker: marker)
+    }
+    /// A soft highlight drawn under the cursor (halo) or a dot replacing it, in video pixels at cursor scale 1.
+    static func cursorMarker(_ style: StudioCursorStyle, scale: Double) -> CIImage? {
+        guard style != .macOS else { return nil }
+        let r = (style == .halo ? 22 : 9)*scale, size = Int(ceil(r*2+4*scale))
+        guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let circle = CGRect(x: CGFloat(size)/2-r, y: CGFloat(size)/2-r, width: r*2, height: r*2)
+        if style == .halo {
+            ctx.setFillColor(CGColor(srgbRed: 1, green: 0.85, blue: 0.2, alpha: 0.38)); ctx.fillEllipse(in: circle)
+        } else {
+            ctx.setFillColor(CGColor(srgbRed: 0.1, green: 0.1, blue: 0.12, alpha: 0.9)); ctx.fillEllipse(in: circle)
+            ctx.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.95)); ctx.setLineWidth(2.5*scale); ctx.strokeEllipse(in: circle)
+        }
+        return ctx.makeImage().map { CIImage(cgImage: $0) }
     }
     static func backgroundImage(_ background: StudioBackground, canvas: CGSize) -> CIImage {
         let bounds = CGRect(origin: .zero, size: canvas)
@@ -80,11 +91,7 @@ final class StudioRenderer: @unchecked Sendable {
         case .none: return CIImage(color: .black).cropped(to: bounds)
         case .color(let r, let g, let b): return CIImage(color: CIColor(red: r, green: g, blue: b)).cropped(to: bounds)
         case .gradient(let index):
-            let pair = gradients[min(max(index, 0), gradients.count-1)]
-            let gradient = CIFilter.linearGradient()
-            gradient.point0 = CGPoint(x: 0, y: canvas.height); gradient.point1 = CGPoint(x: canvas.width, y: 0)
-            gradient.color0 = pair.0; gradient.color1 = pair.1
-            return gradient.outputImage?.cropped(to: bounds) ?? CIImage(color: pair.0).cropped(to: bounds)
+            return Backdrops.image(index, size: canvas).map { CIImage(cgImage: $0) } ?? CIImage(color: .black).cropped(to: bounds)
         case .image(let path):
             guard let image = CIImage(contentsOf: URL(fileURLWithPath: path), options: [.applyOrientationProperty: true]), image.extent.width > 0 else {
                 return backgroundImage(.gradient(0), canvas: canvas)
@@ -101,7 +108,12 @@ final class StudioRenderer: @unchecked Sendable {
         let w = source.extent.width, h = source.extent.height
         let sx = w/max(track.width, 1), sy = h/max(track.height, 1)
         var image = source
-        if plan.showCursor, !cursors.isEmpty, let cursor = cursors[min(track.shape(at: t), cursors.count-1)] {
+        if plan.showCursor, let marker = state.marker {
+            let p = timeline.cursor(at: t), m = sx*plan.cursorScale*timeline.pressScale(at: t)
+            let e = marker.extent
+            image = marker.transformed(by: CGAffineTransform(scaleX: m, y: m).concatenating(CGAffineTransform(translationX: p.x*sx-e.width*m/2, y: h-p.y*sy-e.height*m/2)), highQualityDownsample: true).composited(over: image)
+        }
+        if plan.showCursor, plan.cursorStyle != .dot, !cursors.isEmpty, let cursor = cursors[min(track.shape(at: t), cursors.count-1)] {
             let shape = track.shapes[min(track.shape(at: t), track.shapes.count-1)]
             let p = timeline.cursor(at: t)
             let s = track.scale*sx*plan.cursorScale*timeline.pressScale(at: t)
@@ -122,7 +134,7 @@ final class StudioRenderer: @unchecked Sendable {
             if speed > 0.05 {
                 let blur = CIFilter.zoomBlur()
                 blur.inputImage = image.clampedToExtent(); blur.center = CGPoint(x: inner.midX, y: inner.midY)
-                blur.amount = Float(min(speed*6, 14)*canvas.width/1920)
+                blur.amount = Float(min(speed*6, 14)*canvas.width/1920*plan.motionBlurAmount*2)
                 image = blur.outputImage?.cropped(to: inner) ?? image
             }
         }
@@ -168,7 +180,7 @@ enum StudioExporter {
         let asset = AVURLAsset(url: video)
         let duration = try await asset.load(.duration).seconds
         let size = try await videoSize(asset)
-        let renderer = StudioRenderer(track: track, plan: plan, duration: duration, video: size, canvas: plan.output.size(for: size))
+        let renderer = StudioRenderer(track: track, plan: plan, duration: duration, video: size, canvas: plan.canvasSize(for: size))
         let composition = try await composition(asset: asset, renderer: renderer)
         let preset = plan.hevc ? AVAssetExportPresetHEVCHighestQuality : AVAssetExportPresetHighestQuality
         guard let session = AVAssetExportSession(asset: asset, presetName: preset) else { throw ShotError.message("Cannot export this recording.") }

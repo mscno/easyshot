@@ -23,8 +23,20 @@ struct TextAnalysis: Sendable {
             for observation in request.results ?? [] {
                 guard let candidate = observation.topCandidates(1).first else { continue }
                 result.lines.append(pixels(observation.boundingBox))
-                for match in scanner.scan(candidate.string) {
-                    guard let box = try? candidate.boundingBox(for: match.range)?.boundingBox else { continue }
+                let string = candidate.string
+                for match in scanner.scan(string) {
+                    // Vision locates whole words. For a secret inside a longer token (KEY=sk-…), narrow the
+                    // token's box by character position, widened by half a character so no edge escapes.
+                    var token = match.range
+                    while token.lowerBound > string.startIndex,!string[string.index(before: token.lowerBound)].isWhitespace { token = string.index(before: token.lowerBound)..<token.upperBound }
+                    while token.upperBound < string.endIndex,!string[token.upperBound].isWhitespace { token = token.lowerBound..<string.index(after: token.upperBound) }
+                    guard var box = try? candidate.boundingBox(for: token)?.boundingBox else { continue }
+                    if token != match.range {
+                        let count = CGFloat(string.distance(from: token.lowerBound,to: token.upperBound))
+                        let a = (CGFloat(string.distance(from: token.lowerBound,to: match.range.lowerBound))-0.5)/count
+                        let b = (CGFloat(string.distance(from: token.lowerBound,to: match.range.upperBound))+0.5)/count
+                        box = CGRect(x: box.minX+box.width*max(0,a),y: box.minY,width: box.width*(min(1,b)-max(0,a)),height: box.height)
+                    }
                     let rect = pixels(box).insetBy(dx: -3,dy: -3).intersection(CGRect(x: 0,y: 0,width: w,height: h))
                     if !rect.isNull { result.secrets.append(Secret(rect: rect.integral,kind: match.kind,text: match.text)) }
                 }
