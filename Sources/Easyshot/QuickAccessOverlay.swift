@@ -112,7 +112,7 @@ import EasyshotCore
         return panel
     }
 
-    enum Action { case annotate, copy, save, link, pin, text, trim, gif, close }
+    enum Action { case annotate, copy, save, link, pin, text, trim, gif, close, copyLink, markdown, openLink, retry }
     private func perform(_ action: Action,_ id: UUID) {
         guard let clip = clips[id] else { return }
         switch action {
@@ -126,6 +126,10 @@ import EasyshotCore
             Task { await controller.uploadClip(clip) }
         case .text: copyText(clip)
         case .gif: exportGIF(clip)
+        case .copyLink: controller.copyShareLink(clip)
+        case .markdown: controller.copyShareMarkdown(clip)
+        case .openLink: controller.openShare(clip)
+        case .retry: controller.retryShare(clip)
         }
     }
     private func saveAs(_ clip: Clip) {
@@ -198,6 +202,7 @@ struct QuickAccessCard: View {
     let cloud: Bool
     let perform: (QuickAccess.Action) -> Void
     let hover: (Bool) -> Void
+    @ObservedObject private var shares = ShareCenter.shared
     @State private var thumbnail: NSImage?
     @State private var duration: Double?
     var body: some View {
@@ -212,6 +217,9 @@ struct QuickAccessCard: View {
                 Button { perform(.close) } label: { Image(systemName: "xmark.circle.fill").font(.system(size: 17)).symbolRenderingMode(.hierarchical) }
                     .buttonStyle(.plain).padding(6).help("Close · swipe to dismiss").accessibilityLabel("Close")
             }
+            .overlay(alignment: .bottomTrailing) {
+                if let share = shares.state(clip) { ShareBadge(share: share).padding(7) }
+            }
             .overlay(alignment: .bottomLeading) {
                 if let duration { Text(String(format: "%d:%02d",Int(duration)/60,Int(duration)%60)).font(.system(size: 10,weight: .semibold,design: .monospaced)).padding(.horizontal,6).padding(.vertical,3).background(.black.opacity(0.55),in: Capsule()).foregroundStyle(.white).padding(7) }
             }
@@ -221,7 +229,17 @@ struct QuickAccessCard: View {
             HStack(spacing: 0) {
                 button("doc.on.doc","Copy",.copy)
                 button("square.and.arrow.down","Save As…",.save)
-                if clip.isVideo {
+                if clip.isVideo,let share = shares.state(clip) {
+                    switch share.status {
+                    case .ready:
+                        button("link","Copy link",.copyLink)
+                        button("chevron.left.forwardslash.chevron.right","Copy Markdown for GitHub",.markdown)
+                        button("safari","Open in browser",.openLink)
+                    case .uploading: button("link","Copy link · plays when the upload finishes",.copyLink)
+                    case .failed: button("arrow.clockwise","Upload failed · Retry",.retry)
+                    }
+                    button("scissors","Trim",.trim)
+                } else if clip.isVideo {
                     button("scissors","Trim",.trim)
                     button("photo.stack","Export GIF",.gif)
                 } else {
@@ -244,5 +262,21 @@ struct QuickAccessCard: View {
     func button(_ symbol: String,_ title: String,_ action: QuickAccess.Action) -> some View {
         Button { perform(action) } label: { Image(systemName: symbol).font(.system(size: 14)).frame(maxWidth: .infinity,minHeight: 30).contentShape(Rectangle()) }
             .buttonStyle(.plain).help(title).accessibilityLabel(title)
+    }
+}
+
+/// Cloud state of a shared recording, shown on its thumbnail.
+struct ShareBadge: View {
+    let share: CloudShare
+    var body: some View {
+        HStack(spacing: 4) {
+            switch share.status {
+            case .uploading: ProgressView().controlSize(.mini); Text("Uploading")
+            case .ready: Image(systemName: "link"); Text("Shared")
+            case .failed: Image(systemName: "exclamationmark.triangle.fill"); Text("Upload failed")
+            }
+        }.font(.system(size: 10,weight: .semibold)).padding(.horizontal,6).padding(.vertical,3)
+            .background(share.status == .failed ? Color.red.opacity(0.8) : Color.black.opacity(0.55),in: Capsule()).foregroundStyle(.white)
+            .help(share.error ?? share.url ?? "")
     }
 }

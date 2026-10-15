@@ -90,12 +90,14 @@ enum MCPMode {
             ]),
             MCPTool("screenshot","Capture a display, window, area or the active window at native resolution. Saves a PNG/JPEG (per Settings) and returns its path, metadata and a downscaled preview.",properties: target.merging(preview) { a,_ in a }),
             MCPTool("ocr","Recognize text and QR/barcodes on screen (same targets as screenshot) or in an image file, with each line's frame. Frames are global points for screen targets and pixels for files.",properties: target.merging(path) { a,_ in a }),
-            MCPTool("record_start","Start an MP4 screen recording of a display, window, area or the active window. Audio follows Easyshot Settings. Returns a recording_id.",properties: target.merging([
+            MCPTool("record_start","Start an MP4 screen recording of a display, window, area or the active window. Audio follows Easyshot Settings. Returns a recording_id. With share: true it also returns an Easyshot Cloud share_url immediately; parts upload while recording and the link plays as soon as record_stop returns.",properties: target.merging([
+                "share": ["type": "boolean","description": "Record & Share: upload to Easyshot Cloud while recording and return a share link. Requires signing in. Default false."],
+                "title": ["type": "string","description": "Title shown on the watch page when share is true."],
                 "fps": ["type": "integer","minimum": 1,"maximum": 120,"description": "Frames per second. Default from Settings."],
                 "cursor": ["type": "boolean","description": "Show the pointer. Default true."],
                 "max_seconds": ["type": "number","minimum": 1,"maximum": 3600,"description": "Stop automatically after this many seconds. Default 300."]
             ]) { a,_ in a }),
-            MCPTool("record_stop","Stop a recording and return its MP4 path and duration.",properties: ["recording_id": ["type": "string","description": "From record_start. Optional when only one recording exists."]]),
+            MCPTool("record_stop","Stop a recording and return its MP4 path and duration; for a shared recording also the ready share_url and Markdown for GitHub.",properties: ["recording_id": ["type": "string","description": "From record_start. Optional when only one recording exists."]]),
             MCPTool("upload","Upload an image file to Easyshot Cloud and return a short share link (expires after 30 days). Requires signing in under Settings → Easyshot Cloud.",properties: path.merging(["copy": ["type": "boolean","description": "Also copy the link to the clipboard. Default false."],
                                      "redact": ["type": "boolean","description": "Black out detected secrets (API keys, tokens, emails, card numbers) before uploading. Default false: uploads with findings are refused."],
                                      "allow_secrets": ["type": "boolean","description": "Upload unchanged despite findings. Only when the user has confirmed the image is safe to share."]]) { a,_ in a },required: ["path"]),
@@ -107,7 +109,7 @@ enum MCPMode {
     private lazy var store = ClipStore()
     private var refreshed = -Double.infinity
     private var requestedScreen = false
-    private struct Recording { let recorder: Recorder; let url: URL; let size: CGSize; let started: Date; var timeout: Task<Void,Never>? }
+    private struct Recording { let recorder: Recorder; let url: URL; let size: CGSize; let started: Date; var timeout: Task<Void,Never>?; var share: ShareRecording? = nil; var voice = false }
     private var recordings: [String: Recording] = [:]
     private var finished: [String: [String: Any]] = [:]
 
@@ -270,15 +272,28 @@ enum MCPMode {
         try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
         let url = folder.appendingPathComponent(CaptureFiles.filename(extension: "mp4"))
         let id = String(UUID().uuidString.prefix(8)).lowercased()
+        var share: ShareRecording?
+        if args.bool("share",default: false) {
+            guard CloudSession.isAvailable else { throw ShotError.message("Easyshot Cloud is not available in this edition.") }
+            guard CloudSession.shared.isSignedIn,let client = CloudSession.shared.client else { throw ShotError.message("Not signed in. Ask the user to sign in under Easyshot Settings → Easyshot Cloud.") }
+            share = try ShareRecording(client: client,url: url,title: args.string("title") ?? AppController.shareTitle()) { _ in }
+        }
         let recorder = Recorder()
         recorder.didFail = { [weak self] error in Task { @MainActor in _ = try? await self?.finish(id,note: "Recording stopped: \(error.localizedDescription)") } }
-        try await recorder.start(filter: filter,configuration: config,url: url)
+        do { try await recorder.start(filter: filter,configuration: config,url: url,spool: share?.spool) }
+        catch { if let share { await share.cancel(); try? FileManager.default.removeItem(at: url) }; throw error }
+        var reply: [String: Any] = ["recording_id": id,"path": url.path,"width": config.width,"height": config.height]
+        if let share {
+            do { let video = try await share.waitForVideo(); reply["share_url"] = video.shareUrl }
+            catch { reply["share_error"] = "The link could not be created (\(error.localizedDescription)); the recording continues locally." }
+        }
         let limit = min(3600,max(1,args.double("max_seconds") ?? 300))
         recordings[id] = Recording(recorder: recorder,url: url,size: CGSize(width: config.width,height: config.height),started: Date(),timeout: Task { [weak self] in
             do { try await Task.sleep(for: .seconds(limit)) } catch { return }
             _ = try? await self?.finish(id,note: "Stopped automatically after \(Int(limit)) seconds.")
-        })
-        return MCP.toolResult([MCP.json(["recording_id": id,"path": url.path,"width": config.width,"height": config.height,"max_seconds": limit])])
+        },share: share,voice: p.microphone)
+        reply["max_seconds"] = limit
+        return MCP.toolResult([MCP.json(reply)])
     }
     private func recordStop(_ args: MCPArguments) async throws -> [String: Any] {
         let ids = Set(recordings.keys).union(finished.keys)
@@ -298,10 +313,30 @@ enum MCPMode {
         if let note { result["note"] = note }
         do {
             try await recording.recorder.stop()
-            if Preferences.shared.microphone { try? await VideoTools.mixAudio(recording.url) }
-            result["duration_seconds"] = (try? await AVURLAsset(url: recording.url).load(.duration).seconds) ?? Date().timeIntervalSince(recording.started)
+            // A shared recording's file is the uploaded fragmented MP4; mixing would rewrite it.
+            if recording.share == nil,Preferences.shared.microphone { try? await VideoTools.mixAudio(recording.url) }
+            let duration = (try? await AVURLAsset(url: recording.url).load(.duration).seconds) ?? Date().timeIntervalSince(recording.started)
+            result["duration_seconds"] = duration
             result["bytes"] = (try? FileManager.default.attributesOfItem(atPath: recording.url.path)[.size] as? Int) ?? 0
-            store.add(Clip(path: recording.url.path,kind: "Recording",width: Int(recording.size.width),height: Int(recording.size.height)))
+            var clip = Clip(path: recording.url.path,kind: "Recording",width: Int(recording.size.width),height: Int(recording.size.height))
+            if let share = recording.share {
+                do {
+                    let video = try await share.finish(durationMs: Int(duration*1000),width: clip.width,height: clip.height)
+                    clip.share = CloudShare(video: video,title: nil,status: .ready)
+                    result["share_url"] = video.shareUrl; result["share_status"] = video.status; result["markdown"] = clip.share?.markdown
+                    if let warning = try? await ShareExtras.uploadPoster(client: share.client,video: video.id,file: recording.url) { result["warning"] = warning }
+                    if recording.voice,Preferences.shared.shareTranscribe {
+                        // Captions can take a while; the link is already playable without them.
+                        let client = share.client,file = recording.url
+                        Task.detached { _ = try? await ShareExtras.uploadTranscript(client: client,video: video.id,file: file) }
+                        result["transcript"] = "uploading in the background"
+                    }
+                } catch {
+                    clip.share = CloudShare(video: share.video,title: nil,status: .failed,error: error.localizedDescription)
+                    result["share_error"] = "Upload failed (\(error.localizedDescription)); the recording is saved locally and can be retried from the Easyshot Library."
+                }
+            }
+            store.add(clip)
         } catch {
             result["error"] = error.localizedDescription
             finished[id] = result

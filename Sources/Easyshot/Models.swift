@@ -132,6 +132,8 @@ struct Clip: Codable, Identifiable, Equatable {
     var width: Int
     var height: Int
     var text: String?
+    /// Record & Share: the Cloud video this recording uploads to.
+    var share: CloudShare?
     var url: URL { URL(fileURLWithPath: path) }
     var isVideo: Bool { url.pathExtension.lowercased() == "mp4" || url.pathExtension.lowercased() == "mov" }
     var image: NSImage? { isVideo ? nil : NSImage(contentsOf: url) }

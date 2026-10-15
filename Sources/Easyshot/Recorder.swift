@@ -16,6 +16,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var effects: RecordingEffects?
     private var telemetry: CursorTelemetry?
+    /// Record & Share: the writer emits fragmented-MP4 segments into this spool, which is both the local
+    /// recording and the source of upload parts. The writer starts at the first frame, because a segmented
+    /// writer needs its initial segment time before `startWriting`.
+    private var spool: SegmentSpool?
+    private var outputURL: URL?
     private var started = false
     private var ending = false
     private var sampleError: Error?
@@ -51,17 +56,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     }
 
     /// With `telemetry`, frames pass through untouched and the cursor is logged for Studio export.
-    func start(filter: SCContentFilter,configuration: SCStreamConfiguration,url: URL,effects: RecordingEffects? = nil,telemetry: CursorTelemetry? = nil) async throws {
-        let writer = try AVAssetWriter(outputURL: url,fileType: .mp4)
-        let video = AVAssetWriterInput(mediaType: .video,outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: configuration.width,
-            AVVideoHeightKey: configuration.height,
-            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: min(35_000_000,max(4_000_000,configuration.width*configuration.height*5))]
-        ])
-        video.expectsMediaDataInRealTime = true
+    func start(filter: SCContentFilter,configuration: SCStreamConfiguration,url: URL,effects: RecordingEffects? = nil,telemetry: CursorTelemetry? = nil,spool: SegmentSpool? = nil) async throws {
+        let writer = try Self.makeWriter(url: url,spool: spool)
+        // A delegate switches the writer to segment delivery; a plain file writer must not have one.
+        if spool != nil { writer.delegate = self }
+        let video = Self.videoInput(width: configuration.width,height: configuration.height,fragmented: spool != nil)
         guard writer.canAdd(video) else { throw ShotError.message("Video encoder unavailable at this resolution.") }
         writer.add(video)
+        self.spool = spool; outputURL = url
         self.effects = effects
         if effects != nil {
             adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: video,sourcePixelBufferAttributes: [
@@ -77,22 +79,41 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         configuration.capturesAudio = Preferences.shared.systemAudio
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48000; configuration.channelCount = 2
-        if configuration.capturesAudio { audio = audioInput(channels: 2); writer.add(audio!) }
-        if #available(macOS 15.0, *),Preferences.shared.microphone {
+        // Browsers play only the first audio track, so a shared recording puts the voice first.
+        let voiceFirst = spool != nil && Preferences.shared.microphone
+        if voiceFirst,#available(macOS 15.0, *) { configuration.captureMicrophone = true; mic = Self.audioInput(channels: 1); writer.add(mic!) }
+        if configuration.capturesAudio { audio = Self.audioInput(channels: 2); writer.add(audio!) }
+        if !voiceFirst,#available(macOS 15.0, *),Preferences.shared.microphone {
             configuration.captureMicrophone = true
-            mic = audioInput(channels: 1); writer.add(mic!)
+            mic = Self.audioInput(channels: 1); writer.add(mic!)
         }
         let stream = SCStream(filter: filter,configuration: configuration,delegate: self)
         self.stream = stream
         try stream.addStreamOutput(self,type: .screen,sampleHandlerQueue: queue)
         if configuration.capturesAudio { try stream.addStreamOutput(self,type: .audio,sampleHandlerQueue: queue) }
         if #available(macOS 15.0, *),configuration.captureMicrophone { try stream.addStreamOutput(self,type: .microphone,sampleHandlerQueue: queue) }
-        guard writer.startWriting() else { throw writer.error ?? ShotError.message("Could not start video writer.") }
+        if spool == nil { guard writer.startWriting() else { throw writer.error ?? ShotError.message("Could not start video writer.") } }
         telemetry?.start(fps: Int(1/max(configuration.minimumFrameInterval.seconds,1/120)),queue: queue)
         do { try await stream.startCapture() }
-        catch { telemetry?.cancel(); writer.cancelWriting(); self.stream = nil; throw error }
+        catch { telemetry?.cancel(); if writer.status == .writing { writer.cancelWriting() }; self.stream = nil; throw error }
     }
-    private func audioInput(channels: Int) -> AVAssetWriterInput {
+    /// A plain MP4 file, or with `spool` a fragmented MP4 delivered segment by segment (init segment first).
+    static func makeWriter(url: URL,spool: SegmentSpool?) throws -> AVAssetWriter {
+        guard spool != nil else { return try AVAssetWriter(outputURL: url,fileType: .mp4) }
+        let writer = AVAssetWriter(contentType: .mpeg4Movie)
+        writer.outputFileTypeProfile = .mpeg4AppleHLS
+        writer.preferredOutputSegmentInterval = CMTime(seconds: 1,preferredTimescale: 600)
+        return writer
+    }
+    static func videoInput(width: Int,height: Int,fragmented: Bool) -> AVAssetWriterInput {
+        var compression: [String: Any] = [AVVideoAverageBitRateKey: min(35_000_000,max(4_000_000,width*height*5))]
+        // Segments split at sync samples; a keyframe each second keeps parts flowing during a recording.
+        if fragmented { compression[AVVideoMaxKeyFrameIntervalDurationKey] = 1.0 }
+        let input = AVAssetWriterInput(mediaType: .video,outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264,AVVideoWidthKey: width,AVVideoHeightKey: height,AVVideoCompressionPropertiesKey: compression])
+        input.expectsMediaDataInRealTime = true
+        return input
+    }
+    static func audioInput(channels: Int) -> AVAssetWriterInput {
         let input = AVAssetWriterInput(mediaType: .audio,outputSettings: [
             AVFormatIDKey: kAudioFormatMPEG4AAC,AVSampleRateKey: 48000,AVNumberOfChannelsKey: channels,AVEncoderBitRateKey: 128000
         ])
@@ -100,12 +121,18 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
         return input
     }
     func stream(_ stream: SCStream,didOutputSampleBuffer sample: CMSampleBuffer,of type: SCStreamOutputType) {
-        guard sample.isValid,!ending,let writer,writer.status == .writing else { return }
+        guard sample.isValid,!ending,let writer,writer.status == .writing || (spool != nil && !started && writer.status == .unknown) else { return }
         if type == .screen {
             guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample,createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
                   let raw = attachments.first?[.status] as? Int,SCFrameStatus(rawValue: raw) == .complete else { return }
             guard let (time,delta) = map(sample.presentationTimeStamp,track: 0) else { return }
-            if !started { writer.startSession(atSourceTime: time); telemetry?.setOrigin(time); started = true }
+            if !started {
+                if spool != nil {
+                    writer.initialSegmentStartTime = time
+                    guard writer.startWriting() else { sampleError = writer.error; return }
+                }
+                writer.startSession(atSourceTime: time); telemetry?.setOrigin(time); started = true
+            }
             if video?.isReadyForMoreMediaData == true {
                 if let effects,let adaptor,let pool = adaptor.pixelBufferPool,let input = CMSampleBufferGetImageBuffer(sample) {
                     if let output = effects.composite(input,pool: pool),!adaptor.append(output,withPresentationTime: time) { sampleError = writer.error }
@@ -122,7 +149,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
     func stop() async throws {
         guard let stream,let writer else { return }
         do { try await stream.stopCapture() }
-        catch { telemetry?.cancel(); writer.cancelWriting(); self.stream = nil; throw error }
+        catch { telemetry?.cancel(); if writer.status == .writing { writer.cancelWriting() }; spool?.close(); self.stream = nil; throw error }
         let hasFrames: Bool = await withCheckedContinuation { continuation in
             queue.async {
                 self.ending = true
@@ -130,15 +157,23 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sen
                 continuation.resume(returning: self.started)
             }
         }
-        guard hasFrames else { telemetry?.cancel(); writer.cancelWriting(); throw ShotError.message("No video frames were received. Check Screen Recording permission.") }
+        guard hasFrames else { telemetry?.cancel(); if writer.status == .writing { writer.cancelWriting() }; spool?.close(); throw ShotError.message("No video frames were received. Check Screen Recording permission.") }
         await writer.finishWriting()
+        // Every segment, including the last, has been delivered once finishWriting returns.
+        spool?.close()
         self.stream = nil
         if writer.status != .completed { telemetry?.cancel(); throw writer.error ?? sampleError ?? ShotError.message("Recording could not be finalized.") }
         // A missing sidecar only disables Studio editing; the recording itself is intact.
-        let output = writer.outputURL
+        let output = outputURL ?? writer.outputURL
         try? await withCheckedThrowingContinuation { (c: CheckedContinuation<Void,Error>) in
             queue.async { let clock = self.clock; c.resume(with: Result { try self.telemetry?.finish(video: output,retime: { clock.outputTime($0) },clamp: { clock.clampedOutputTime($0) }) }) }
         }
+    }
+}
+
+extension Recorder: AVAssetWriterDelegate {
+    func assetWriter(_ writer: AVAssetWriter,didOutputSegmentData segmentData: Data,segmentType: AVAssetSegmentType,segmentReport: AVAssetSegmentReport?) {
+        do { try spool?.append(segmentData) } catch { queue.async { self.sampleError = error } }
     }
 }
 

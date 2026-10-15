@@ -135,7 +135,7 @@ final class CaptureOverlayWindow: NSPanel {
         }
         presentSelectionWindows()
         let screen = NSScreen.pointerScreen
-        let panel = CaptureToolbarPanel(contentRect: CGRect(x: screen.visibleFrame.midX-(CloudSession.isAvailable ? 348 : 330),y: screen.visibleFrame.minY+24,width: CloudSession.isAvailable ? 696 : 660,height: 62),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
+        let panel = CaptureToolbarPanel(contentRect: CGRect(x: screen.visibleFrame.midX-(CloudSession.isAvailable ? 384 : 348),y: screen.visibleFrame.minY+24,width: CloudSession.isAvailable ? 768 : 696,height: 62),styleMask: [.borderless,.nonactivatingPanel],backing: .buffered,defer: false)
         panel.overlay = self; panel.acceptsMouseMovedEvents = true; panel.hidesOnDeactivate = false
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue+1)
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true; panel.isReleasedWhenClosed = false
@@ -650,12 +650,20 @@ struct CaptureToolbar: View {
                         .font(.system(size: 12)).padding(.horizontal,7).frame(height: 38)
                 }.buttonStyle(.plain).captureHelp("Options\nChoose folder, clipboard, thumbnail, timer and area size. Open Settings or Library.",using: tooltips).accessibilityLabel("Capture options")
                     .popover(isPresented: $options,arrowEdge: .top) { optionsView }
+                Button { tooltips.dismiss(); state.purpose = state.purpose == "Recording" ? "Screenshot" : "Recording" } label: {
+                    Image(systemName: "record.circle").font(.system(size: 18,weight: .regular)).frame(width: 34,height: 40)
+                        .background(state.purpose == "Recording" ? Color.primary.opacity(0.12) : Color.clear,in: RoundedRectangle(cornerRadius: 7))
+                }.buttonStyle(.plain).captureHelp("Record Screen\nRecord the selection as MP4. Click again for screenshots.",using: tooltips).accessibilityLabel("Record screen")
                 if CloudSession.isAvailable {
+                    Button { tooltips.dismiss(); state.purpose = state.purpose == AppController.recordSharePurpose ? "Screenshot" : AppController.recordSharePurpose } label: {
+                        Image(systemName: "video.badge.waveform").font(.system(size: 18,weight: .regular)).frame(width: 34,height: 40)
+                            .background(state.purpose == AppController.recordSharePurpose ? Color.primary.opacity(0.12) : Color.clear,in: RoundedRectangle(cornerRadius: 7))
+                    }.buttonStyle(.plain).captureHelp("Record & Share\nRecord the selection and copy an Easyshot Cloud link right away. It uploads while you record, so the link plays the moment you stop.",using: tooltips).accessibilityLabel("Record and share")
                     Button { tooltips.dismiss(); state.uploadCapture?() } label: {
                         Image(systemName: "link.badge.plus").font(.system(size: 18,weight: .regular)).frame(width: 34,height: 40)
                     }.buttonStyle(.plain).captureHelp("Capture & Copy Link · \(preferences.uploadKey.uppercased()) or ⇧Return\nUpload the capture to Easyshot Cloud and copy a shareable link, for pasting over SSH or into chat.",using: tooltips).accessibilityLabel("Capture and copy link")
                 }
-                Button(state.needsPermission ? "Allow Access" : state.purpose == "Recording" ? "Record" : state.purpose == "Upload" ? "Upload" : state.isText ? "Copy Text" : "Capture") { state.capture?() }
+                Button(state.needsPermission ? "Allow Access" : state.purpose == "Recording" ? "Record" : state.purpose == AppController.recordSharePurpose ? "Record & Share" : state.purpose == "Upload" ? "Upload" : state.isText ? "Copy Text" : "Capture") { state.capture?() }
                     .buttonStyle(.glassProminent).tint(.accentColor).controlSize(.large).keyboardShortcut(.defaultAction)
                     .font(.system(size: 12,weight: .medium)).captureHelp("\(state.needsPermission ? "Allow Screen Recording Access" : state.purpose == "Recording" ? "Record · Return" : "Capture · Return")\n\(hint)",using: tooltips)
                     .accessibilityHint(hint)

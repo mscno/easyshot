@@ -39,6 +39,11 @@ struct RecordScreenIntent: EasyshotIntent {
     static let description = IntentDescription("Select an area to record, or stop the current recording.")
     static let action = LaunchAction.record
 }
+struct RecordShareIntent: EasyshotIntent {
+    static let title: LocalizedStringResource = "Record & Share"
+    static let description = IntentDescription("Record an area and copy its Easyshot Cloud link right away. Parts upload while you record, so the link plays the moment you stop.")
+    static let action = LaunchAction.recordShare
+}
 struct OpenLibraryIntent: EasyshotIntent {
     static let title: LocalizedStringResource = "Open Library"
     static let description = IntentDescription("Browse, search and share past captures.")
@@ -55,6 +60,7 @@ struct EasyshotShortcuts: AppShortcutsProvider {
         AppShortcut(intent: CaptureAreaIntent(),phrases: ["Capture area with \(.applicationName)","Take a screenshot with \(.applicationName)"],shortTitle: "Capture Area",systemImageName: "crop")
         AppShortcut(intent: CaptureTextIntent(),phrases: ["Capture text with \(.applicationName)"],shortTitle: "Capture Text",systemImageName: "text.viewfinder")
         AppShortcut(intent: RecordScreenIntent(),phrases: ["Record the screen with \(.applicationName)"],shortTitle: "Record Screen",systemImageName: "record.circle")
+        AppShortcut(intent: RecordShareIntent(),phrases: ["Record and share with \(.applicationName)"],shortTitle: "Record & Share",systemImageName: "video.badge.waveform")
         AppShortcut(intent: CaptureWindowIntent(),phrases: ["Capture a window with \(.applicationName)"],shortTitle: "Capture Window",systemImageName: "macwindow")
         AppShortcut(intent: RepeatAreaIntent(),phrases: ["Repeat the last area with \(.applicationName)"],shortTitle: "Repeat Area",systemImageName: "arrow.counterclockwise")
     }

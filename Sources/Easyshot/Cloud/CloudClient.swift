@@ -39,12 +39,12 @@ struct CloudClient {
     struct Created { var screenshot: CloudScreenshot; var uploadURL: URL; var headers: [String: String]; var method: String }
     struct AuthResult { var token: String; var user: CloudUser }
 
-    private static let decoder: JSONDecoder = { let d = JSONDecoder(); d.keyDecodingStrategy = .convertFromSnakeCase; return d }()
+    static let decoder: JSONDecoder = { let d = JSONDecoder(); d.keyDecodingStrategy = .convertFromSnakeCase; return d }()
 
     private static let failureDecoder = JSONDecoder()
     private struct Failure: Decodable { struct Inner: Decodable { var message: String }; var error: Inner }
 
-    private func makeRequest(_ method: String,_ path: String,query: [URLQueryItem] = [],body: Data? = nil,authorized: Bool = true) throws -> URLRequest {
+    func makeRequest(_ method: String,_ path: String,query: [URLQueryItem] = [],body: Data? = nil,authorized: Bool = true) throws -> URLRequest {
         var components = URLComponents(url: baseURL.appendingPathComponent(path),resolvingAgainstBaseURL: false)!
         if !query.isEmpty { components.queryItems = query }
         var request = URLRequest(url: components.url!,timeoutInterval: 30)
@@ -58,7 +58,7 @@ struct CloudClient {
         if let body { request.setValue("application/json",forHTTPHeaderField: "Content-Type"); request.httpBody = body }
         return request
     }
-    private func send(_ request: URLRequest,authorized: Bool = true) async throws -> Data {
+    func send(_ request: URLRequest,authorized: Bool = true) async throws -> Data {
         let (data,response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw CloudError.invalidResponse }
         if http.statusCode == 401 && authorized { throw CloudError.notSignedIn }
@@ -70,7 +70,7 @@ struct CloudClient {
     private func request(_ method: String,_ path: String,query: [URLQueryItem] = []) async throws -> Data {
         try await send(makeRequest(method,path,query: query))
     }
-    private static let encoder: JSONEncoder = { let e = JSONEncoder(); e.keyEncodingStrategy = .convertToSnakeCase; return e }()
+    static let encoder: JSONEncoder = { let e = JSONEncoder(); e.keyEncodingStrategy = .convertToSnakeCase; return e }()
     private func shot(_ wire: Wire.Shot) throws -> CloudScreenshot {
         guard let created = RFC3339.parse(wire.createdAt),let expires = RFC3339.parse(wire.expiresAt) else { throw CloudError.invalidResponse }
         return CloudScreenshot(id: wire.id,slug: wire.slug,shareURL: wire.shareUrl,contentType: wire.contentType,byteSize: wire.byteSize,width: wire.width,height: wire.height,filename: wire.filename,createdAt: created,expiresAt: expires,imageURL: wire.imageUrl ?? "")

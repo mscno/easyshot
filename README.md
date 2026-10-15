@@ -83,6 +83,16 @@ Screenshots do not paste across SSH. Easyshot Cloud (direct-download edition onl
    - Library → ⋯ → **Upload & copy link** for an existing capture.
 3. The **Cloud** page lists everything you have uploaded, grouped by day, with expiry countdowns, copy-link and delete.
 
+### Record & Share
+
+Click **Record & Share** in the capture bar (the video button next to Record), run `easyshot://record-share`, the *Record & Share* App Intent, or the Raycast command. Select an area and press Return. The server creates the video first, so the watch-page link exists as recording starts. It is copied to the clipboard and shown in the recording pill. Turn off copying under **Settings → Easyshot Cloud**.
+
+- **Upload while recording.** The writer emits fragmented MP4 segments, about one per second. Segments are appended to the local recording, which is also the upload source. Parts of at least 5 MiB go directly to object storage with up to three in flight. Video never passes through the Easyshot server or waits in memory. During a network drop, recording continues and parts retry with backoff until the connection returns. Stopping sends only the last part and `complete`. Locally, a 30-second 3440×1440 recording (30 MB, six parts) became playable 224 ms after Stop. Pause/resume keeps segments continuous. The pill's trash button discards the recording and deletes the link.
+- **After the link is live**, a poster frame is uploaded so Slack, Linear and GitHub unfurl it. Then, if the microphone was recorded, the voice track is transcribed on this Mac with SpeechAnalyzer, falling back to on-device SFSpeechRecognizer, and uploaded as WebVTT captions. Neither step delays the link. In shared recordings the voice is the first audio track, because browsers play only the first; system audio follows as a second track.
+- **Secrets.** With **Check for secrets before uploading** on, the poster frame is scanned and detected secrets are blacked out in the poster. A video can't be redacted after the fact, so Easyshot warns instead of blocking. Delete the link from the Library if the warning applies.
+- **Quick Access and Library** show the upload state. Copy the link, **Copy Markdown for GitHub** (`[![title](…/thumbnail.jpg)](link)`, which renders the poster linking to the player) or open it in the browser. A failed upload shows **Retry**, which re-uploads the local file to the same link. The Library menu also renames or deletes the link and can share an existing recording.
+- **Agents.** `record_start` with `share: true` returns `share_url` immediately; `record_stop` returns it ready, with GitHub Markdown.
+
 ## Raycast and launcher integration
 
 Install Easyshot in `~/Applications` or `/Applications`. Add **`integrations/raycast`** through **Raycast Settings → Extensions → + → Add Script Directory**, then type **shot** to find the capture bar, Draw New Area, Repeat Area, Capture Text, Restore Last Capture, and Library commands. See [Raycast's Script Commands instructions](https://github.com/raycast/script-commands#install-script-commands-from-this-repository). The main Easyshot command opens the bottom bar with your last mode selected. You can assign it the alias `shot` in Raycast.
@@ -103,6 +113,7 @@ open 'easyshot://paste-upload'  # upload the clipboard image, copy a link
 open 'easyshot://cloud'         # Library, Cloud page
 open 'easyshot://capture-text'  # select an area, copy its text and QR codes
 open 'easyshot://record'        # select an area to record, or stop recording
+open 'easyshot://record-share'  # record with an instant Easyshot Cloud link, or stop
 open 'easyshot://restore-overlay' # reopen the last closed Quick Access card
 open 'easyshot://edit?path=/absolute/file.png'  # open a file in the editor
 ```
@@ -167,6 +178,10 @@ dist/Easyshot.app/Contents/MacOS/Easyshot --self-test
 dist/Easyshot.app/Contents/MacOS/Easyshot --capture-test
 dist/Easyshot.app/Contents/MacOS/Easyshot --studio-test       # offline: synthetic 1440p60 → Studio export, no permissions
 dist/Easyshot.app/Contents/MacOS/Easyshot --editor-test       # offline: editor tools, secret OCR, backgrounds, retention, pause/resume, overlays, reframed export
+dist/Easyshot.app/Contents/MacOS/Easyshot --share-test        # offline: synthetic 1440p + voice → fragmented MP4 → live multipart upload to a mock Cloud
+dist/Easyshot.app/Contents/MacOS/Easyshot --transcribe-test FILE   # on-device WebVTT from a recording's voice track
+dist/Easyshot.app/Contents/MacOS/Easyshot --record-share-test http://localhost:8080 dev@easyshot.test easyshot-dev-password --seconds 30 --full
+                                                              # live: real screen → running server; checks link, ranges, poster, captions
 dist/Easyshot.app/Contents/MacOS/Easyshot --effects-bench     # offline: per-frame recording overlay cost at 1440p
 dist/Easyshot.app/Contents/MacOS/Easyshot --idle-exit-test
 dist/Easyshot.app/Contents/MacOS/Easyshot --escape-exit-test

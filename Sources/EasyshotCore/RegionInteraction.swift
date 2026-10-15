@@ -70,6 +70,8 @@ public enum LaunchAction: String, CaseIterable {
     case captureText = "capture-text", restoreOverlay = "restore-overlay"
     /// Start an area recording, or stop the current one.
     case record
+    /// Record & Share: record an area and get its Easyshot Cloud link as recording starts.
+    case recordShare = "record-share"
     public init?(url: URL) {
         guard ["easyshot","easyshot-dev"].contains(url.scheme?.lowercased() ?? ""),url.user == nil,url.password == nil,url.port == nil,
               url.path.isEmpty || url.path == "/",url.query == nil,url.fragment == nil,
