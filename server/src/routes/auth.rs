@@ -79,9 +79,17 @@ pub async fn issue_session(
     ))
 }
 
-/// With mail on: always `202 {"verification_required": true}` and no session (nothing
-/// tells whether the address had an account). Without mail: `201` with a session, or
-/// `409 EMAIL_TAKEN`.
+/// `202 {"verification_required": true, "attempt": "…"}`: the client asks for the mailed
+/// code and sends it to `otp/verify` with this attempt.
+fn verification_required(attempt: String) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"verification_required": true, "attempt": attempt})),
+    )
+}
+
+/// With mail on: always [`verification_required`] and no session (nothing tells whether
+/// the address had an account). Without mail: `201` with a session, or `409 EMAIL_TAKEN`.
 pub async fn register(
     State(st): State<AppState>,
     addr: ClientAddr,
@@ -102,12 +110,9 @@ pub async fn register(
 
     if st.mailer.enabled() {
         // Uniform for new, unverified and verified addresses; the session comes from the
-        // mailed code (`otp/verify`).
-        sign_up_attempt(&st, &email, body.password, hash).await?;
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({"verification_required": true})),
-        ));
+        // mailed code (`otp/verify` with this attempt).
+        let attempt = sign_up_attempt(&st, &email, hash).await?;
+        return Ok(verification_required(attempt));
     }
     // Without mail (local development) nothing can be verified: sign straight in.
     let id = Uuid::new_v4();
@@ -125,8 +130,8 @@ pub async fn register(
 pub enum PasswordLogin {
     SignedIn(LoginUser),
     /// Right password, unverified account, mail on: a verification code carrying this
-    /// password was mailed; sign-in finishes with that code.
-    VerifyFirst,
+    /// password was mailed, bound to this attempt nonce; sign-in finishes with both.
+    VerifyFirst(String),
     Invalid,
     /// Too many failures for this email recently.
     Locked,
@@ -158,27 +163,30 @@ pub async fn password_login(
     };
     repo::login_succeeded(&st.db, attempt).await?;
     if st.mailer.enabled() && !u.email_verified {
-        send_attempt_code(st, u.id, email, password, u.password_hash);
-        return Ok(PasswordLogin::VerifyFirst);
+        let attempt = send_attempt_code(st, u.id, email, u.password_hash);
+        return Ok(PasswordLogin::VerifyFirst(attempt));
     }
     repo::touch_user(&st.db, u.id, now).await?;
     Ok(PasswordLogin::SignedIn(u))
 }
 
+/// `200` with a session; for an unverified account (mail on) the same `202` as
+/// `register`, after which the mailed code finishes sign-in through `otp/verify`.
 pub async fn login(
     State(st): State<AppState>,
     addr: ClientAddr,
     ApiJson(body): ApiJson<Credentials>,
-) -> AppResult<Json<Value>> {
+) -> AppResult<(StatusCode, Json<Value>)> {
     throttle(&st, Bucket::Login, &addr)?;
     // Anything that can't be a valid email still counts as a failed credential, not a 400.
     let email = body.email.trim().to_lowercase();
     match password_login(&st, &email, body.password, addr.as_str()).await? {
         PasswordLogin::SignedIn(r) => {
             let user = user_json(r.id, &email, &r.plan, ts(r.created_at), r.email_verified);
-            issue_session(&st, user, r.id, clean_device(body.device_name)).await
+            let json = issue_session(&st, user, r.id, clean_device(body.device_name)).await?;
+            Ok((StatusCode::OK, json))
         }
-        PasswordLogin::VerifyFirst => Err(AppError::EmailNotVerified),
+        PasswordLogin::VerifyFirst(attempt) => Ok(verification_required(attempt)),
         PasswordLogin::Invalid => Err(AppError::InvalidCredentials),
         PasswordLogin::Locked => Err(AppError::RateLimited),
     }

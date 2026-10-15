@@ -42,6 +42,12 @@ pub fn generate_token(prefix: &str) -> (String, String) {
     (token, hash)
 }
 
+/// `(nonce, sha256_hex)` for a sign-up attempt: 43 URL-safe characters handed to whoever
+/// made the attempt; only the hash is stored, on the code mailed for it.
+pub fn generate_attempt() -> (String, String) {
+    generate_token("")
+}
+
 /// Uniform 6-digit code.
 pub fn generate_code() -> String {
     format!("{:06}", OsRng.gen_range(0..1_000_000))

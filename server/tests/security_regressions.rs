@@ -29,6 +29,17 @@ struct Res {
 }
 
 impl Res {
+    fn attempt(&self) -> String {
+        self.body
+            .split("name=\"attempt\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
     fn json(&self) -> Value {
         serde_json::from_str(&self.body).unwrap_or(Value::Null)
     }
@@ -139,13 +150,14 @@ impl App {
             )
             .await;
         assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
+        let attempt = r.json()["attempt"].as_str().unwrap().to_owned();
         let code = self.mailed_code(email, "Confirm").await;
         let r = self
             .api(
                 "POST",
                 "/v1/auth/otp/verify",
                 None,
-                Some(json!({"email": email, "code": code})),
+                Some(json!({"email": email, "code": code, "attempt": attempt})),
             )
             .await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.body);
@@ -308,10 +320,9 @@ async fn email_owner_must_not_inherit_attacker_credentials() {
             Some(json!({"email": email, "password": "supersecret123"})),
         )
         .await;
-    assert_eq!(
-        (reg.status, reg.json()),
-        (StatusCode::ACCEPTED, json!({"verification_required": true}))
-    );
+    assert_eq!(reg.status, StatusCode::ACCEPTED);
+    assert_eq!(reg.json()["verification_required"], true);
+    assert_eq!(reg.json()["attempt"].as_str().unwrap().len(), 43);
     let attacker_login = app
         .api(
             "POST",
@@ -320,8 +331,8 @@ async fn email_owner_must_not_inherit_attacker_credentials() {
             Some(json!({"email": email, "password": "supersecret123"})),
         )
         .await;
-    assert_eq!(attacker_login.status, StatusCode::FORBIDDEN);
-    assert_eq!(attacker_login.json()["error"]["code"], "EMAIL_NOT_VERIFIED");
+    assert_eq!(attacker_login.status, StatusCode::ACCEPTED);
+    assert_eq!(attacker_login.json()["verification_required"], true);
     assert!(attacker_login.json().get("token").is_none());
     let token = app
         .api(
@@ -352,9 +363,15 @@ async fn email_owner_must_not_inherit_attacker_credentials() {
         )
         .await;
     assert_eq!(signup.status, StatusCode::OK);
+    let attempt = signup.attempt();
     let code = app.mailed_code(email, "Confirm").await;
     let verify = app
-        .form("/verify", &[("email", email), ("code", &code)], None, false)
+        .form(
+            "/verify",
+            &[("email", email), ("code", &code), ("attempt", &attempt)],
+            None,
+            false,
+        )
         .await;
     assert_eq!(verify.status, StatusCode::SEE_OTHER);
     let victim = verify.cookie("sg_session").expect("victim session");
@@ -505,8 +522,14 @@ async fn review_complete_recovers_after_storage_commit_before_database_commit() 
         .unwrap();
     let key = row.text(0).unwrap();
     let upload = row.text(1).unwrap();
-    let presigned = app.api("POST", &format!("/v1/videos/{id}/parts"), Some(&token),
-        Some(json!({"parts":[{"part_number":1,"size":1000}]}))).await;
+    let presigned = app
+        .api(
+            "POST",
+            &format!("/v1/videos/{id}/parts"),
+            Some(&token),
+            Some(json!({"parts":[{"part_number":1,"size":1000}]})),
+        )
+        .await;
     assert_eq!(presigned.status, StatusCode::OK, "{}", presigned.body);
     let tag = app.store.put_part(&upload, 1, 1000);
     // Simulate the exact durable state after S3 commits and the process/DB fails

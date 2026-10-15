@@ -10,6 +10,12 @@
 //! a password reset), the mailbox owner claims it: every session and API token ends and
 //! the password becomes the one chosen with the sign-up attempt the code was mailed for
 //! (none for a sign-in code), whoever registered the address first.
+//!
+//! A code that carries a password is bound to its attempt: whoever made the attempt gets a
+//! random nonce (`attempt`), the code row keeps only its hash, and the code is accepted
+//! only together with it. Someone who signs up for the same address with another password
+//! therefore cannot have the mailbox owner confirm *their* password by typing the code
+//! from their (later) email: the owner's client holds the owner's attempt.
 
 use axum::Json;
 use axum::extract::State;
@@ -22,13 +28,13 @@ use uuid::Uuid;
 use super::ApiJson;
 use super::auth::{clean_device, issue_session, normalize_email, user_json};
 use crate::auth::{
-    AuthUser, Bucket, ClientAddr, UNUSABLE_PASSWORD, generate_code, hash_code,
-    hash_password_blocking, throttle, verify_password_blocking,
+    AuthUser, Bucket, ClientAddr, UNUSABLE_PASSWORD, generate_attempt, generate_code, hash_code,
+    hash_password_blocking, hash_token, throttle,
 };
 use crate::db::DbError;
 use crate::error::{AppError, AppResult};
 use crate::mailer::{CodePurpose, code_email};
-use crate::repo::{self, Issued, LoginUser, NewCode, now_ms, ts};
+use crate::repo::{self, Issued, LiveCode, LoginUser, NewCode, now_ms, ts};
 use crate::state::AppState;
 
 const MAX_GUESSES: i64 = 5;
@@ -40,25 +46,21 @@ pub fn send_code(st: &AppState, user_id: Uuid, email: &str, purpose: CodePurpose
     spawn_send(st, user_id, email, purpose, None);
 }
 
+/// The password and nonce hashes for one independent sign-up attempt.
+struct Attempt {
+    hash: String,
+    nonce_hash: String,
+}
+
 /// A verification code for one sign-up attempt, or for a password sign-in on an unverified
 /// account: it carries that attempt's password (`hash` of `password`), which becomes the
-/// account's password if the code claims it. When the resend limits hold the code back and
-/// the code already out carries a different password, that one is retired, so the mailbox
-/// owner can never confirm with a code that installs someone else's password.
-pub fn send_attempt_code(
-    st: &AppState,
-    user_id: Uuid,
-    email: &str,
-    password: String,
-    hash: String,
-) {
-    spawn_send(
-        st,
-        user_id,
-        email,
-        CodePurpose::VerifyEmail,
-        Some((password, hash)),
-    );
+/// account's password if the code claims it, and is bound to the returned nonce. A
+/// throttled attempt never changes or invalidates a code belonging to another attempt.
+pub fn send_attempt_code(st: &AppState, user_id: Uuid, email: &str, hash: String) -> String {
+    let (nonce, nonce_hash) = generate_attempt();
+    let attempt = Attempt { hash, nonce_hash };
+    spawn_send(st, user_id, email, CodePurpose::VerifyEmail, Some(attempt));
+    nonce
 }
 
 fn spawn_send(
@@ -66,7 +68,7 @@ fn spawn_send(
     user_id: Uuid,
     email: &str,
     purpose: CodePurpose,
-    attempt: Option<(String, String)>,
+    attempt: Option<Attempt>,
 ) {
     let st = st.clone();
     let email = email.to_string();
@@ -84,7 +86,7 @@ async fn issue_and_send(
     user_id: Uuid,
     email: &str,
     purpose: CodePurpose,
-    attempt: Option<(String, String)>,
+    attempt: Option<Attempt>,
 ) -> AppResult<()> {
     let now = now_ms();
     let p = purpose.as_str();
@@ -97,7 +99,9 @@ async fn issue_and_send(
         user_id,
         purpose: p,
         code_hash: &code_hash,
-        password_hash: attempt.as_ref().map(|(_, h)| h.as_str()),
+        bound: attempt
+            .as_ref()
+            .map(|a| (a.hash.as_str(), a.nonce_hash.as_str())),
         now,
         expires_at: now + ttl * 60_000,
     };
@@ -107,16 +111,38 @@ async fn issue_and_send(
             .send(code_email(purpose, email, &code, ttl, &id.to_string()))
             .await
             .map_err(|e| AppError::Internal(e.to_string())),
-        Issued::Throttled { live } => {
-            if let (Some((password, _)), Some(live)) = (attempt, live)
-                && let Some(carried) = live.password_hash
-                && !verify_password_blocking(password, carried).await?
-            {
-                repo::supersede_code(&st.db, live.id, now).await?;
-            }
-            Ok(())
-        }
+        Issued::Throttled => Ok(()),
     }
+}
+
+/// Resend for the same attempt without accepting a replacement password. An unknown
+/// nonce gets the same public response but cannot replace or invalidate another code.
+pub async fn resend_attempt(
+    st: &AppState,
+    user_id: Uuid,
+    email: &str,
+    nonce: &str,
+) -> AppResult<()> {
+    let wanted = hash_token(nonce);
+    let live =
+        repo::live_codes(&st.db, user_id, CodePurpose::VerifyEmail.as_str(), now_ms()).await?;
+    if let Some(c) = live
+        .into_iter()
+        .find(|c| c.attempt_hash.as_deref().is_some_and(|h| same(h, &wanted)))
+        && let Some(hash) = c.password_hash
+    {
+        spawn_send(
+            st,
+            user_id,
+            email,
+            CodePurpose::VerifyEmail,
+            Some(Attempt {
+                hash,
+                nonce_hash: wanted,
+            }),
+        );
+    }
+    Ok(())
 }
 
 /// What a spent code carried.
@@ -125,12 +151,19 @@ pub struct Spent {
     pub password_hash: Option<String>,
 }
 
+fn same(a: &str, b: &str) -> bool {
+    bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
 /// Validates a submitted code and spends it. Every failure is the same `InvalidCode`.
+/// The candidates are the newest unbound code and, with an `attempt` nonce, the live code
+/// bound to it; a bound code is never accepted without its nonce.
 pub async fn check_code(
     st: &AppState,
     user_id: Uuid,
     purpose: CodePurpose,
     submitted: &str,
+    attempt: Option<&str>,
 ) -> AppResult<Spent> {
     let submitted = submitted.trim();
     if submitted.len() != 6 || !submitted.bytes().all(|b| b.is_ascii_digit()) {
@@ -138,48 +171,73 @@ pub async fn check_code(
     }
     let now = now_ms();
     let p = purpose.as_str();
-    let live = repo::live_code(&st.db, user_id, p, now)
-        .await?
-        .ok_or(AppError::InvalidCode)?;
-    if !repo::spend_code_attempt(&st.db, live.id, MAX_GUESSES).await? {
-        return Err(AppError::InvalidCode);
-    }
+    let live = repo::live_codes(&st.db, user_id, p, now).await?;
+    let wanted = attempt.filter(|a| !a.is_empty()).map(hash_token);
+    let bound = wanted.as_deref().and_then(|w| {
+        live.iter()
+            .find(|c| c.attempt_hash.as_deref().is_some_and(|h| same(h, w)))
+    });
+    let unbound = live.iter().find(|c| c.attempt_hash.is_none());
     let expected = hash_code(p, user_id, submitted);
-    if !bool::from(expected.as_bytes().ct_eq(live.code_hash.as_bytes())) {
-        return Err(AppError::InvalidCode);
+    for c in [bound, unbound].into_iter().flatten() {
+        if let Some(spent) = try_code(st, c, &expected, now).await? {
+            return Ok(spent);
+        }
     }
-    if !repo::consume_code(&st.db, live.id, now).await? {
-        return Err(AppError::InvalidCode);
+    Err(AppError::InvalidCode)
+}
+
+async fn try_code(
+    st: &AppState,
+    c: &LiveCode,
+    expected: &str,
+    now: i64,
+) -> AppResult<Option<Spent>> {
+    if !repo::spend_code_attempt(&st.db, c.id, MAX_GUESSES).await?
+        || !same(expected, &c.code_hash)
+        || !repo::consume_code(&st.db, c.id, now).await?
+    {
+        return Ok(None);
     }
-    Ok(Spent {
-        password_hash: live.password_hash,
-    })
+    Ok(Some(Spent {
+        password_hash: c.password_hash.clone(),
+    }))
 }
 
 /// Sign in with an emailed code typed in anonymously (web `/verify`, `otp/verify`): a
-/// verification code (unverified accounts) or a sign-in code. The first proof for a
-/// never-verified account claims it (see the module docs); verified accounts keep their
-/// password, sessions and tokens. Returns the account, now verified.
-pub async fn sign_in_with_code(st: &AppState, email: &str, code: &str) -> AppResult<LoginUser> {
+/// verification code (unverified accounts; one carrying a password needs its `attempt`)
+/// or a sign-in code. The first proof for a never-verified account claims it (see the
+/// module docs); verified accounts keep their password, sessions and tokens. Returns the
+/// account, now verified.
+pub async fn sign_in_with_code(
+    st: &AppState,
+    email: &str,
+    code: &str,
+    attempt: Option<&str>,
+) -> AppResult<LoginUser> {
     let mut u = repo::find_user_for_login(&st.db, email)
         .await?
         .filter(|u| !u.disabled)
         .ok_or(AppError::InvalidCode)?;
     let mut spent = None;
     if !u.email_verified {
-        spent = check_code(st, u.id, CodePurpose::VerifyEmail, code)
-            .await
-            .ok();
+        spent = match check_code(st, u.id, CodePurpose::VerifyEmail, code, attempt).await {
+            Ok(s) => Some(s),
+            Err(AppError::InvalidCode) => None,
+            Err(e) => return Err(e),
+        };
     }
     let spent = match spent {
         Some(s) => s,
-        None => check_code(st, u.id, CodePurpose::LoginOtp, code).await?,
+        None => check_code(st, u.id, CodePurpose::LoginOtp, code, None).await?,
     };
     let now = now_ms();
     if !u.email_verified {
         let password = spent.password_hash.as_deref().unwrap_or(UNUSABLE_PASSWORD);
         // False when another claim or reset verified it meanwhile; that one stands.
-        repo::replace_credentials(&st.db, u.id, password, now, true).await?;
+        if !repo::replace_credentials(&st.db, u.id, password, now, true).await? {
+            return Err(AppError::InvalidCode);
+        }
         u.email_verified = true;
     }
     repo::touch_user(&st.db, u.id, now).await?;
@@ -198,35 +256,38 @@ pub async fn reset_password(
         .await?
         .filter(|u| !u.disabled)
         .ok_or(AppError::InvalidCode)?;
-    check_code(st, u.id, CodePurpose::ResetPassword, code).await?;
+    check_code(st, u.id, CodePurpose::ResetPassword, code, None).await?;
     let hash = hash_password_blocking(new_password).await?;
     repo::replace_credentials(&st.db, u.id, &hash, now_ms(), false).await?;
     Ok(u.id)
 }
 
 /// A sign-up attempt while mail is on (`password` already validated, `hash` its argon2
-/// hash). The visible outcome is the same for every address: a new account gets a
-/// verification code; an unverified one gets a verification code carrying this attempt's
-/// password (it does not change until that code claims the account); a verified one gets
-/// a sign-in code and keeps its password. No session either way.
-pub async fn sign_up_attempt(
-    st: &AppState,
-    email: &str,
-    password: String,
-    hash: String,
-) -> AppResult<()> {
+/// hash). The visible outcome is the same for every address, an attempt nonce of the same
+/// shape: a new account gets a verification code bound to it; an unverified one gets a
+/// verification code carrying this attempt's password, bound to it (the password does not
+/// change until that code claims the account); a verified one gets a sign-in code and
+/// keeps its password (the nonce is unbound). No session either way.
+pub async fn sign_up_attempt(st: &AppState, email: &str, hash: String) -> AppResult<String> {
     let id = Uuid::new_v4();
-    match repo::create_user(&st.db, id, email, &hash, now_ms()).await {
-        Ok(()) => send_attempt_code(st, id, email, password, hash),
-        Err(DbError::UniqueViolation) => match repo::find_user_for_login(&st.db, email).await? {
-            Some(u) if u.disabled => {}
-            Some(u) if u.email_verified => send_code(st, u.id, email, CodePurpose::LoginOtp),
-            Some(u) => send_attempt_code(st, u.id, email, password, hash),
-            None => {}
+    let unbound = || generate_attempt().0;
+    Ok(
+        match repo::create_user(&st.db, id, email, &hash, now_ms()).await {
+            Ok(()) => send_attempt_code(st, id, email, hash),
+            Err(DbError::UniqueViolation) => {
+                match repo::find_user_for_login(&st.db, email).await? {
+                    Some(u) if u.disabled => unbound(),
+                    Some(u) if u.email_verified => {
+                        send_code(st, u.id, email, CodePurpose::LoginOtp);
+                        unbound()
+                    }
+                    Some(u) => send_attempt_code(st, u.id, email, hash),
+                    None => unbound(),
+                }
+            }
+            Err(e) => return Err(e.into()),
         },
-        Err(e) => return Err(e.into()),
-    }
-    Ok(())
+    )
 }
 
 fn require_mail(st: &AppState) -> AppResult<()> {
@@ -275,7 +336,7 @@ pub async fn verify_confirm(
 ) -> AppResult<Json<Value>> {
     if !user.email_verified {
         throttle(&st, Bucket::CodeVerify, &addr)?;
-        check_code(&st, user.id, CodePurpose::VerifyEmail, &b.code).await?;
+        check_code(&st, user.id, CodePurpose::VerifyEmail, &b.code, None).await?;
         repo::set_email_verified(&st.db, user.id, now_ms()).await?;
     }
     Ok(Json(json!({"email_verified": true})))
@@ -286,6 +347,7 @@ pub async fn verify_confirm(
 #[derive(Deserialize)]
 pub struct EmailBody {
     email: String,
+    attempt: Option<String>,
 }
 
 pub async fn password_forgot(
@@ -341,7 +403,13 @@ pub async fn otp_request(
     if let Some(u) = repo::find_user_for_login(&st.db, &email).await?
         && !u.disabled
     {
-        send_code(&st, u.id, &email, CodePurpose::LoginOtp);
+        if !u.email_verified
+            && let Some(attempt) = b.attempt
+        {
+            resend_attempt(&st, u.id, &email, &attempt).await?;
+        } else {
+            send_code(&st, u.id, &email, CodePurpose::LoginOtp);
+        }
     }
     Ok(accepted())
 }
@@ -351,10 +419,12 @@ pub struct OtpVerifyBody {
     email: String,
     code: String,
     device_name: Option<String>,
+    /// The nonce from the `202` of `register` (or `login`) the code was mailed for.
+    attempt: Option<String>,
 }
 
 /// Accepts a verification code (what registration and sign-in on an unverified account
-/// mail) as well as a sign-in code.
+/// mail; with the `attempt` they answered) as well as a sign-in code.
 pub async fn otp_verify(
     State(st): State<AppState>,
     addr: ClientAddr,
@@ -362,7 +432,7 @@ pub async fn otp_verify(
 ) -> AppResult<Json<Value>> {
     throttle(&st, Bucket::CodeVerify, &addr)?;
     let email = b.email.trim().to_lowercase();
-    let u = sign_in_with_code(&st, &email, &b.code).await?;
+    let u = sign_in_with_code(&st, &email, &b.code, b.attempt.as_deref()).await?;
     let user = user_json(u.id, &email, &u.plan, ts(u.created_at), true);
     issue_session(&st, user, u.id, clean_device(b.device_name)).await
 }

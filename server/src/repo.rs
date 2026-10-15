@@ -110,23 +110,29 @@ pub struct NewCode<'a> {
     pub user_id: Uuid,
     pub purpose: &'a str,
     pub code_hash: &'a str,
-    /// The sign-up attempt's password, installed if this code claims an unverified account.
-    pub password_hash: Option<&'a str>,
+    /// For a code bound to a sign-up (or password sign-in) attempt: that attempt's password
+    /// hash, installed if the code claims an unverified account, and the sha256 of the
+    /// attempt's nonce, without which the code is not accepted. Both or neither.
+    pub bound: Option<(&'a str, &'a str)>,
     pub now: i64,
     pub expires_at: i64,
 }
 
 pub enum Issued {
-    /// Stored, superseding every earlier live code of this purpose: mail it.
+    /// Stored: mail it.
     Stored,
-    /// Refused by the resend cooldown or the hourly cap. `live` is the newest still-usable
-    /// code, if any, with the password it carries.
-    Throttled { live: Option<LiveCode> },
+    /// Refused by the resend cooldown or the hourly cap.
+    Throttled,
 }
 
 /// Issue a code under the per-(user, purpose) rate limits, in one transaction that holds a
 /// transaction-level advisory lock on (user, purpose), so concurrent requests are counted
 /// one after another: at most one code per `cooldown_ms`, `per_hour` per hour.
+///
+/// Unbound codes supersede earlier unbound codes; resends supersede only their own
+/// attempt's codes. Independent attempt-bound codes remain valid: each is redeemable only
+/// with its own attempt's nonce, so a competing attempt cannot use another's code, and neither can it cancel one;
+/// all it can do is spend the shared per-account cooldown and hourly cap.
 pub async fn issue_code(
     db: &Db,
     c: &NewCode<'_>,
@@ -153,35 +159,28 @@ pub async fn issue_code(
         .ok_or_else(|| DbError::Other("no aggregate row".into()))?;
     let (last, sent) = (r.opt_i64(0)?, r.i64(1)?);
     if sent >= per_hour || last.is_some_and(|t| c.now - t < cooldown_ms) {
-        let live = tx_query(
-            &mut tx,
-            &format!("{LIVE_CODE} LIMIT 1"),
-            &vals![c.user_id, c.purpose, c.now],
-        )
-        .await?
-        .first()
-        .map(live_code_row)
-        .transpose()?;
         tx.commit().await.map_err(orm::orm_err)?;
-        return Ok(Issued::Throttled { live });
+        return Ok(Issued::Throttled);
     }
     tx_execute(
         &mut tx,
-        "UPDATE auth_codes SET consumed_at = $3 \
-         WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL",
-        &vals![c.user_id, c.purpose, c.now],
+        "UPDATE auth_codes SET consumed_at = $3, password_hash = NULL WHERE user_id = $1 AND purpose = $2 \
+         AND consumed_at IS NULL AND attempt_hash IS NOT DISTINCT FROM $4",
+        &vals![c.user_id, c.purpose, c.now, c.bound.map(|b| b.1)],
     )
     .await?;
     tx_execute(
         &mut tx,
-        "INSERT INTO auth_codes (id, user_id, purpose, code_hash, password_hash, created_at, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO auth_codes \
+         (id, user_id, purpose, code_hash, password_hash, attempt_hash, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         &vals![
             c.id,
             c.user_id,
             c.purpose,
             c.code_hash,
-            c.password_hash,
+            c.bound.map(|b| b.0),
+            c.bound.map(|b| b.1),
             c.now,
             c.expires_at
         ],
@@ -191,48 +190,40 @@ pub async fn issue_code(
     Ok(Issued::Stored)
 }
 
-/// Retire one code early (it carries a password other than the latest attempt's).
-pub async fn supersede_code(db: &Db, id: Uuid, now: i64) -> DbResult<()> {
-    db.execute(
-        "UPDATE auth_codes SET consumed_at = $2 WHERE id = $1 AND consumed_at IS NULL",
-        &vals![id, now],
-    )
-    .await?;
-    Ok(())
-}
-
 pub struct LiveCode {
     pub id: Uuid,
     pub code_hash: String,
     pub password_hash: Option<String>,
+    pub attempt_hash: Option<String>,
 }
 
-const LIVE_CODE: &str = "SELECT id, code_hash, password_hash FROM auth_codes \
-     WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL AND expires_at > $3 \
-     ORDER BY created_at DESC";
+const LIVE_CODES: &str = "SELECT id, code_hash, password_hash, attempt_hash FROM auth_codes \
+     WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL AND expires_at > $3";
 
 fn live_code_row(r: &Row) -> DbResult<LiveCode> {
     Ok(LiveCode {
         id: r.uuid(0)?,
         code_hash: r.text(1)?,
         password_hash: r.opt_text(2)?,
+        attempt_hash: r.opt_text(3)?,
     })
 }
 
-pub async fn live_code(
+/// The live codes of a user and purpose, newest first (a handful: issuing is capped).
+pub async fn live_codes(
     db: &Db,
     user_id: Uuid,
     purpose: &str,
     now: i64,
-) -> DbResult<Option<LiveCode>> {
-    db.query_opt(
-        &format!("{LIVE_CODE} LIMIT 1"),
+) -> DbResult<Vec<LiveCode>> {
+    db.query(
+        &format!("{LIVE_CODES} ORDER BY created_at DESC LIMIT 20"),
         &vals![user_id, purpose, now],
     )
     .await?
-    .as_ref()
+    .iter()
     .map(live_code_row)
-    .transpose()
+    .collect()
 }
 
 /// Atomically spend one guess; false once `max` guesses were used (or the code is gone).
@@ -300,6 +291,9 @@ pub async fn replace_credentials(
     )
     .await?;
     tx_execute(&mut tx, REVOKE_USER_TOKENS, &vals![user_id, now]).await?;
+    tx_execute(&mut tx,
+        "UPDATE auth_codes SET consumed_at = $2, password_hash = NULL WHERE user_id = $1 AND consumed_at IS NULL",
+        &vals![user_id, now]).await?;
     tx.commit().await.map_err(orm::orm_err)?;
     Ok(true)
 }

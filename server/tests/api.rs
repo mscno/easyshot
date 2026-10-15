@@ -112,20 +112,16 @@ impl Ctx {
                 Some(json!({"email": email, "password": "supersecret123", "device_name": "test"})),
             )
             .await;
-        assert_eq!(
-            (s, &v),
-            (
-                StatusCode::ACCEPTED,
-                &json!({"verification_required": true})
-            )
-        );
+        assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        assert_eq!(v["verification_required"], true);
+        let attempt = v["attempt"].as_str().unwrap().to_owned();
         let to = email.trim().to_lowercase();
         let code = self.next_code(&to).await;
         let (s, v) = self
             .post(
                 "/v1/auth/otp/verify",
                 None,
-                json!({"email": to, "code": code, "device_name": "test"}),
+                json!({"email": to, "code": code, "device_name": "test", "attempt": attempt}),
             )
             .await;
         assert_eq!(s, StatusCode::OK, "{v}");
@@ -307,10 +303,10 @@ async fn register_validation_and_duplicates(c: Ctx) {
             Some(json!({"email": "A@example.com", "password": "another-password"})),
         )
         .await;
-    assert_eq!(
-        (s, v),
-        (StatusCode::ACCEPTED, json!({"verification_required": true}))
-    );
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(v["verification_required"], true);
+    assert_eq!(v["attempt"].as_str().unwrap().len(), 43);
+    assert!(v.get("token").is_none());
     assert!(
         c.next_mail("a@example.com")
             .await
@@ -1697,10 +1693,10 @@ async fn unverified_accounts_hold_no_credentials(c: Ctx) {
             Some(login_body("n@example.com", "supersecret123")),
         )
         .await;
-    assert_eq!(
-        (s, v),
-        (StatusCode::ACCEPTED, json!({"verification_required": true}))
-    );
+    assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(v["verification_required"], true);
+    assert_eq!(v["attempt"].as_str().unwrap().len(), 43);
+    assert!(v.get("token").is_none());
     let first = c.next_code("n@example.com").await;
     c.age_codes(60_000).await;
     let (s, v) = c
@@ -1710,10 +1706,8 @@ async fn unverified_accounts_hold_no_credentials(c: Ctx) {
             login_body("n@example.com", "supersecret123"),
         )
         .await;
-    assert_eq!(
-        (s, v["error"]["code"].as_str()),
-        (StatusCode::FORBIDDEN, Some("EMAIL_NOT_VERIFIED"))
-    );
+    assert_eq!(s, StatusCode::ACCEPTED);
+    let attempt = v["attempt"].as_str().unwrap().to_owned();
     let code = c.next_code("n@example.com").await;
     let (s, _) = c
         .post(
@@ -1738,7 +1732,7 @@ async fn unverified_accounts_hold_no_credentials(c: Ctx) {
         .post(
             "/v1/auth/otp/verify",
             None,
-            json!({"email": "n@example.com", "code": code, "device_name": "mac"}),
+            json!({"email": "n@example.com", "code": code, "device_name": "mac", "attempt": attempt}),
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
@@ -1784,7 +1778,7 @@ async fn verification_claims_unverified_account(c: Ctx) {
         .await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 
-    let (s, _) = c
+    let (s, pending) = c
         .post(
             "/v1/auth/register",
             None,
@@ -1797,7 +1791,7 @@ async fn verification_claims_unverified_account(c: Ctx) {
         .post(
             "/v1/auth/otp/verify",
             None,
-            json!({"email": email, "code": code}),
+            json!({"email": email, "code": code, "attempt": pending["attempt"]}),
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
@@ -1942,6 +1936,127 @@ async fn concurrent_login_failures_are_all_counted(c: Ctx) {
     c.cleanup().await;
 }
 
+/// Independent password-carrying codes cannot cross attempts, resends retain the same
+/// binding, and exactly one concurrent redemption succeeds.
+async fn signup_codes_are_bound_to_the_requesting_attempt(c: Ctx) {
+    let email = "bound@example.com";
+    let (_, first) = c
+        .post(
+            "/v1/auth/register",
+            None,
+            login_body(email, "owner-password"),
+        )
+        .await;
+    let code = c.next_code(email).await;
+    let first_attempt = first["attempt"].clone();
+    c.age_codes(60_000).await;
+    let (_, second) = c
+        .post(
+            "/v1/auth/register",
+            None,
+            login_body(email, "attacker-password"),
+        )
+        .await;
+    let other_code = c.next_code(email).await;
+    let second_attempt = second["attempt"].clone();
+    assert_ne!(first_attempt, second_attempt);
+    for attempt in [Value::Null, json!("wrong-nonce")] {
+        let (s, _) = c
+            .post(
+                "/v1/auth/otp/verify",
+                None,
+                json!({"email": email, "code": code, "attempt": attempt}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+    if code != other_code {
+        for (submitted, attempt) in [(&code, &second_attempt), (&other_code, &first_attempt)] {
+            let (s, _) = c
+                .post(
+                    "/v1/auth/otp/verify",
+                    None,
+                    json!({"email": email, "code": submitted, "attempt": attempt}),
+                )
+                .await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED);
+        }
+    }
+    // Resending the owner's code cannot discard the password or move it to another nonce.
+    c.age_codes(60_000).await;
+    c.post(
+        "/v1/auth/otp/request",
+        None,
+        json!({"email": email, "attempt": first_attempt}),
+    )
+    .await;
+    let resent = c.next_code(email).await;
+    let body = json!({"email": email, "code": resent, "attempt": first_attempt});
+    let (a, b) = tokio::join!(
+        c.post("/v1/auth/otp/verify", None, body.clone()),
+        c.post("/v1/auth/otp/verify", None, body)
+    );
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::UNAUTHORIZED]);
+    assert_eq!(
+        c.post("/v1/auth/login", None, login_body(email, "owner-password"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        c.post(
+            "/v1/auth/login",
+            None,
+            login_body(email, "attacker-password")
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    // Claiming invalidated every still-live code from competing attempts.
+    assert_eq!(
+        c.post(
+            "/v1/auth/otp/verify",
+            None,
+            json!({"email": email, "code": other_code, "attempt": second_attempt})
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    c.cleanup().await;
+}
+
+async fn recovery_invalidates_outstanding_sign_in_codes(c: Ctx) {
+    let email = "recover@example.com";
+    c.register(email).await;
+    c.post("/v1/auth/otp/request", None, json!({"email": email}))
+        .await;
+    let stale = c.next_code(email).await;
+    c.post("/v1/auth/password/forgot", None, json!({"email": email}))
+        .await;
+    let reset = c.next_code(email).await;
+    let (s, _) = c
+        .post(
+            "/v1/auth/password/reset",
+            None,
+            json!({"email": email, "code": reset, "new_password": "recovered-password"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = c
+        .post(
+            "/v1/auth/otp/verify",
+            None,
+            json!({"email": email, "code": stale}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    c.cleanup().await;
+}
+
 macro_rules! suite {
     ($($name:ident),* $(,)?) => {$(
         mod $name {
@@ -1985,6 +2100,8 @@ suite!(
     verification_claims_unverified_account,
     auth_limits_per_address,
     concurrent_login_failures_are_all_counted,
+    signup_codes_are_bound_to_the_requesting_attempt,
+    recovery_invalidates_outstanding_sign_in_codes,
 );
 
 #[tokio::test]

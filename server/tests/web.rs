@@ -28,6 +28,17 @@ struct Res {
 }
 
 impl Res {
+    fn attempt(&self) -> String {
+        self.body
+            .split("name=\"attempt\" value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
     fn json(&self) -> Value {
         serde_json::from_str(&self.body).unwrap_or(Value::Null)
     }
@@ -135,13 +146,14 @@ impl App {
             )
             .await;
         assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
+        let attempt = r.json()["attempt"].as_str().unwrap().to_owned();
         let code = self.mailed_code(email, "Confirm").await;
         let r = self
             .api(
                 "POST",
                 "/v1/auth/otp/verify",
                 None,
-                Some(json!({"email": email, "code": code})),
+                Some(json!({"email": email, "code": code, "attempt": attempt})),
             )
             .await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.body);
@@ -1035,6 +1047,7 @@ async fn signup_verify_password_login_and_reset() {
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert!(r.body.contains("action=\"/verify\""));
+    let attempt = r.attempt();
     let code = app.mailed_code("new@example.com", "Confirm your").await;
     let r = app
         .form(
@@ -1042,6 +1055,7 @@ async fn signup_verify_password_login_and_reset() {
             &[
                 ("email", "new@example.com"),
                 ("code", &code),
+                ("attempt", &attempt),
                 ("next", "/account"),
             ],
             None,
@@ -1453,63 +1467,60 @@ impl App {
 async fn unverified_sign_in_and_competing_sign_ups() {
     let app = App::new().await;
     let email = "fresh@example.com";
-    let signup = |pw| app.credentials("/signup", email, pw);
-    let r = signup("first password").await;
-    assert!(r.body.contains("action=\"/verify\""), "{}", r.body);
-    let code = app.mailed_code(email, "Confirm").await;
-
-    // The right password before verification: the code form again, no session.
+    let first = app.credentials("/signup", email, "first password").await;
+    let first_attempt = first.attempt();
+    let first_code = app.mailed_code(email, "Confirm").await;
+    // A same-password login during cooldown cannot take over the earlier code's binding.
+    let login = app.credentials("/login", email, "first password").await;
+    assert_eq!(login.status, StatusCode::OK);
+    assert!(login.cookie("sg_session").is_none());
+    app.age_codes().await;
+    let second = app.credentials("/signup", email, "second password").await;
+    let second_attempt = second.attempt();
+    let second_code = app.mailed_code(email, "Confirm").await;
+    if first_code != second_code {
+        for (code, attempt) in [
+            (&second_code, &first_attempt),
+            (&first_code, &second_attempt),
+        ] {
+            let r = app
+                .form(
+                    "/verify",
+                    &[("email", email), ("code", code), ("attempt", attempt)],
+                    None,
+                    false,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(r.attempt(), *attempt);
+        }
+    }
+    // An independent later signup did not supersede the owner's original code.
     let r = app
         .form(
-            "/login",
-            &[("email", email), ("password", "first password")],
+            "/verify",
+            &[
+                ("email", email),
+                ("code", &first_code),
+                ("attempt", &first_attempt),
+            ],
             None,
             false,
         )
         .await;
-    assert_eq!(r.status, StatusCode::OK);
-    assert!(r.body.contains("action=\"/verify\"") && r.cookie("sg_session").is_none());
-
-    // A competing sign-up with another password inside the resend cooldown mails nothing
-    // and retires the code that carries the first password.
-    app.mail.clear();
-    signup("second password").await;
-    for _ in 0..100 {
-        let live = app
-            .t
-            .owner
-            .query_one(
-                "SELECT count(*) FROM auth_codes WHERE consumed_at IS NULL",
-                &[],
-            )
-            .await
-            .unwrap()
-            .i64(0)
-            .unwrap();
-        if live == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let r = app
-        .form("/verify", &[("email", email), ("code", &code)], None, false)
-        .await;
-    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
-
-    // After the cooldown the latest attempt gets its own code and its password.
-    app.age_codes().await;
-    signup("second password").await;
-    let code = app.mailed_code(email, "Confirm").await;
-    let r = app
-        .form("/verify", &[("email", email), ("code", &code)], None, false)
-        .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
-    let login = |pw| app.credentials("/login", email, pw);
     assert_eq!(
-        login("first password").await.status,
+        app.credentials("/login", email, "first password")
+            .await
+            .status,
+        StatusCode::SEE_OTHER
+    );
+    assert_eq!(
+        app.credentials("/login", email, "second password")
+            .await
+            .status,
         StatusCode::UNPROCESSABLE_ENTITY
     );
-    assert_eq!(login("second password").await.status, StatusCode::SEE_OTHER);
     app.t.finish().await;
 }
 

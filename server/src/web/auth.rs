@@ -225,11 +225,11 @@ pub async fn signup_submit(cx: &Cx, Form(f): Form<SignupForm>) -> Result<Respons
     }
     throttle(cx, Bucket::Signup)?;
     let hash = hash_password_blocking(f.password.clone()).await.web()?;
-    if st.mailer.enabled() {
+    let attempt = if st.mailer.enabled() {
         // Same answer whether or not the address has an account (see `sign_up_attempt`):
         // the mailed code confirms a new or unverified account with this password, or signs
         // a verified owner in.
-        sign_up_attempt(st, &email, f.password, hash).await.web()?;
+        sign_up_attempt(st, &email, hash).await.web()?
     } else {
         // No mail configured (local development): nothing to verify with.
         let id = Uuid::new_v4();
@@ -248,10 +248,16 @@ pub async fn signup_submit(cx: &Cx, Form(f): Form<SignupForm>) -> Result<Respons
             }
             Err(e) => return Err(AppError::from(e)).web(),
         }
-    }
+    };
     let body = view! {
         cx =>
-        code_form(next: next, email: email, error: None, resent: false)
+        code_form(
+            next: next,
+            email: email,
+            error: None,
+            resent: false,
+            attempt: attempt
+        )
     }
     .single()
     .await?
@@ -261,12 +267,16 @@ pub async fn signup_submit(cx: &Cx, Form(f): Form<SignupForm>) -> Result<Respons
 
 // ---------- verify (after sign-up, or an emailed sign-in code) ----------
 
+/// `attempt` is the sign-up (or sign-in) attempt's nonce, a verification code carrying a
+/// password needs it; it travels only in this form's hidden fields (empty for sign-in
+/// codes).
 #[component]
 async fn code_form(
     next: String,
     email: String,
     error: Option<String>,
     resent: bool,
+    attempt: String,
 ) -> Result<impl View> {
     Ok(view! {
         card(
@@ -283,6 +293,7 @@ async fn code_form(
             <form method="post" action="/verify" class="stack">
                 <input type="hidden" name="next" value=(next.as_str())>
                 <input type="hidden" name="email" value=(email.as_str())>
+                <input type="hidden" name="attempt" value=(attempt.as_str())>
                 <label for="code">"Code"</label>
                 <input
                     id="code"
@@ -299,6 +310,7 @@ async fn code_form(
             <form method="post" action="/verify/resend" class="inline">
                 <input type="hidden" name="next" value=(next.as_str())>
                 <input type="hidden" name="email" value=(email.as_str())>
+                <input type="hidden" name="attempt" value=(attempt.as_str())>
                 <button type="submit" class="link">"Send a new code"</button>
             </form>
         )
@@ -308,7 +320,16 @@ async fn code_form(
 #[page("/verify")]
 pub async fn verify_page(cx: &Cx) -> Result<impl View> {
     let (next, email) = query(cx);
-    Ok(view! { code_form(next: next, email: email, error: None, resent: false) })
+    let attempt = String::new();
+    Ok(view! {
+        code_form(
+            next: next,
+            email: email,
+            error: None,
+            resent: false,
+            attempt: attempt
+        )
+    })
 }
 
 #[derive(Deserialize)]
@@ -316,6 +337,7 @@ pub struct CodeForm {
     email: String,
     code: String,
     next: Option<String>,
+    attempt: Option<String>,
 }
 
 /// Accepts a verification code (new accounts) or a sign-in code (existing accounts, or the
@@ -328,7 +350,8 @@ pub async fn verify_submit(cx: &Cx, Form(f): Form<CodeForm>) -> Result<Response>
     let st = state(cx);
     let email = f.email.trim().to_lowercase();
     throttle(cx, Bucket::CodeVerify)?;
-    let u = match sign_in_with_code(st, &email, &f.code).await {
+    let attempt = f.attempt.unwrap_or_default();
+    let u = match sign_in_with_code(st, &email, &f.code, Some(&attempt)).await {
         Ok(u) => u,
         Err(AppError::InvalidCode) => {
             let body = view! {
@@ -337,7 +360,8 @@ pub async fn verify_submit(cx: &Cx, Form(f): Form<CodeForm>) -> Result<Response>
                     next: next,
                     email: email,
                     error: Some("That code is not valid or has expired.".into()),
-                    resent: false
+                    resent: false,
+                    attempt: attempt
                 )
             }
             .single()
@@ -355,6 +379,8 @@ pub async fn verify_submit(cx: &Cx, Form(f): Form<CodeForm>) -> Result<Response>
 pub struct EmailForm {
     email: String,
     next: Option<String>,
+    /// Kept by "Send a new code", so the attempt's own code still works.
+    attempt: Option<String>,
 }
 
 #[route(POST "/verify/resend")]
@@ -363,8 +389,8 @@ pub async fn verify_resend(cx: &Cx, Form(f): Form<EmailForm>) -> Result<Response
     let st = state(cx);
     let email = f.email.trim().to_lowercase();
     throttle(cx, Bucket::CodeRequest)?;
-    // A resent verification code carries no password: if it claims the account, the
-    // password is set again through a reset.
+    // A signup resend retains its attempt and chosen password. Passwordless flows
+    // carry neither and cannot install a pre-registration password.
     if st.mailer.enabled()
         && let Some(u) = repo::find_user_for_login(&st.db, &email)
             .await
@@ -377,11 +403,20 @@ pub async fn verify_resend(cx: &Cx, Form(f): Form<EmailForm>) -> Result<Response
         } else {
             CodePurpose::VerifyEmail
         };
-        send_code(st, u.id, &email, purpose);
+        if !u.email_verified
+            && let Some(attempt) = f.attempt.as_deref().filter(|a| !a.is_empty())
+        {
+            crate::routes::codes::resend_attempt(st, u.id, &email, attempt)
+                .await
+                .web()?;
+        } else {
+            send_code(st, u.id, &email, purpose);
+        }
     }
+    let attempt = f.attempt.unwrap_or_default();
     let body = view! {
         cx =>
-        code_form(next: next, email: email, error: None, resent: true)
+        code_form(next: next, email: email, error: None, resent: true, attempt: attempt)
     }
     .single()
     .await?
@@ -480,10 +515,16 @@ pub async fn login_submit(cx: &Cx, Form(f): Form<LoginForm>) -> Result<Response>
     let (ip, _) = fingerprint(cx);
     let u = match password_login(st, &email, f.password, &ip).await.web()? {
         PasswordLogin::SignedIn(u) => u,
-        PasswordLogin::VerifyFirst => {
+        PasswordLogin::VerifyFirst(attempt) => {
             let body = view! {
                 cx =>
-                code_form(next: next, email: email, error: None, resent: false)
+                code_form(
+                    next: next,
+                    email: email,
+                    error: None,
+                    resent: false,
+                    attempt: attempt
+                )
             }
             .single()
             .await?
@@ -578,9 +619,16 @@ pub async fn code_submit(cx: &Cx, Form(f): Form<EmailForm>) -> Result<Response> 
     {
         send_code(st, u.id, &email, CodePurpose::LoginOtp);
     }
+    let attempt = String::new();
     let body = view! {
         cx =>
-        code_form(next: next, email: email, error: None, resent: false)
+        code_form(
+            next: next,
+            email: email,
+            error: None,
+            resent: false,
+            attempt: attempt
+        )
     }
     .single()
     .await?

@@ -106,9 +106,9 @@ struct CloudClient {
         try await send(makeRequest("POST",path,body: Self.encoder.encode(body),authorized: authorized),authorized: authorized)
     }
     /// Emails a one-time code for passwordless sign-in or password reset. The server answers the same for unknown accounts.
-    func requestCode(email: String,reset: Bool) async throws {
-        struct Body: Encodable { var email: String }
-        _ = try await post("v1/auth/\(reset ? "password/forgot" : "otp/request")",Body(email: email))
+    func requestCode(email: String,reset: Bool,attempt: String? = nil) async throws {
+        struct Body: Encodable { var email: String; var attempt: String? }
+        _ = try await post("v1/auth/\(reset ? "password/forgot" : "otp/request")",Body(email: email,attempt: attempt))
     }
     func signIn(email: String,code: String,attempt: String? = nil) async throws -> AuthResult {
         struct Body: Encodable { var email: String; var code: String; var deviceName: String; var attempt: String? }

@@ -31,7 +31,7 @@ extension AppController {
         Task { [weak self] in
             // A failed creation keeps the recording local; it can be retried from Quick Access or the Library.
             do { _ = try await share.waitForVideo() }
-            catch CloudError.notSignedIn { CloudSession.shared.sessionExpired(); self?.showToast("Not signed in · recording locally",symbol: "exclamationmark.triangle.fill",hideAfter: 3) }
+            catch CloudError.notSignedIn { CloudSession.shared.sessionExpired(for: client); self?.showToast("Not signed in · recording locally",symbol: "exclamationmark.triangle.fill",hideAfter: 3) }
             catch { self?.showToast("Couldn't create the link · recording locally",symbol: "exclamationmark.triangle.fill",detail: error.localizedDescription,hideAfter: 3) }
         }
         return share
@@ -103,7 +103,7 @@ extension AppController {
                 let share = try ShareRecording(client: client,file: clip.url,video: existing,title: current?.title ?? Self.shareTitle(clip.date))
                 setShare(clip,CloudShare(video: existing,title: current?.title,status: .uploading))
                 finishShare(share,clip: clip,voice: true)
-            } catch CloudError.notSignedIn { CloudSession.shared.sessionExpired(); requireSignIn() }
+            } catch CloudError.notSignedIn { CloudSession.shared.sessionExpired(for: client); requireSignIn() }
             catch { fail(error) }
         }
     }

@@ -18,7 +18,7 @@ struct CloudAccountForm: View {
     @State private var attempt: String?
     @State private var notice: String?
     @State private var showServer = false
-    private func switchTo(_ new: Mode) { mode = new; codeSent = false; code = ""; newPassword = ""; notice = nil; cloud.error = nil }
+    private func switchTo(_ new: Mode) { mode = new; codeSent = false; code = ""; newPassword = ""; attempt = nil; notice = nil; cloud.error = nil }
     var body: some View {
         if cloud.isSignedIn { signedIn } else { signedOut }
     }
@@ -67,8 +67,7 @@ struct CloudAccountForm: View {
             TextField("6-digit code from the email",text: $code).onSubmit { confirmAccount() }
             HStack {
                 Button("Confirm",action: confirmAccount).buttonStyle(.glassProminent).disabled(cloud.busy || code.count < 6)
-                // Registering again mails a fresh code tied to this password; the server answers the same either way.
-                Button("Resend Code") { Task { if let next = await cloud.signIn(email: email,password: password,register: true) { attempt = next; notice = "A new code is on its way." } } }
+                Button("Resend Code") { Task { if await cloud.requestCode(email: email,reset: false,attempt: attempt) { notice = "Check your email. Codes can be resent every 30 seconds." } } }
                     .buttonStyle(.glass).disabled(cloud.busy)
                 Button("Back") { switchTo(.password) }.buttonStyle(.link)
                 if cloud.busy { ProgressView().controlSize(.small) }
@@ -155,9 +154,10 @@ struct CloudSettingsSection: View {
         loading = true; error = nil; defer { loading = false }
         do {
             let page = try await client.list(before: cursor)
+            guard cloud.isCurrent(client) else { return }
             items += page.items.filter { new in !items.contains { $0.id == new.id } }
             cursor = page.next; hasMore = page.next != nil
-        } catch CloudError.notSignedIn { cloud.sessionExpired() }
+        } catch CloudError.notSignedIn { cloud.sessionExpired(for: client) }
         catch { self.error = error.localizedDescription }
     }
     func delete(_ item: CloudScreenshot) async {

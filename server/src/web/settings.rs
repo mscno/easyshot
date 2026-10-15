@@ -456,7 +456,7 @@ pub async fn verify(cx: &Cx, Form(f): Form<CodeForm>) -> Result<Response> {
     let st = state(cx);
     // From an existing session, so not a claim: credentials stay as they are.
     throttle(cx, Bucket::CodeVerify)?;
-    if check_code(st, m.user_id, CodePurpose::VerifyEmail, &f.code)
+    if check_code(st, m.user_id, CodePurpose::VerifyEmail, &f.code, None)
         .await
         .is_err()
     {

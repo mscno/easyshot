@@ -49,9 +49,12 @@ import EasyshotCore
         do {
             switch try await CloudClient(baseURL: origin.url).authenticate(register: register,email: address,password: password,deviceName: Host.current().localizedName ?? "Mac") {
             case .signedIn(let result): finish(result,from: origin); return nil
-            case .verificationRequired(let attempt): return attempt
+            case .verificationRequired(let attempt): return isCurrent(origin) ? attempt : nil
             }
         } catch { self.error = error.localizedDescription; return nil }
+    }
+    private func isCurrent(_ origin: Origin) -> Bool {
+        loadIfNeeded(); return origin.generation == generation && origin.account == account
     }
     private func finish(_ result: CloudClient.AuthResult,from origin: Origin) {
         loadIfNeeded()
@@ -64,7 +67,7 @@ import EasyshotCore
         }
         CloudKeychain.write(result.token,account: origin.account)
         UserDefaults.standard.set(try? JSONEncoder().encode(result.user),forKey: "cloudUser:\(origin.account)")
-        token = result.token; user = result.user
+        token = result.token; user = result.user; generation += 1
     }
     /// Runs a server call that doesn't sign in, surfacing the server's message. Returns success.
     @discardableResult private func attempt(_ work: (CloudClient,Origin) async throws -> Void) async -> Bool {
@@ -81,9 +84,9 @@ import EasyshotCore
         return address
     }
     /// Emails a 6-digit code for sign-in (`reset: false`) or a password reset.
-    func requestCode(email: String,reset: Bool) async -> Bool {
+    func requestCode(email: String,reset: Bool,attempt confirming: String? = nil) async -> Bool {
         guard let address = validEmail(email) else { return false }
-        return await attempt { client,_ in try await client.requestCode(email: address,reset: reset) }
+        return await attempt { client,_ in try await client.requestCode(email: address,reset: reset,attempt: confirming) }
     }
     func signIn(email: String,code: String,attempt confirming: String? = nil) async {
         guard let address = validEmail(email) else { return }
@@ -95,20 +98,21 @@ import EasyshotCore
     }
     func sendVerification() async -> Bool { await attempt { client,_ in try await client.sendVerification() } }
     func confirmEmail(code: String) async -> Bool {
-        let ok = await attempt { client,_ in try await client.confirmEmail(code: code.trimmingCharacters(in: .whitespaces)) }
-        if ok,var current = user {
-            current.emailVerified = true; user = current
-            UserDefaults.standard.set(try? JSONEncoder().encode(current),forKey: "cloudUser:\(account)")
+        await attempt { client,origin in
+            try await client.confirmEmail(code: code.trimmingCharacters(in: .whitespaces))
+            guard self.isCurrent(origin),var current = self.user else { return }
+            current.emailVerified = true; self.user = current
+            UserDefaults.standard.set(try? JSONEncoder().encode(current),forKey: "cloudUser:\(origin.account)")
         }
-        return ok
     }
-    /// Refresh the cached profile (e.g. email confirmation state) from the server.
+    /// Refresh the cached profile only for the identity that requested it.
     func refreshUser() async {
-        guard let client,token != nil else { return }
+        guard let origin = origin(),let token else { return }
         do {
-            let fresh = try await client.me()
-            user = fresh; UserDefaults.standard.set(try? JSONEncoder().encode(fresh),forKey: "cloudUser:\(account)")
-        } catch CloudError.notSignedIn { sessionExpired() } catch {}
+            let fresh = try await CloudClient(baseURL: origin.url,token: token).me()
+            guard isCurrent(origin) else { return }
+            user = fresh; UserDefaults.standard.set(try? JSONEncoder().encode(fresh),forKey: "cloudUser:\(origin.account)")
+        } catch CloudError.notSignedIn { expire(origin) } catch {}
     }
     func signOut() {
         let client = self.client
@@ -117,8 +121,11 @@ import EasyshotCore
         UserDefaults.standard.removeObject(forKey: "cloudUser:\(account)")
         token = nil; user = nil; generation += 1
     }
-    /// The server rejected our token (expired or revoked).
-    func sessionExpired() {
+    /// A delayed response from another server or identity cannot clear this session.
+    func isCurrent(_ client: CloudClient) -> Bool { loadIfNeeded(); return client.baseURL == baseURL && client.token == token }
+    func sessionExpired(for client: CloudClient) { if isCurrent(client) { sessionExpired() } }
+    /// The server rejected our current token (expired or revoked).
+    private func sessionExpired() {
         CloudKeychain.delete(account); UserDefaults.standard.removeObject(forKey: "cloudUser:\(account)")
         token = nil; user = nil; error = "Your session expired. Sign in again."; generation += 1
     }
