@@ -17,13 +17,24 @@ jobs:
       run:
         working-directory: server
     env:
-      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       FLY_APP: ${{ vars.FLY_APP }}
+      # Pinned release, checked against its published checksum before it ever sees a secret.
+      FLYCTL_VERSION: 0.4.111
+      FLYCTL_SHA256: 1878d7fb1f8a418039042cf0749e4b7216c6c7018b66ae10611a64c2b6d9aa9e
     steps:
-      - uses: actions/checkout@v5
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install flyctl
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/flyctl.tgz" "https://github.com/superfly/flyctl/releases/download/v${FLYCTL_VERSION}/flyctl_${FLYCTL_VERSION}_Linux_x86_64.tar.gz"
+          echo "$FLYCTL_SHA256  $RUNNER_TEMP/flyctl.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/flyctl" && tar -xzf "$RUNNER_TEMP/flyctl.tgz" -C "$RUNNER_TEMP/flyctl" flyctl
+          echo "$RUNNER_TEMP/flyctl" >> "$GITHUB_PATH"
       - name: Sync runtime secrets
         env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           # App role (easyshot_app) and owner role connection strings.
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
@@ -46,4 +57,6 @@ jobs:
           flyctl secrets import -a "$FLY_APP" --stage < "$RUNNER_TEMP/secrets.env"
           rm -f "$RUNNER_TEMP/secrets.env"
       - name: Deploy (single machine, scales to zero)
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: flyctl deploy -a "$FLY_APP" --remote-only --ha=false --strategy immediate
