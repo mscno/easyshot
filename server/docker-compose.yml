@@ -1,5 +1,5 @@
 # Local dev dependencies: MinIO (+ bucket creation), and optionally PostgreSQL.
-# The usual setup uses a local PostgreSQL 18 on :5433 and `mise run server:dev` (see README).
+# The usual setup uses a local PostgreSQL 18 on :5432; this optional container maps to :5433 to avoid clashing with it and `mise run server:dev` (see README).
 #   docker compose up -d minio minio-init
 # Everything in containers, including PostgreSQL:
 #   docker compose --profile postgres --profile app up --build

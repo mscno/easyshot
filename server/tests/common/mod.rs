@@ -1,5 +1,5 @@
 //! PostgreSQL test databases: one throwaway schema per test inside `TEST_DATABASE_URL`
-//! (default: the local `easyshot_test` on port 5433), migrated as the owner. Tests get an
+//! (default: the local `easyshot_test` on port 5432), migrated as the owner. Tests get an
 //! owner handle for setup and inspection (a superuser bypasses RLS) and an app-role handle
 //! plus URL for the code under test (`easyshot_app`, NOBYPASSRLS, search_path = schema).
 
@@ -14,7 +14,7 @@ use sqlx::{ConnectOptions, Connection, Executor, PgConnection};
 use tokio::sync::OnceCell;
 
 pub const DEFAULT_TEST_URL: &str =
-    "postgres://postgres:postgres@localhost:5433/easyshot_test?sslmode=disable";
+    "postgres://postgres:postgres@localhost:5432/easyshot_test?sslmode=disable";
 pub const APP_ROLE: &str = "easyshot_app";
 
 pub fn test_url() -> String {
@@ -37,7 +37,7 @@ async fn prepare() {
                 .database("postgres")
                 .connect()
                 .await
-                .expect("connect to the test cluster (is Postgres on :5433 running?)");
+                .expect("connect to the test cluster (is Postgres on :5432 running?)");
             let exists: Option<i32> =
                 sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
                     .bind(&name)

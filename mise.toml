@@ -3,12 +3,12 @@
 #
 # Migrations run as the table owner (the *_DATABASE_URL below); the server connects as the
 # easyshot_app role (NOSUPERUSER NOBYPASSRLS) so row-level security applies. Override any
-# value in a gitignored mise.local.toml or your shell. Local PostgreSQL 18 listens on 5433.
+# value in a gitignored mise.local.toml or your shell. Local PostgreSQL 18 listens on 5432.
 
 [env]
-DEV_DATABASE_URL = { default = "postgres://postgres:postgres@localhost:5433/easyshot_dev?sslmode=disable" }
-TEST_DATABASE_URL = { default = "postgres://postgres:postgres@localhost:5433/easyshot_test?sslmode=disable" }
-DEV_APP_DATABASE_URL = { default = "postgres://easyshot_app:easyshot_app@localhost:5433/easyshot_dev?sslmode=disable" }
+DEV_DATABASE_URL = { default = "postgres://postgres:postgres@localhost:5432/easyshot_dev?sslmode=disable" }
+TEST_DATABASE_URL = { default = "postgres://postgres:postgres@localhost:5432/easyshot_test?sslmode=disable" }
+DEV_APP_DATABASE_URL = { default = "postgres://easyshot_app:easyshot_app@localhost:5432/easyshot_dev?sslmode=disable" }
 
 # ── database ──────────────────────────────────────────────────────────────────
 

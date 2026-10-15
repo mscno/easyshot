@@ -31,7 +31,7 @@ sqlx code applies a `db::Context` per statement (`Db::scoped`); Toasty work runs
 
 ## Local setup
 
-Requires PostgreSQL 18 on `localhost:5433` (user/password `postgres`), [mise](https://mise.jdx.dev) and Docker for MinIO. Tasks live in the repository's `mise.toml`:
+Requires PostgreSQL 18 on `localhost:5432` (user/password `postgres`), [mise](https://mise.jdx.dev) and Docker for MinIO. Tasks live in the repository's `mise.toml`:
 
 ```sh
 docker compose up -d minio minio-init     # MinIO :9000 (console :9001), bucket `easyshot`
@@ -43,7 +43,7 @@ mise run server:dev                        # http://127.0.0.1:8080, app role, Mi
 
 `db:status`, `db:reset` (dev only: drops and rebuilds `public`), `db:new -- name`, `db:test` and `db:test:reset` work the same way. Override `DEV_DATABASE_URL`, `TEST_DATABASE_URL` or `DEV_APP_DATABASE_URL` in `mise.local.toml`. Without Lettermint, web sign-in codes cannot be mailed; the API (`/v1/auth/login`) still works with the seeded password `easyshot-dev-password`.
 
-Tests run against `TEST_DATABASE_URL` (default `easyshot_test` on :5433), one throwaway schema per test, migrated as the owner, with the code under test connected as `easyshot_app`:
+Tests run against `TEST_DATABASE_URL` (default `easyshot_test` on :5432), one throwaway schema per test, migrated as the owner, with the code under test connected as `easyshot_app`:
 
 ```sh
 mise run server:test                       # or: cd server && cargo test
