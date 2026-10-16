@@ -2126,7 +2126,12 @@ async fn lettermint_client_request_shape() {
         )
         .route(
             "/bad/send",
-            axum::routing::post(|| async { (StatusCode::UNPROCESSABLE_ENTITY, "bad from") }),
+            axum::routing::post(|| async {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "recipient=u@example.com code=424242 token=lm_secret",
+                )
+            }),
         )
         .with_state(seen.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2157,5 +2162,33 @@ async fn lettermint_client_request_shape() {
 
     let bad = LettermintMailer::new(&format!("http://{addr}/bad"), "t", "a@b.c", None);
     let err = bad.send(mail).await.unwrap_err().to_string();
-    assert!(err.contains("422") && err.contains("bad from"), "{err}");
+    assert!(err.contains("422"), "{err}");
+    for sensitive in ["u@example.com", "424242", "lm_secret"] {
+        assert!(!err.contains(sensitive));
+    }
+    // Unset routing delegates to the project's real default; never invent a route slug.
+    let mut cfg = Config::for_tests("unused");
+    cfg.lettermint_api_token = Some("lm_secret".into());
+    cfg.mail_from = Some("Easyshot <no-reply@example.com>".into());
+    cfg.lettermint_api_url = format!("http://{addr}/v1");
+    LettermintMailer::from_config(&cfg)
+        .unwrap()
+        .send(easyshot_server::mailer::code_email(
+            easyshot_server::mailer::CodePurpose::LoginOtp,
+            "u@example.com",
+            "424242",
+            10,
+            "k2",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        seen.lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .1
+            .get("route")
+            .is_none()
+    );
 }

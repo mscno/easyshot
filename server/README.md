@@ -167,7 +167,7 @@ There is no migration from the earlier Turso/libSQL backend: production starts f
 | `ALLOW_SIGNUPS` | `true` | |
 | `LETTERMINT_API_TOKEN` | unset | Lettermint project token (`lm_...`). Enables email (codes, web sign-in, "send to"); when unset the code endpoints answer 503 |
 | `MAIL_FROM` | unset | `Name <sender@verified-domain>`; required with the token |
-| `LETTERMINT_ROUTE` | `transactional` | Lettermint route |
+| `LETTERMINT_ROUTE` | unset | Optional route override; otherwise Lettermint uses the project’s default route |
 | `LETTERMINT_API_URL` | `https://api.lettermint.co/v1` | override for testing |
 | `REQUIRE_EMAIL_VERIFICATION` | `true` when the token is set, else `false` | creating uploads needs a confirmed email |
 | `AUTH_CODE_TTL_MINUTES` | `10` | lifetime of emailed codes |

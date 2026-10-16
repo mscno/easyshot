@@ -115,10 +115,9 @@ impl Mailer for LettermintMailer {
         if status.is_success() {
             return Ok(());
         }
-        // The body can echo request fields; log only its size-limited prefix.
-        let body = res.text().await.unwrap_or_default();
-        let body: String = body.chars().take(300).collect();
-        Err(MailError(format!("lettermint returned {status}: {body}")))
+        // Provider error bodies can echo the code, recipient or credentials. Keep those
+        // out of application logs even when a validation or transport error occurs.
+        Err(MailError(format!("lettermint returned {status}")))
     }
 }
 

@@ -154,9 +154,7 @@ impl Config {
             lettermint_api_token: get("LETTERMINT_API_TOKEN"),
             lettermint_api_url: get("LETTERMINT_API_URL")
                 .unwrap_or_else(|| "https://api.lettermint.co/v1".into()),
-            lettermint_route: Some(
-                get("LETTERMINT_ROUTE").unwrap_or_else(|| "transactional".into()),
-            ),
+            lettermint_route: get("LETTERMINT_ROUTE"),
             mail_from: get("MAIL_FROM"),
             require_email_verification: boolean(
                 "REQUIRE_EMAIL_VERIFICATION",
@@ -208,7 +206,7 @@ impl Config {
             db_max_connections: 5,
             lettermint_api_token: None,
             lettermint_api_url: "https://api.lettermint.co/v1".into(),
-            lettermint_route: Some("transactional".into()),
+            lettermint_route: None,
             mail_from: None,
             require_email_verification: false,
             auth_code_ttl_minutes: 10,
@@ -330,14 +328,23 @@ mod tests {
         };
         let c = with(&[]).unwrap();
         assert!(c.lettermint_api_token.is_none() && !c.require_email_verification);
-        assert_eq!(c.lettermint_route.as_deref(), Some("transactional"));
+        assert!(c.lettermint_route.is_none());
         assert_eq!(c.lettermint_api_url, "https://api.lettermint.co/v1");
         assert_eq!(c.auth_code_ttl_minutes, 10);
         assert!(with(&[("LETTERMINT_API_TOKEN", "t")]).is_err());
         let c = with(&[("LETTERMINT_API_TOKEN", "t"), ("MAIL_FROM", "a@b.c")]).unwrap();
         assert_eq!(c.mail_from.as_deref(), Some("a@b.c"));
+        assert!(c.lettermint_route.is_none());
         // verification is required by default once email is configured
         assert!(c.require_email_verification);
+        let c = with(&[("LETTERMINT_ROUTE", "outgoing")]).unwrap();
+        assert_eq!(c.lettermint_route.as_deref(), Some("outgoing"));
+        assert!(
+            with(&[("LETTERMINT_ROUTE", "  ")])
+                .unwrap()
+                .lettermint_route
+                .is_none()
+        );
         let c = with(&[
             ("LETTERMINT_API_TOKEN", "t"),
             ("MAIL_FROM", "a@b.c"),
