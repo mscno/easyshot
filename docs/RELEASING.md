@@ -1,6 +1,6 @@
 # Releasing Easyshot
 
-The release path builds an Apple Silicon app, signs with **Developer ID Application** and Hardened Runtime, notarizes and staples the app, builds a Finder disk image with the app and an Applications shortcut, then signs, notarizes and staples the DMG. Final signature, ticket and Gatekeeper checks must pass before the DMG and checksum are uploaded as an Actions artifact. Creating a versioned draft release is optional. No Mac App Store submission or installer package is involved.
+The release path builds an Apple Silicon app, signs with **Developer ID Application** and Hardened Runtime, notarizes and staples the app, builds a Finder disk image with the app and an Applications shortcut, then signs, notarizes and staples the DMG. Final signature, ticket and Gatekeeper checks must pass before the DMG and checksum are uploaded as an Actions artifact. Pushing a version tag publishes the matching DMG, checksum and signed update feed as a stable GitHub release. Creating a draft release manually is also supported. No Mac App Store submission or installer package is involved.
 
 Easyshot's bundle ID is `no.paraply.easyshot`. The app bundle, code-signing identifier and Raycast launch commands use this ID. Changing the bundle ID does not require a new Developer ID certificate or notarization API key.
 
@@ -72,11 +72,11 @@ Signing and notarization avoid the unidentified-developer/cannot-check-for-malic
 
 ## Automate through GitHub Actions
 
-The **Release signed DMG** workflow runs on pushes to `master` and manually from the Actions tab, on an Apple Silicon `macos-26` runner. It runs Swift unit tests and notarization control-flow tests, imports signing credentials into a temporary keychain, runs the same release script, uploads the verified DMG and checksum as an Actions artifact, and removes the temporary credentials. It does not sign pull requests or other branches. There is no path filter: rewriting the single-commit `master` history prevents GitHub from reliably comparing changed files. The DMG layout uses [dmgbuild](https://github.com/dmgbuild/dmgbuild), which writes Finder settings without automating Finder.
+The **Release signed DMG** workflow runs on pushes to `master`, version tags (`v*`), and manually from the Actions tab, on an Apple Silicon `macos-26` runner. It runs Swift unit tests and notarization control-flow tests, imports signing credentials into a temporary keychain, runs the same release script, uploads the verified DMG and checksum as an Actions artifact, and removes the temporary credentials. It does not sign pull requests or other branches. There is no path filter: rewriting the single-commit `master` history prevents GitHub from reliably comparing changed files. The DMG layout uses [dmgbuild](https://github.com/dmgbuild/dmgbuild), which writes Finder settings without automating Finder.
 
 Open a successful run and download **Easyshot-<version>-AppleSilicon** from its Artifacts section or its summary link. Extract the artifact ZIP, verify `SHA256SUMS.txt`, open the DMG, and drag the app into Applications. Artifacts are retained for 30 days and require a GitHub account. A failed notarization publishes only available public diagnostic JSON, never a release DMG or signing credentials. [GitHub's artifact guide](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts) explains downloading them.
 
-The job allows 210 minutes for the two notarization waits and packaging. Artifact builds can repeat the same version; they do not create a tag or GitHub release. A separate optional job creates a **draft** release only when requested by the manual workflow input.
+The job allows 210 minutes for the two notarization waits and packaging. Builds from `master` can repeat the same version and only upload an artifact. A version-tag build requires the tag to match `CFBundleShortVersionString`, then publishes the verified DMG, checksum and signed appcast together as the latest stable release. A separate optional job creates a **draft** release when requested by the manual workflow input.
 
 Set these repository secrets in **Settings → Secrets and variables → Actions**:
 
@@ -102,7 +102,9 @@ base64 -i /path/to/AuthKey_KEYID.p8 | gh secret set NOTARY_API_KEY_BASE64 --repo
 
 Set the other values in GitHub's secrets form, or use interactive `gh secret set NAME --repo mscno/easyshot`. Certificate passwords and private keys belong in GitHub Secrets/Keychain, not this repo or chat. The key files and local release venv are ignored by Git.
 
-After adding secrets, `master` pushes produce an artifact automatically. To build one manually, choose **Actions → Release signed DMG → Run workflow**, leaving the branch as `master` and **Create draft release** unchecked. Alternatively:
+After adding secrets, `master` pushes produce an artifact automatically. To publish a stable update, bump both version and build number in `Resources/Info.plist`, commit it on `master`, then push an annotated tag matching the version (for example `v2.0.2`). The tag workflow publishes the release only after signing, notarization and verification succeed. Never move an existing published tag.
+
+To build an artifact manually, choose **Actions → Release signed DMG → Run workflow**, leaving the branch as `master` and **Create draft release** unchecked. Alternatively:
 
 ```sh
 gh workflow run release.yml --repo mscno/easyshot --ref master
@@ -128,4 +130,4 @@ The direct-download app embeds Sparkle 2.10.0, including its signed installer he
 
 Set `SPARKLE_PRIVATE_KEY` in GitHub Actions secrets to the base64-encoded 32-byte Ed25519 seed matching `SUPublicEDKey`. Keep a secure backup outside Git. For local signing set `SPARKLE_KEY_FILE` to a protected file containing that value. Existing Apple signing/notarization secrets are unchanged.
 
-After notarization and stapling, `scripts/generate-appcast.py` signs the final DMG and feed with Sparkle's pinned tools, verifies both signatures, and adds the feed checksum. Draft releases include `appcast.xml`. Publish the matching DMG and feed together as a stable release; the app uses GitHub's latest stable release asset URL. Never edit a signed feed after signing or overwrite a published DMG. Bump both the marketing version and build number for every update.
+After notarization and stapling, `scripts/generate-appcast.py` signs the final DMG and feed with Sparkle's pinned tools, verifies both signatures, and adds the feed checksum. Version-tag releases publish `appcast.xml` alongside the matching DMG automatically. For a manual draft release, publish the matching DMG and feed together. The app uses GitHub's latest stable release asset URL. Never edit a signed feed after signing or overwrite a published DMG. Bump both the marketing version and build number for every update.
